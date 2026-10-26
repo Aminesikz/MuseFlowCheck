@@ -1,0 +1,30 @@
+{
+  "name": "flowcheck",
+  "version": "0.0.0",
+  "description": "AI shift-left secure-code review for JavaScript/TypeScript via cross-file taint analysis and self-verification.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "flowcheck": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx scripts/smoke-test.ts"
+  },
+  "dependencies": {
+    "openai": "^7.44.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
