@@ -19,9 +19,12 @@ export interface Finding {
   file: string;
   /** 1-based line where untrusted input enters. */
   sourceLine: number;
-  /** 1-based line where the tainted value reaches the dangerous operation. */
+  /** 1-based line of the call that executes the query (e.g. `pool.query(sql)`), not where the SQL string is built. */
   sinkLine: number;
-  /** Hops from source to sink, as short code descriptions. */
+  /**
+   * Ordered hops from source to sink, each a short code excerpt with its line:
+   * source → intermediate steps (assignments, helper calls, string building) → execute call.
+   */
   taintPath: string[];
   /** Plain-language reason the flow is exploitable. */
   explanation: string;

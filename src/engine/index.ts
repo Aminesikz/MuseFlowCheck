@@ -11,5 +11,5 @@ export { FindingParseError } from "./parse.js";
 export async function analyzeFile(filePath: string): Promise<Finding[]> {
   const source = await readFile(filePath, "utf8");
   const raw = await complete(buildSqliPrompt(filePath, source));
-  return parseFindings(raw, filePath);
+  return parseFindings(raw, filePath, source.split(/\r?\n/).length);
 }

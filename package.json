@@ -17,6 +17,7 @@
     "build": "tsc -p tsconfig.build.json",
     "dev": "tsx src/cli.ts",
     "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
     "smoke": "tsx scripts/smoke-test.ts"
   },
   "dependencies": {
