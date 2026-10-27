@@ -47,7 +47,7 @@ function codeSlice(fn: FunctionRef): string {
 
 export function buildJudgePrompt(group: SinkGroup): string {
   const paths = group.paths
-    .map((p, i) => `Path ${i}:\n${p.hops.map((h, n) => `  ${n + 1}. [${h.kind}] ${formatHop(h)}`).join("\n")}`)
+    .map((p, i) => `Path ${i + 1}:\n${p.hops.map((h, n) => `  ${n + 1}. [${h.kind}] ${formatHop(h)}`).join("\n")}`)
     .join("\n\n");
 
   return `You are a senior security code reviewer. A deterministic cross-file tracer followed HTTP request input through the function calls below until it became part of the SQL text passed to a call that executes SQL. The tracer follows values across files, but it does NOT understand validation or sanitization — it over-approximates. Decide whether this is genuinely exploitable SQL injection (CWE-89).
@@ -64,6 +64,7 @@ CODE — every function on the paths, with real file line numbers prefixed as "N
 ${functionsOn(group).map(codeSlice).join("\n\n")}
 
 ${SEVERITY_GUIDE}
+Middleware and route registration are not shown. If the handler reads an authenticated-user object (e.g. req.user, ctx.state.user), assume the route requires login; otherwise assume it may be reachable without authentication. Apply the severity rule above on that basis, and state the assumption in the explanation.
 
 OUTPUT
 Return ONLY a JSON array — no prose, no markdown fences.
@@ -73,7 +74,7 @@ Return ONLY a JSON array — no prose, no markdown fences.
   "type": "SQL Injection",
   "cwe": "CWE-89",
   "severity": "critical" | "high" | "medium" | "low",
-  "pathIndex": number,       // the path that most clearly demonstrates the injection
+  "path": number,            // the "Path N" number above that most clearly demonstrates the injection
   "explanation": string,     // plain language: why it is exploitable across these files, what an attacker could do; mention any other exploitable paths into the same call
   "suggestedPatch": string   // corrected code for the function containing the SQL execution, using the same library's parameter binding, multi-line and formatted like the original
 }
@@ -86,8 +87,9 @@ export function parseJudgment(raw: string, group: SinkGroup): Finding | null {
   if (items.length === 0) return null;
   try {
     const judgment = validateJudgment(items[0], 0);
-    const index = (items[0] as Record<string, unknown>).pathIndex;
-    const path = group.paths[Number.isInteger(index) && (index as number) >= 0 ? (index as number) : 0] ?? group.paths[0];
+    // "path" is 1-based, matching the "Path N" headings in the prompt and the trace output.
+    const n = Number((items[0] as Record<string, unknown>).path);
+    const path = (Number.isInteger(n) && group.paths[n - 1]) || group.paths[0];
     const source = path.hops[0];
     const sink = path.hops.at(-1)!;
     return {

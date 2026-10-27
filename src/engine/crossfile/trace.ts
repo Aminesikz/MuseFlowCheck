@@ -163,11 +163,6 @@ class Tracer {
     return { file: this.rel(node.getSourceFile()), line: node.getStartLineNumber(), code, kind, fn };
   }
 
-  /** The trimmed source line a node starts on. */
-  private lineText(node: Node): string {
-    return node.getSourceFile().getFullText().split(/\r?\n/)[node.getStartLineNumber() - 1].trim();
-  }
-
   private signature(fn: Fn): string {
     const body = fn.getBody();
     const head = body ? fn.getText().slice(0, body.getStart() - fn.getStart()) : fn.getText();
@@ -202,12 +197,21 @@ class Tracer {
     return out;
   }
 
-  /** New taints for request inputs read directly inside `expr` (e.g. a call argument `req.params.id`). */
+  /**
+   * New taints for request inputs read directly inside `expr` (e.g. a call argument `req.params.id`).
+   * The hop points at the enclosing statement so multi-line calls read as one complete line of code.
+   */
   private inlineSourceTaints(expr: Node, req: string | undefined, ref: FunctionRef): Taint[] {
-    return this.sourceAccesses(expr, req).map((pa) => ({
-      origin: `${this.rel(pa.getSourceFile())}:${pa.getStartLineNumber()}:${pa.getText()}`,
-      hops: [this.hop(pa, "source", ref, this.lineText(pa))],
-    }));
+    return this.sourceAccesses(expr, req).map((pa) => {
+      const stmt =
+        pa.getFirstAncestor(
+          (a) => Node.isVariableStatement(a) || Node.isExpressionStatement(a) || Node.isReturnStatement(a),
+        ) ?? pa;
+      return {
+        origin: `${this.rel(pa.getSourceFile())}:${pa.getStartLineNumber()}:${pa.getText()}`,
+        hops: [this.hop(stmt, "source", ref)],
+      };
+    });
   }
 
   private isStringBuild(expr: Node): boolean {

@@ -35,10 +35,18 @@ test("bound parameters are classified, not sent as SQL-text paths", () => {
   assert.equal(bound[0].hops.at(-1)!.line, 9);
 });
 
+test("inline request reads show the whole enclosing statement", () => {
+  const source = bound[0].hops[0];
+  assert.equal(source.line, 12);
+  assert.equal(source.code, "res.json(await orderService.getOrder(req.params.id));");
+});
+
 test("judge prompt includes paths and real-line code slices from every file", () => {
   const [group] = groupBySink(trace.paths);
   const prompt = buildJudgePrompt(group);
-  assert.match(prompt, /Path 0:/);
+  assert.match(prompt, /Path 1:/);
+  assert.doesNotMatch(prompt, /Path 0:/);
+  assert.match(prompt, /Middleware and route registration are not shown/);
   for (const file of ["routes/orders.js", "services/orderService.js", "db/orders.js"]) assert.match(prompt, new RegExp(`=== ${file}`));
   assert.match(prompt, / {3}4 \| {3}const sql = `SELECT/);
   assert.match(prompt, /=== db\/orders\.js — exports\.search \(lines 3–6\)/);
@@ -47,7 +55,7 @@ test("judge prompt includes paths and real-line code slices from every file", ()
 
 test("judgment fills locations and taintPath from the trace", () => {
   const [group] = groupBySink(trace.paths);
-  const raw = '```json\n[{"type":"SQL Injection","cwe":"CWE-89","severity":"Critical","pathIndex":0,"explanation":"e","suggestedPatch":"p","sinkLine":999}]\n```';
+  const raw = '```json\n[{"type":"SQL Injection","cwe":"CWE-89","severity":"Critical","path":1,"explanation":"e","suggestedPatch":"p","sinkLine":999}]\n```';
   const f = parseJudgment(raw, group)!;
   assert.equal(f.file, "routes/orders.js");
   assert.equal(f.sourceLine, 7);
@@ -56,6 +64,18 @@ test("judgment fills locations and taintPath from the trace", () => {
   assert.equal(f.severity, "critical");
   assert.equal(f.confidence, "suspected");
   assert.equal(f.taintPath.length, 8);
+});
+
+test("path number is 1-based; out-of-range or missing falls back to path 1", () => {
+  const [group] = groupBySink(trace.paths);
+  const twoPaths = { ...group, paths: [group.paths[0], { ...group.paths[0], hops: group.paths[0].hops.slice(1) }] };
+  const judge = (path: unknown) =>
+    parseJudgment(JSON.stringify([{ type: "SQL Injection", cwe: "CWE-89", severity: "high", path, explanation: "e", suggestedPatch: "p" }]), twoPaths)!;
+  assert.equal(judge(2).taintPath.length, 7);
+  assert.equal(judge(1).taintPath.length, 8);
+  assert.equal(judge(0).taintPath.length, 8);
+  assert.equal(judge(9).taintPath.length, 8);
+  assert.equal(judge(undefined).taintPath.length, 8);
 });
 
 test("empty judgment means not exploitable", () => {
