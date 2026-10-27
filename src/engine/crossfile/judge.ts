@@ -6,10 +6,15 @@ import { extractJsonArray, FindingParseError, validateJudgment } from "../parse.
 import { SAFE_PATTERNS, SEVERITY_GUIDE } from "../prompt.js";
 import type { CandidatePath, FunctionRef, Hop } from "./trace.js";
 
+/** Most paths shown to the model for one sink; the rest are counted in the prompt, keeping prompt size bounded. */
+export const MAX_PATHS_PER_SINK = 8;
+
 /** Candidate paths into SQL text that end at the same executing call. */
 export interface SinkGroup {
   sink: Hop;
   paths: CandidatePath[];
+  /** Further paths into the same call that were left out of the prompt. */
+  omitted: number;
 }
 
 export function groupBySink(paths: CandidatePath[]): SinkGroup[] {
@@ -17,10 +22,18 @@ export function groupBySink(paths: CandidatePath[]): SinkGroup[] {
   for (const p of paths.filter((c) => c.sqlText)) {
     const sink = p.hops.at(-1)!;
     const key = `${sink.file}:${sink.line}`;
-    if (!groups.has(key)) groups.set(key, { sink, paths: [] });
-    groups.get(key)!.paths.push(p);
+    if (!groups.has(key)) groups.set(key, { sink, paths: [], omitted: 0 });
+    const group = groups.get(key)!;
+    if (group.paths.length < MAX_PATHS_PER_SINK) group.paths.push(p);
+    else group.omitted++;
   }
   return [...groups.values()];
+}
+
+/** Identifies what the model is asked about: the sink plus every hop of every path shown. */
+export function groupSignature(group: SinkGroup): string {
+  const path = (p: CandidatePath) => p.hops.map((h) => `${h.kind}@${h.file}:${h.line}`).join(">");
+  return `${group.sink.file}:${group.sink.line}|${group.paths.map(path).join("|")}`;
 }
 
 export function formatHop(h: Hop): string {
@@ -58,7 +71,7 @@ Also not exploitable: a condition on the path that makes the dangerous concatena
 A path IS exploitable if attacker-controlled data reaches the SQL text without neutralization — including as an unquoted numeric value, an identifier, or a keyword.
 
 CANDIDATE PATHS (all end at the same SQL execution call: ${formatHop(group.sink)})
-${paths}
+${paths}${group.omitted > 0 ? `\n\n(${group.omitted} more path(s) into this call are not shown.)` : ""}
 
 CODE — every function on the paths, with real file line numbers prefixed as "N | "
 ${functionsOn(group).map(codeSlice).join("\n\n")}

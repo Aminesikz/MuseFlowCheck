@@ -21,6 +21,7 @@
     "smoke": "tsx scripts/smoke-test.ts"
   },
   "dependencies": {
+    "ignore": "^7.0.14",
     "openai": "^7.44.0",
     "ts-morph": "^28.0.0"
   },

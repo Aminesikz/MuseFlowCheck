@@ -3,6 +3,7 @@
 // syntactically (no type checker) so every resolved edge — and every one that breaks — can be explained.
 import { existsSync, statSync } from "node:fs";
 import path from "node:path";
+import { discoverFiles } from "./files.js";
 import {
   Node,
   Project,
@@ -64,11 +65,28 @@ export interface ExternalCall {
   target: string;
 }
 
+/** A function where untrusted HTTP input enters: a registered route handler or a request-reading function. */
+export interface EntryPoint {
+  file: string;
+  line: number;
+  name: string;
+  /** `GET /search`, when found through a route registration with a literal path. */
+  route?: string;
+  /** Where the handler is registered, when that differs from where it is defined. */
+  registeredAt?: string;
+  /** False when the handler neither reads request input nor passes the request on (e.g. auth middleware). */
+  readsInput: boolean;
+}
+
 export interface TraceResult {
   root: string;
+  /** The entry file, or the scanned directory. */
   entry: string;
-  /** Request-handler functions traced: those in the entry file plus those it references from other files. */
+  /** Source files loaded up front: 1 for a single-entry trace, every discovered file for a directory. */
+  files: number;
+  /** Request-handler functions traced. */
   handlers: number;
+  entryPoints: EntryPoint[];
   paths: CandidatePath[];
   unresolved: UnresolvedCall[];
   external: ExternalCall[];
@@ -93,8 +111,13 @@ type Value =
   | { kind: "instance"; cls: Cls; args?: Thunk[] } // args: constructor arguments from the `new` site, when known
   | { kind: "external"; what: string }
   | { kind: "unresolved"; reason: string };
+/**
+ * The request object in scope: its parameter name, and the hops that brought it here when a handler passed
+ * the whole request on (`service.search(req)`), so sources read further down still start at the handler.
+ */
+type Req = { name: string; via: Hop[] };
 /** A request handler to trace from: `req` is its request parameter, `self` its `this` when it is a method. */
-type Handler = { fn: Fn; req: string; self?: Value };
+type Handler = { fn: Fn; req: Req; self?: Value; entry: EntryPoint };
 type ProjectValue = Extract<Value, { kind: "module" | "object" | "class" | "instance" }>;
 type Callee = Value | { kind: "sink" };
 
@@ -102,6 +125,10 @@ type Callee = Value | { kind: "sink" };
 const SOURCE_PROPS = new Set(["query", "params", "body"]);
 /** Methods that execute SQL when called on something that isn't a project function (pool.query, client.query, db.query, …). */
 const SINK_METHODS = new Set(["query", "execute"]);
+/** Router / app methods that register request handlers (Express, Koa router, and similar). */
+const ROUTE_METHODS = new Set(["get", "post", "put", "patch", "delete", "del", "all", "options", "head", "use"]);
+/** Parameter names conventionally bound to the request (Express `req`, Koa `ctx`). */
+const REQUEST_PARAM = /^(?:req|request|ctx|context)$/;
 const MODULE_EXTENSIONS = ["", ".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx", ".mts", ".cts", "/index.js", "/index.ts", "/index.mjs", "/index.cjs"];
 const MAX_DEPTH = 8;
 
@@ -191,6 +218,8 @@ class Tracer {
     skipFileDependencyResolution: true,
   });
   private readonly onStack = new Set<Fn>();
+  /** Every function analyzed so far, from any entry point. */
+  readonly visited = new Set<Fn>();
   private readonly pathKeys = new Set<string>();
   private readonly edgeKeys = new Set<string>();
   /** Declarations / exports currently being resolved, to stop on circular definitions and re-exports. */
@@ -212,8 +241,9 @@ class Tracer {
   handlers(sf: SourceFile): Handler[] {
     const found: Handler[] = [];
     for (const node of sf.getDescendants()) {
-      const req = isFn(node) ? this.handlerReq(node) : undefined;
-      if (req) found.push({ fn: node as Fn, req });
+      if (!isFn(node)) continue;
+      const first = node.getParameters()[0]?.getNameNode();
+      if (Node.isIdentifier(first) && this.sourceAccesses(node, first.getText()).length > 0) found.push(this.handler(node, first.getText()));
     }
     return found;
   }
@@ -223,25 +253,97 @@ class Tracer {
    * Only arguments of calls outside function bodies (route registration) are considered.
    */
   referencedHandlers(sf: SourceFile): Handler[] {
-    const found = new Map<Fn, Omit<Handler, "fn">>();
+    const found = new Map<Fn, Handler>();
     for (const call of sf.getDescendantsOfKind(SyntaxKind.CallExpression)) {
       if (call.getFirstAncestor(isFn)) continue;
       for (const arg of call.getArguments()) {
         if (!Node.isIdentifier(arg) && !Node.isPropertyAccessExpression(arg)) continue;
         const v = this.resolveExpr(arg);
         if (v.kind !== "function" || v.fn.getSourceFile() === sf) continue;
-        const req = this.handlerReq(v.fn);
-        if (req) found.set(v.fn, { req, self: v.self });
+        const first = v.fn.getParameters()[0]?.getNameNode();
+        if (Node.isIdentifier(first) && this.sourceAccesses(v.fn, first.getText()).length > 0) {
+          found.set(v.fn, this.handler(v.fn, first.getText(), v.self));
+        }
       }
     }
-    return [...found].map(([fn, h]) => ({ fn, ...h }));
+    return [...found.values()];
   }
 
-  private handlerReq(fn: Fn): string | undefined {
-    const first = fn.getParameters()[0]?.getNameNode();
-    if (!first || !Node.isIdentifier(first)) return undefined;
-    const req = first.getText();
-    return this.sourceAccesses(fn, req).length > 0 ? req : undefined;
+  /**
+   * Functions registered on a router/app anywhere in the project: `router.get('/x', fn)`, `app.use(mw)`,
+   * `router.post('/x', ctrl.save)`, `ctrl.save.bind(ctrl)`, wrappers like `asyncHandler(fn)`, and arrays of handlers.
+   */
+  registeredHandlers(files: SourceFile[]): Handler[] {
+    const found = new Map<Fn, Handler>();
+    for (const sf of files) {
+      for (const call of sf.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+        const callee = call.getExpression();
+        if (!Node.isPropertyAccessExpression(callee) || !ROUTE_METHODS.has(callee.getName())) continue;
+        const receiver = this.resolveExpr(callee.getExpression());
+        if (isProjectValue(receiver) || receiver.kind === "function") continue; // a project object's own `get`, not a router
+        const [first] = call.getArguments();
+        const routePath = first && (Node.isStringLiteral(first) || Node.isNoSubstitutionTemplateLiteral(first)) ? first.getLiteralValue() : undefined;
+        const route = `${callee.getName().toUpperCase()}${routePath !== undefined ? ` ${routePath}` : ""}`;
+        for (const arg of call.getArguments()) {
+          for (const v of this.registeredFunctions(arg)) {
+            const req = this.requestParam(v.fn);
+            if (!req || found.has(v.fn)) continue;
+            const h = this.handler(v.fn, req, v.self);
+            h.entry.route = route;
+            const at = `${this.rel(sf)}:${call.getStartLineNumber()}`;
+            if (at !== `${h.entry.file}:${h.entry.line}`) h.entry.registeredAt = at;
+            found.set(v.fn, h);
+          }
+        }
+      }
+    }
+    return [...found.values()];
+  }
+
+  /**
+   * Functions not reached by any traced handler whose request-named parameter (`req`, `ctx`, …) is read as
+   * `.query|.params|.body` — handlers a framework calls by convention, e.g. file-based API routes.
+   */
+  requestReaders(files: SourceFile[]): Handler[] {
+    const found = new Map<Fn, Handler>();
+    for (const sf of files) {
+      for (const node of sf.getDescendants()) {
+        if (!isFn(node) || this.visited.has(node)) continue;
+        const req = node.getParameters().map((p) => p.getNameNode()).find((n) => Node.isIdentifier(n) && REQUEST_PARAM.test(n.getText()));
+        if (req && this.sourceAccesses(node, req.getText()).length > 0) found.set(node, this.handler(node, req.getText()));
+      }
+    }
+    return [...found.values()];
+  }
+
+  /** Project functions an argument of a route registration stands for. */
+  private registeredFunctions(arg: Node): Extract<Value, { kind: "function" }>[] {
+    const e = unwrap(arg);
+    if (Node.isArrayLiteralExpression(e)) return e.getElements().flatMap((el) => this.registeredFunctions(el));
+    if (Node.isCallExpression(e)) {
+      const callee = e.getExpression();
+      if (Node.isPropertyAccessExpression(callee) && callee.getName() === "bind") return this.registeredFunctions(callee.getExpression());
+      return e.getArguments().flatMap((a) => this.registeredFunctions(a)); // asyncHandler(fn), wrap(ctrl.list)
+    }
+    if (!isFn(e) && !Node.isIdentifier(e) && !Node.isPropertyAccessExpression(e)) return [];
+    const v = this.resolveExpr(e);
+    return v.kind === "function" ? [v] : [];
+  }
+
+  /** The request parameter of a registered handler: a request-named one, else Express's error-handler slot, else the first. */
+  private requestParam(fn: Fn): string | undefined {
+    const names = fn.getParameters().map((p) => p.getNameNode());
+    const named = names.find((n) => Node.isIdentifier(n) && REQUEST_PARAM.test(n.getText()));
+    const pick = named ?? (names.length === 4 ? names[1] : names[0]);
+    return Node.isIdentifier(pick) ? pick.getText() : undefined;
+  }
+
+  private handler(fn: Fn, req: string, self?: Value): Handler {
+    const readsInput =
+      this.sourceAccesses(fn, req).length > 0 ||
+      fn.getDescendantsOfKind(SyntaxKind.CallExpression).some((c) => c.getArguments().some((a) => Node.isIdentifier(a) && a.getText() === req));
+    const entry: EntryPoint = { file: this.rel(fn.getSourceFile()), line: fn.getStartLineNumber(), name: this.fnName(fn), readsInput };
+    return { fn, req: { name: req, via: [] }, self, entry };
   }
 
   // ---- naming / hops ----------------------------------------------------------------------
@@ -305,14 +407,16 @@ class Tracer {
 
   // ---- taint queries ----------------------------------------------------------------------
 
-  /** `<req>.query`, `<req>.params`, `<req>.body` accesses within a node. */
+  /** `<req>.query|params|body` accesses within a node, and Koa's `<ctx>.request.query|params|body`. */
   private sourceAccesses(node: Node, req: string | undefined): Node[] {
     if (!req) return [];
     const all = Node.isPropertyAccessExpression(node) ? [node] : [];
     all.push(...node.getDescendantsOfKind(SyntaxKind.PropertyAccessExpression));
+    const isReq = (n: Node) => Node.isIdentifier(n) && n.getText() === req;
     return all.filter((pa) => {
+      if (!SOURCE_PROPS.has(pa.getName())) return false;
       const target = pa.getExpression();
-      return Node.isIdentifier(target) && target.getText() === req && SOURCE_PROPS.has(pa.getName());
+      return isReq(target) || (Node.isPropertyAccessExpression(target) && target.getName() === "request" && isReq(target.getExpression()));
     });
   }
 
@@ -334,20 +438,20 @@ class Tracer {
    * New taints for request inputs read directly inside `expr` (e.g. a call argument `req.params.id`).
    * The hop points at the enclosing statement so multi-line calls read as one complete line of code.
    */
-  private inlineSourceTaints(expr: Node, req: string | undefined, ref: FunctionRef): Taint[] {
-    return this.sourceAccesses(expr, req).map((pa) => {
+  private inlineSourceTaints(expr: Node, req: Req | undefined, ref: FunctionRef): Taint[] {
+    return this.sourceAccesses(expr, req?.name).map((pa) => {
       const stmt =
         pa.getFirstAncestor(
           (a) => Node.isVariableStatement(a) || Node.isExpressionStatement(a) || Node.isReturnStatement(a),
         ) ?? pa;
       return {
         origin: `${this.rel(pa.getSourceFile())}:${pa.getStartLineNumber()}:${pa.getText()}`,
-        hops: [this.hop(stmt, "source", ref)],
+        hops: [...req!.via, this.hop(stmt, "source", ref)],
       };
     });
   }
 
-  private exprTaints(expr: Node, env: Env, ref: FunctionRef, req?: string): Taint[] {
+  private exprTaints(expr: Node, env: Env, ref: FunctionRef, req?: Req): Taint[] {
     return mergeTaints(this.inlineSourceTaints(expr, req, ref), this.idTaints(expr, env));
   }
 
@@ -361,10 +465,11 @@ class Tracer {
 
   // ---- intraprocedural walk ---------------------------------------------------------------
 
-  analyze(fn: Fn, env: Env, depth: number, req?: string, self?: Value): void {
+  analyze(fn: Fn, env: Env, depth: number, req?: Req, self?: Value): void {
     const body = fn.getBody();
     if (!body || depth > MAX_DEPTH || this.onStack.has(fn)) return;
     this.onStack.add(fn);
+    this.visited.add(fn);
     this.selfStack.push(self);
     const ref = this.fnRef(fn);
 
@@ -384,7 +489,7 @@ class Tracer {
     this.onStack.delete(fn);
   }
 
-  private onDeclaration(decl: VariableDeclaration, env: Env, ref: FunctionRef, req?: string): void {
+  private onDeclaration(decl: VariableDeclaration, env: Env, ref: FunctionRef, req?: Req): void {
     const init = decl.getInitializer();
     if (!init) return;
     const nameNode = decl.getNameNode();
@@ -393,14 +498,14 @@ class Tracer {
       : nameNode.getDescendantsOfKind(SyntaxKind.BindingElement).map((b) => b.getName());
 
     const stmt = decl.getFirstAncestorByKind(SyntaxKind.VariableStatement) ?? decl;
-    const readsSource = this.sourceAccesses(init, req).length > 0;
+    const readsSource = this.sourceAccesses(init, req?.name).length > 0;
     const flowing = this.idTaints(init, env);
     const kind = this.isStringBuild(init) ? "build" : "propagate";
 
     for (const name of names) {
       let taints: Taint[] = [];
       if (readsSource) {
-        taints.push({ origin: `${ref.file}:${decl.getStartLineNumber()}:${name}`, hops: [this.hop(stmt, "source", ref)] });
+        taints.push({ origin: `${ref.file}:${decl.getStartLineNumber()}:${name}`, hops: [...req!.via, this.hop(stmt, "source", ref)] });
       }
       taints = mergeTaints(taints, flowing.map((t) => ({ origin: t.origin, hops: [...t.hops, this.hop(stmt, kind, ref)] })));
       if (taints.length > 0) env.set(name, taints);
@@ -408,7 +513,7 @@ class Tracer {
     }
   }
 
-  private onAssignment(bin: BinaryExpression, env: Env, ref: FunctionRef, req?: string): void {
+  private onAssignment(bin: BinaryExpression, env: Env, ref: FunctionRef, req?: Req): void {
     const op = bin.getOperatorToken().getKind();
     const left = bin.getLeft();
     if ((op !== SyntaxKind.EqualsToken && op !== SyntaxKind.PlusEqualsToken) || !Node.isIdentifier(left)) return;
@@ -426,9 +531,10 @@ class Tracer {
     else env.delete(name);
   }
 
-  private onCall(call: CallExpression, env: Env, ref: FunctionRef, depth: number, req?: string): void {
+  private onCall(call: CallExpression, env: Env, ref: FunctionRef, depth: number, req?: Req): void {
     const argTaints = call.getArguments().map((arg) => this.exprTaints(arg, env, ref, req));
-    if (argTaints.every((t) => t.length === 0)) return;
+    const forwardsReq = req !== undefined && call.getArguments().some((arg) => Node.isIdentifier(arg) && arg.getText() === req.name);
+    if (!forwardsReq && argTaints.every((t) => t.length === 0)) return;
 
     const callee = this.resolveCallee(call);
     const at = { file: ref.file, line: call.getStartLineNumber(), call: excerpt(call.getExpression()) };
@@ -450,7 +556,7 @@ class Tracer {
    * Tainted constructor arguments. Taint stored in instance fields is not tracked, so a project class is reported
    * as unresolved (not dropped); a package class is a call leaving the project.
    */
-  private onNew(expr: NewExpression, env: Env, ref: FunctionRef, req?: string): void {
+  private onNew(expr: NewExpression, env: Env, ref: FunctionRef, req?: Req): void {
     if ((expr.getArguments() ?? []).every((arg) => this.exprTaints(arg, env, ref, req).length === 0)) return;
     const ctor = this.resolveExpr(expr.getExpression());
     const at = { file: ref.file, line: expr.getStartLineNumber(), call: `new ${excerpt(expr.getExpression())}` };
@@ -478,13 +584,14 @@ class Tracer {
     env: Env,
     ref: FunctionRef,
     depth: number,
-    req?: string,
+    req?: Req,
     self?: Value,
   ): void {
     const calleeRef = this.fnRef(fn);
     const callHop = this.hop(call, "call", ref);
     const paramHop: Hop = { file: calleeRef.file, line: fn.getStartLineNumber(), code: this.signature(fn), kind: "param", fn: calleeRef };
     const calleeEnv: Env = new Map();
+    let calleeReq: Req | undefined;
     const bind = (name: string, taints: Taint[]) => {
       if (taints.length === 0) return;
       const hops = [callHop, { ...paramHop, code: `${paramHop.code}  [param ${name}]` }];
@@ -492,14 +599,20 @@ class Tracer {
     };
 
     fn.getParameters().forEach((param, i) => {
+      // The whole request object passed on: the parameter becomes the request in the callee.
+      const arg = call.getArguments()[i];
+      const nameNode = param.getNameNode();
+      if (req && arg && Node.isIdentifier(arg) && arg.getText() === req.name && Node.isIdentifier(nameNode)) {
+        const name = nameNode.getText();
+        calleeReq = { name, via: [...req.via, callHop, { ...paramHop, code: `${paramHop.code}  [param ${name} = request]` }] };
+        return;
+      }
       const taints = param.isRestParameter() ? argTaints.slice(i).reduce(mergeTaints, []) : (argTaints[i] ?? []);
       if (taints.length === 0) return;
-      const nameNode = param.getNameNode();
       if (Node.isIdentifier(nameNode)) return bind(nameNode.getText(), taints);
 
       // Destructured parameter: map `{ a, b: c }` to the matching properties of an object-literal argument;
       // otherwise (whole tainted object, nested or array patterns, spreads) every bound name takes the argument's taint.
-      const arg = call.getArguments()[i];
       const literal = arg && !param.isRestParameter() ? unwrap(arg) : undefined;
       const byKey = Node.isObjectLiteralExpression(literal) && !literal.getProperties().some(Node.isSpreadAssignment) ? literal : undefined;
       for (const el of nameNode.getDescendantsOfKind(SyntaxKind.BindingElement)) {
@@ -516,7 +629,7 @@ class Tracer {
       }
     });
 
-    if (calleeEnv.size > 0) this.analyze(fn, calleeEnv, depth + 1, undefined, self);
+    if (calleeEnv.size > 0 || calleeReq) this.analyze(fn, calleeEnv, depth + 1, calleeReq, self);
   }
 
   private recordSink(call: CallExpression, argTaints: Taint[][], ref: FunctionRef): void {
@@ -524,10 +637,12 @@ class Tracer {
     const sqlText = argTaints[0]?.length > 0;
     const taints = sqlText ? argTaints[0] : argTaints.slice(1).flat();
     for (const t of taints) {
-      const key = `${t.origin}->${sinkHop.file}:${sinkHop.line}`;
-      if (this.pathKeys.has(key)) continue;
-      this.pathKeys.add(key);
-      this.paths.push({ hops: [...t.hops, sinkHop], sqlText });
+      const hops = [...t.hops, sinkHop];
+      // One path per (origin, sink); identical hop sequences reached from different entry points also collapse.
+      const keys = [`${t.origin}->${sinkHop.file}:${sinkHop.line}`, hops.map((h) => `${h.kind}@${h.file}:${h.line}`).join(">")];
+      if (keys.some((k) => this.pathKeys.has(k))) continue;
+      keys.forEach((k) => this.pathKeys.add(k));
+      this.paths.push({ hops, sqlText });
     }
   }
 
@@ -975,24 +1090,57 @@ class Tracer {
   }
 }
 
+function sortPaths(paths: CandidatePath[]): CandidatePath[] {
+  return [...paths].sort((a, b) => {
+    const sa = a.hops.at(-1)!;
+    const sb = b.hops.at(-1)!;
+    const [fa, fb] = [a.hops[0], b.hops[0]];
+    return (
+      Number(b.sqlText) - Number(a.sqlText) ||
+      sa.file.localeCompare(sb.file) ||
+      sa.line - sb.line ||
+      fa.file.localeCompare(fb.file) ||
+      fa.line - fb.line
+    );
+  });
+}
+
+function analyzeAll(tracer: Tracer, handlers: Handler[]): void {
+  for (const { fn, req, self } of handlers) tracer.analyze(fn, new Map(), 0, req, self);
+}
+
+function result(tracer: Tracer, entry: string, files: number, handlers: Handler[]): TraceResult {
+  return {
+    root: tracer.root,
+    entry,
+    files,
+    handlers: handlers.length,
+    entryPoints: handlers.map((h) => h.entry),
+    paths: sortPaths(tracer.paths),
+    unresolved: tracer.unresolved,
+    external: tracer.external,
+  };
+}
+
 /** Traces request input from every handler in `entry` (or referenced by it) across files to SQL-executing calls. */
 export function traceEntry(entry: string, root = findProjectRoot(entry)): TraceResult {
   const tracer = new Tracer(path.resolve(root));
   const sf = tracer.load(path.resolve(entry));
   const handlers = [...tracer.handlers(sf), ...tracer.referencedHandlers(sf)];
-  for (const { fn, req, self } of handlers) tracer.analyze(fn, new Map(), 0, req, self);
+  analyzeAll(tracer, handlers);
+  return result(tracer, path.relative(tracer.root, path.resolve(entry)), 1, handlers);
+}
 
-  const paths = [...tracer.paths].sort((a, b) => {
-    const sa = a.hops.at(-1)!;
-    const sb = b.hops.at(-1)!;
-    return Number(b.sqlText) - Number(a.sqlText) || sa.file.localeCompare(sb.file) || sa.line - sb.line || a.hops[0].line - b.hops[0].line;
-  });
-  return {
-    root: tracer.root,
-    entry: path.relative(tracer.root, path.resolve(entry)),
-    handlers: handlers.length,
-    paths,
-    unresolved: tracer.unresolved,
-    external: tracer.external,
-  };
+/**
+ * Traces a whole project: loads every discovered source file under `dir`, finds the entry points across all of
+ * them, and traces each with one shared tracer, so paths and unresolved edges are collected (and deduplicated) once.
+ */
+export function traceProject(dir: string): TraceResult {
+  const tracer = new Tracer(path.resolve(dir));
+  const files = discoverFiles(tracer.root).map((f) => tracer.load(f));
+  const registered = tracer.registeredHandlers(files);
+  analyzeAll(tracer, registered);
+  const readers = tracer.requestReaders(files); // after tracing, so functions already reached aren't entry points
+  analyzeAll(tracer, readers);
+  return result(tracer, ".", files.length, [...registered, ...readers]);
 }
