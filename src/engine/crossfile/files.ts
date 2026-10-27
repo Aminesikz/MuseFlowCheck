@@ -61,6 +61,15 @@ function ancestorMatchers(root: string): Matcher[] {
 
 /** Absolute paths of the JS/TS source files to scan under `root`, sorted. */
 export function discoverFiles(root: string): string[] {
+  return walkFiles(root, (name) => SOURCE_FILE.test(name) && !SKIP_FILE.test(name));
+}
+
+/** SQL schema / migration files under `root` (same skip rules), for data-model evidence. */
+export function discoverSqlFiles(root: string): string[] {
+  return walkFiles(root, (name) => name.endsWith(".sql"));
+}
+
+function walkFiles(root: string, accept: (name: string) => boolean): string[] {
   const files: string[] = [];
   const walk = (dir: string, matchers: Matcher[]) => {
     const own = gitignoreAt(dir);
@@ -70,7 +79,7 @@ export function discoverFiles(root: string): string[] {
       if (entry.isDirectory()) {
         if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name) || isIgnored(active, abs, true)) continue;
         walk(abs, active);
-      } else if (entry.isFile() && SOURCE_FILE.test(entry.name) && !SKIP_FILE.test(entry.name) && !isIgnored(active, abs, false)) {
+      } else if (entry.isFile() && accept(entry.name) && !isIgnored(active, abs, false)) {
         files.push(abs);
       }
     }

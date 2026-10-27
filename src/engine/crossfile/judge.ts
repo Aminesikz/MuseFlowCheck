@@ -53,7 +53,7 @@ function functionsOn(group: SinkGroup): FunctionRef[] {
 }
 
 /** A function's code with its real file line numbers. */
-function codeSlice(fn: FunctionRef): string {
+export function codeSlice(fn: FunctionRef): string {
   const numbered = fn.code.split("\n").map((line, i) => `${String(fn.startLine + i).padStart(4, " ")} | ${line}`);
   return `=== ${fn.file} — ${fn.name} (lines ${fn.startLine}–${fn.endLine}) ===\n${numbered.join("\n")}`;
 }

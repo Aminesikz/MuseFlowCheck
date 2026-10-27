@@ -13,6 +13,17 @@ import {
   type JudgeResult,
   type TraceResult,
 } from "./engine/crossfile/index.js";
+import {
+  assembleAccessContext,
+  buildAccessPrompt,
+  candidates,
+  judgeAccess,
+  routeLabel,
+  scopingEvidence,
+  secureSiblings,
+  type AccessContext,
+  type AccessRoute,
+} from "./engine/access/index.js";
 import { describeApiError, loadDotEnv } from "./llm/errors.js";
 import { SEVERITIES, type Finding } from "./types/index.js";
 
@@ -28,8 +39,15 @@ Usage:
   flowcheck trace <dir|entry> [--root <dir>] [--show-prompt]
                                                      Stage 1 only: print traced paths (no API call);
                                                      --show-prompt also prints the Stage 2 prompt(s)
+  flowcheck scan <dir> --mode access [--route <text>] [--json]
+                                                     Broken access control / IDOR: assemble per-route evidence,
+                                                     then judge each unchecked route with the model
+  flowcheck trace <dir> --mode access [--route <text>] [--show-prompt]
+                                                     Access-control Stage 1 only (no API call)
   flowcheck --version
 
+  --mode   sqli (default) or access
+  --route  only judge (or show prompts for) routes whose "METHOD /path" contains <text>
   --json   print the findings as a JSON Finding[] on stdout (progress and summary go to stderr)
 
 Exit codes: 0 no high/critical findings, 1 high/critical finding(s), 2 error`;
@@ -231,13 +249,107 @@ function isDirectory(target: string): boolean {
   }
 }
 
+// ---- access-control mode ----------------------------------------------------------------------
+
+function formatAccessRoute(ctx: AccessContext, r: AccessRoute): string {
+  const out = [`${r.status.toUpperCase().padEnd(13)} ${routeLabel(r)}  (${r.handler.file}:${r.handler.startLine})`];
+  if (r.status === "public" || r.status === "no-identifier" || r.status === "unscoped") return `${out[0]} — ${r.reason}`;
+  if (r.identity) {
+    const via = r.identity.middleware ? ` — set by ${r.identity.middleware.name} (${r.identity.middleware.file})` : "";
+    out.push(`    identity: ${r.identity.expression} {${r.identity.fields.join(", ")}}${via}`);
+  }
+  for (const a of r.accesses) {
+    const sink = a.path.hops.at(-1)!;
+    out.push(`    access:   [${a.kind}] ${a.location}.${a.field} → ${a.tables.join(", ")}${a.column ? `.${a.column}` : ""}  (${sink.file}:${sink.line})`);
+  }
+  for (const g of r.guards) out.push(`    check:    ${g.kind} at ${g.file}:${g.line}: ${g.code}`);
+  if (r.status === "candidate") {
+    for (const line of scopingEvidence(ctx, r)) out.push(`    scoping:  ${line}`);
+    const siblings = secureSiblings(ctx, r).map(routeLabel);
+    out.push(`    siblings: ${siblings.join(", ") || "none found"}`);
+  }
+  return out.join("\n");
+}
+
+function accessCounts(ctx: AccessContext): string {
+  const n = (s: AccessRoute["status"]) => ctx.routes.filter((r) => r.status === s).length;
+  return `${ctx.routes.length} route(s) — ${n("candidate")} unchecked candidate(s), ${n("guarded")} guarded, ${n("unscoped")} on unscoped data, ${n("no-identifier")} without a request identifier, ${n("public")} unauthenticated`;
+}
+
+function traceAccess(dir: string, filter: string | undefined, showPrompt: boolean): number {
+  let ctx: AccessContext;
+  try {
+    ctx = assembleAccessContext(dir);
+  } catch (err) {
+    return reportError(err, dir);
+  }
+  const schema = ctx.schemaFiles.length > 0 ? `${ctx.schemaFiles.join(", ")} (${ctx.schema.length} table(s))` : "none found";
+  say(
+    [
+      `Access control — Stage 1 (root: ${ctx.root})`,
+      `  Files scanned: ${ctx.files} · schema: ${schema}`,
+      `  ${accessCounts(ctx)}`,
+      "",
+      ...ctx.routes.filter((r) => !filter || routeLabel(r).includes(filter)).map((r) => formatAccessRoute(ctx, r)),
+    ].join("\n"),
+  );
+  if (showPrompt) {
+    for (const r of candidates(ctx, filter)) say(`\n--- Stage 2 prompt for ${routeLabel(r)} ---\n${buildAccessPrompt(ctx, r)}\n--- end prompt ---`);
+  }
+  return 0;
+}
+
+async function scanAccess(dir: string, filter: string | undefined, json: boolean): Promise<number> {
+  loadDotEnv();
+  say(`Scanning project ${dir} for broken access control / IDOR...\n`);
+  let ctx: AccessContext;
+  try {
+    ctx = assembleAccessContext(dir);
+  } catch (err) {
+    return reportError(err, dir);
+  }
+  const toJudge = candidates(ctx, filter);
+  say(
+    [
+      `Stage 1 — ${ctx.files} file(s); ${accessCounts(ctx)}`,
+      ...ctx.routes.filter((r) => r.status === "guarded").map((r) => `  guarded (not sent): ${routeLabel(r)} — ${r.guards[0].kind} at ${r.guards[0].file}:${r.guards[0].line}`),
+      `  Run \`flowcheck trace ${dir} --mode access\` for the evidence on every route.`,
+      "",
+      toJudge.length > 0
+        ? `Stage 2 — asking the model to judge ${toJudge.length} route(s)${filter ? ` matching "${filter}"` : ""}...\n`
+        : "Stage 1 found no unchecked candidate route — nothing sent to the model.\n",
+    ].join("\n"),
+  );
+  const result = toJudge.length > 0 ? await judgeAccess(ctx, filter) : { findings: [], failures: [], cleared: [], calls: 0 };
+  const findings = [...result.findings].sort(bySeverity);
+  const counts = SEVERITIES.map((s) => `${s} ${findings.filter((f) => f.severity === s).length}`).join(", ");
+  say(
+    [
+      "Summary",
+      `  Files scanned:  ${ctx.files}`,
+      `  Routes:         ${ctx.routes.length} (${ctx.routes.filter((r) => r.status === "guarded").length} guarded)`,
+      `  Judged:         ${result.calls} route(s); ${result.cleared.length} judged not vulnerable`,
+      `  Findings:       ${findings.length} — ${counts}`,
+      "",
+    ].join("\n"),
+  );
+  let code = emitFindings(findings, json);
+  for (const r of result.cleared) say(`Judged not vulnerable: ${routeLabel(r)}`);
+  for (const f of result.failures) console.error(`✗ Judging ${f.route} failed: ${describeError(f.error, dir)}`);
+  if (result.failures.length > 0 && code === 0) code = EXIT_ERROR;
+  return code;
+}
+
+/** Flags that take a value: `--root <dir>`, `--mode <name>`, `--route <text>`. */
+const VALUE_FLAGS = new Set(["root", "mode", "route"]);
+
 /** Splits argv into positionals and `--flag [value]` options. */
 function parseArgs(args: string[]): { positional: string[]; flags: Map<string, string | true> } {
   const positional: string[] = [];
   const flags = new Map<string, string | true>();
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === "--root") flags.set("root", args[++i] ?? "");
+    if (arg.startsWith("--") && VALUE_FLAGS.has(arg.slice(2))) flags.set(arg.slice(2), args[++i] ?? "");
     else if (arg.startsWith("--")) flags.set(arg.slice(2), true);
     else positional.push(arg);
   }
@@ -256,11 +368,22 @@ async function main(argv: string[]): Promise<number> {
   }
 
   const { positional, flags } = parseArgs(rest);
-  const root = typeof flags.get("root") === "string" ? (flags.get("root") as string) : undefined;
+  const value = (name: string) => (typeof flags.get(name) === "string" ? (flags.get(name) as string) : undefined);
+  const root = value("root");
+  const mode = value("mode") ?? "sqli";
   const json = flags.has("json");
   if (json) say = (text) => console.error(text);
-  if (positional.length === 1 && flags.get("root") !== "") {
+  const emptyValue = [...VALUE_FLAGS].some((f) => flags.get(f) === "");
+  if (positional.length === 1 && !emptyValue && (mode === "sqli" || mode === "access")) {
     const [target] = positional;
+    if (mode === "access") {
+      if (!isDirectory(target)) {
+        console.error("✗ --mode access scans a project directory (routes, middleware and schema are read together).");
+        return EXIT_ERROR;
+      }
+      if (command === "scan") return scanAccess(target, value("route"), json);
+      if (command === "trace") return traceAccess(target, value("route"), flags.has("show-prompt"));
+    }
     if (command === "scan") {
       if (isDirectory(target)) return scanProject(target, json);
       return flags.has("cross-file") ? scanCrossFile(target, root, json) : scan(target, json);

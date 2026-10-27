@@ -4,7 +4,7 @@ Flowcheck is an AI agent for shift-left secure-code review of JavaScript/TypeScr
 
 Intentionally built for the Meta Global AI Developer Hackathon.
 
-**Status:** WIP — SQL injection only: project-wide scanning with cross-file tracing and model judgment (no self-verification pass yet).
+**Status:** WIP — SQL injection and broken access control / IDOR: project-wide scanning with cross-file tracing and model judgment (no self-verification pass yet).
 
 ## Quick start
 
@@ -32,6 +32,23 @@ node dist/cli.js scan path/to/project --json   # findings as a JSON Finding[] on
 node dist/cli.js trace <dir>                  # Stage 1 only: entry points, every traced hop, unresolved calls; no API call
 node dist/cli.js trace <dir> --show-prompt    # ...plus the Stage 2 prompt for each SQL sink
 ```
+
+### Broken access control / IDOR
+
+```bash
+node dist/cli.js trace <dir> --mode access                  # Stage 1 only: per-route evidence, no API call
+node dist/cli.js scan <dir> --mode access                   # Stage 1 + Stage 2
+node dist/cli.js scan <dir> --mode access --route /orders   # judge only routes whose "METHOD /path" contains /orders
+```
+
+An access-control bug is a missing check, not a dangerous sink: the query can be perfectly parameterized. For each route (paths composed from where routers are mounted), Stage 1 assembles evidence instead of hunting sinks:
+
+- **Request identifiers → data:** which path parameters (and `…Id`-style query/body fields) reach which data access, read or write, and which column they select.
+- **Identity:** the middleware on the route's chain that sets `req.user` (or `ctx.state.user`), and the fields it carries.
+- **Scoping:** from SQL schema files, which accessed tables carry an ownership column (`<identity field>` in snake case, usually a foreign key) or are themselves the scope record.
+- **Checks:** comparisons of a request value or a loaded record's owner field with the identity that reject on mismatch (in the handler, services or middleware), and queries constrained by an identity value. A check placed after a write does not count.
+
+Routes that are unauthenticated, already checked, or that only touch tables the schema shows as unowned are not sent to the model. Each remaining route is judged once, with its evidence and the sibling routes that do enforce a check. Only a route with all three signals (identity available, scoped data, no check) is reported. Reads are reported as IDOR (CWE-639), writes as missing authorization (CWE-862).
 
 ### Single entry file
 

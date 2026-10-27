@@ -47,6 +47,8 @@ export interface CandidatePath {
   hops: Hop[];
   /** True when taint reaches the SQL text argument; false when it only reaches bound parameters. */
   sqlText: boolean;
+  /** Where the input entered: `file:line:<variable or request expression>`. */
+  origin: string;
 }
 
 /** A tainted call into project code that the tracer could not follow — the place a trace breaks. */
@@ -92,7 +94,7 @@ export interface TraceResult {
   external: ExternalCall[];
 }
 
-type Fn = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
+export type Fn = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
 type Cls = ClassDeclaration | ClassExpression;
 interface Taint {
   origin: string;
@@ -117,7 +119,14 @@ type Value =
  */
 type Req = { name: string; via: Hop[] };
 /** A request handler to trace from: `req` is its request parameter, `self` its `this` when it is a method. */
-type Handler = { fn: Fn; req: Req; self?: Value; entry: EntryPoint };
+export type Handler = {
+  fn: Fn;
+  req: Req;
+  self?: Value;
+  entry: EntryPoint;
+  /** The router/app call that registered it, for handlers found through a route registration. */
+  registration?: CallExpression;
+};
 type ProjectValue = Extract<Value, { kind: "module" | "object" | "class" | "instance" }>;
 type Callee = Value | { kind: "sink" };
 
@@ -132,7 +141,7 @@ const REQUEST_PARAM = /^(?:req|request|ctx|context)$/;
 const MODULE_EXTENSIONS = ["", ".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx", ".mts", ".cts", "/index.js", "/index.ts", "/index.mjs", "/index.cjs"];
 const MAX_DEPTH = 8;
 
-function isFn(node: Node | undefined): node is Fn {
+export function isFn(node: Node | undefined): node is Fn {
   return (
     Node.isFunctionDeclaration(node) || Node.isArrowFunction(node) || Node.isFunctionExpression(node) || Node.isMethodDeclaration(node)
   );
@@ -142,7 +151,7 @@ function isProjectValue(v: Value): v is ProjectValue {
   return v.kind === "module" || v.kind === "object" || v.kind === "class" || v.kind === "instance";
 }
 
-function excerpt(node: Node, max = 140): string {
+export function excerpt(node: Node, max = 140): string {
   const text = node.getText().replace(/\s+/g, " ").trim();
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
@@ -211,7 +220,7 @@ export function findProjectRoot(entry: string): string {
   }
 }
 
-class Tracer {
+export class Tracer {
   private readonly project = new Project({
     compilerOptions: { allowJs: true },
     skipAddingFilesFromTsConfig: true,
@@ -292,6 +301,7 @@ class Tracer {
             h.entry.route = route;
             const at = `${this.rel(sf)}:${call.getStartLineNumber()}`;
             if (at !== `${h.entry.file}:${h.entry.line}`) h.entry.registeredAt = at;
+            h.registration = call;
             found.set(v.fn, h);
           }
         }
@@ -344,6 +354,38 @@ class Tracer {
       fn.getDescendantsOfKind(SyntaxKind.CallExpression).some((c) => c.getArguments().some((a) => Node.isIdentifier(a) && a.getText() === req));
     const entry: EntryPoint = { file: this.rel(fn.getSourceFile()), line: fn.getStartLineNumber(), name: this.fnName(fn), readsInput };
     return { fn, req: { name: req, via: [] }, self, entry };
+  }
+
+  // ---- read-only access for other analyses (no effect on tracing) -------------------------
+
+  /** The project function an expression refers to, if any (with its `this` binding when it is a method). */
+  resolveFunction(node: Node): { fn: Fn; self?: Value } | undefined {
+    const v = this.resolveExpr(node);
+    return v.kind === "function" ? { fn: v.fn, self: v.self } : undefined;
+  }
+
+  /** The project file an expression was loaded from: `x` in `const x = require('./x')` / `import x from './x'`. */
+  requiredFile(node: Node): SourceFile | undefined {
+    const e = unwrap(node);
+    if (!Node.isIdentifier(e)) return undefined;
+    const decl = this.lookup(e, e.getText());
+    let spec: string | undefined;
+    if (Node.isVariableDeclaration(decl)) {
+      const init = decl.getInitializer();
+      const arg = Node.isCallExpression(init) && init.getExpression().getText() === "require" ? init.getArguments()[0] : undefined;
+      if (arg && Node.isStringLiteral(arg)) spec = arg.getLiteralValue();
+    } else if (Node.isImportClause(decl) || Node.isNamespaceImport(decl)) {
+      spec = decl.getFirstAncestorByKind(SyntaxKind.ImportDeclaration)?.getModuleSpecifierValue();
+    }
+    return spec?.startsWith(".") ? this.resolveModule(e.getSourceFile(), spec) : undefined;
+  }
+
+  relPath(sf: SourceFile): string {
+    return this.rel(sf);
+  }
+
+  functionRef(fn: Fn): FunctionRef {
+    return this.fnRef(fn);
   }
 
   // ---- naming / hops ----------------------------------------------------------------------
@@ -642,7 +684,7 @@ class Tracer {
       const keys = [`${t.origin}->${sinkHop.file}:${sinkHop.line}`, hops.map((h) => `${h.kind}@${h.file}:${h.line}`).join(">")];
       if (keys.some((k) => this.pathKeys.has(k))) continue;
       keys.forEach((k) => this.pathKeys.add(k));
-      this.paths.push({ hops, sqlText });
+      this.paths.push({ hops, sqlText, origin: t.origin });
     }
   }
 
