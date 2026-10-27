@@ -97,9 +97,15 @@ export class Target {
     assertLocalTarget(url.toString()); // defense in depth: a crafted path cannot redirect us off-host
     const headers = { ...init.headers };
     let body: string | undefined;
-    if (init.body !== undefined) {
+    // GET/HEAD cannot carry a body (fetch throws); ignore one if the PoC supplied it, and put it in the query instead.
+    const canHaveBody = method !== "GET" && method !== "HEAD";
+    if (init.body !== undefined && canHaveBody) {
       headers["Content-Type"] = "application/json";
       body = JSON.stringify(init.body);
+    } else if (init.body !== undefined && init.body !== null && typeof init.body === "object") {
+      for (const [k, v] of Object.entries(init.body as Record<string, unknown>)) {
+        if (!url.searchParams.has(k)) url.searchParams.set(k, typeof v === "string" ? v : JSON.stringify(v));
+      }
     }
     const res = await this.fetchImpl(url.toString(), { method, headers, body, redirect: "manual" });
     const text = await res.text();

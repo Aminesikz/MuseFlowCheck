@@ -176,6 +176,15 @@ test("Target exchanges login credentials for a token once", async () => {
   assert.equal(logins, 1); // token cached after the first exchange
 });
 
+test("a GET request never carries a body; an object body folds into the query string", async () => {
+  const target = new Target({ url: base, auth: { kind: "token", token: "tenant-1" } });
+  // The model sometimes emits a GET PoC with a body; fetch would throw. It must be folded into the query instead.
+  const res = await target.request("GET", "/api/appointments", { body: { status: "' OR '1'='1" } });
+  assert.equal(res.status, 200);
+  assert.match(res.path, /status=/);
+  assert.equal(JSON.parse(res.body).appointments.length, 4); // the injected status still reached the query
+});
+
 // ---- patch proof --------------------------------------------------------------------------------
 
 test("patch proof: a named-function patch is applied, and a blocked exploit reports 'blocked'", async () => {
