@@ -4,15 +4,19 @@ Flowcheck is an AI agent for shift-left secure-code review of JavaScript/TypeScr
 
 Intentionally built for the Meta Global AI Developer Hackathon.
 
-**Status:** WIP — Day 0 (project skeleton + API smoke test only).
+**Status:** WIP — single-file SQL injection detection (no cross-file tracing or verification yet).
 
 ## Quick start
 
 ```bash
 cp .env.example .env   # then paste your META_API_KEY into .env
 npm install
-npm run smoke
+npm run smoke          # check API access
+npm run build
+node dist/cli.js scan fixtures/sqli-single-file.js
 ```
+
+`flowcheck scan <file>` exits `0` when there are no high/critical findings, `1` when there are, and `2` on errors.
 
 ## License
 
