@@ -64,7 +64,7 @@ CODE — every function on the paths, with real file line numbers prefixed as "N
 ${functionsOn(group).map(codeSlice).join("\n\n")}
 
 ${SEVERITY_GUIDE}
-Middleware and route registration are not shown. If the handler reads an authenticated-user object (e.g. req.user, ctx.state.user), assume the route requires login; otherwise assume it may be reachable without authentication. Apply the severity rule above on that basis, and state the assumption in the explanation.
+Middleware and route registration are not shown. If the handler reads an authenticated-user object (e.g. req.user, ctx.state.user), assume the route requires login; otherwise assume it may be reachable without authentication. State that assumption in the explanation. It only affects the "without authentication" condition of rule 1 — it never lowers severity when the data-scope condition of rule 1 matches.
 
 OUTPUT
 Return ONLY a JSON array — no prose, no markdown fences.

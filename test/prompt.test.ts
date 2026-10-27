@@ -34,6 +34,15 @@ test("prompt defines the sink as the execute call", () => {
   assert.match(instructions, /illustrative, NOT exhaustive/);
 });
 
+test("severity is an ordered decision where impact outranks reachability", () => {
+  assert.match(instructions, /IN ORDER and assign the FIRST one that matches/);
+  assert.match(instructions, /Requiring a login does NOT lower severity/);
+  // The old contradictory clause must not come back.
+  assert.doesNotMatch(instructions, /reachable only behind authentication/);
+  const order = ['1. "critical"', '2. "high"', '3. "medium" or "low"'].map((s) => instructions.indexOf(s));
+  assert.ok(order.every((i) => i >= 0) && order[0] < order[1] && order[1] < order[2]);
+});
+
 test("numberLines prefixes 1-based, padded line numbers", () => {
   assert.equal(numberLines("a\nb"), "1 | a\n2 | b");
 });

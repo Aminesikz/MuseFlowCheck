@@ -22,7 +22,15 @@ export const SAFE_PATTERNS = `- Parameterized / bound queries: the SQL text cont
 - Query-builder / ORM methods that bind values internally (object or value arguments to where/insert/update/find, etc.).
 - Values neutralized before reaching SQL text: converted to a number (Number(), parseInt(), parseFloat(), unary +) or validated against a fixed allowlist (includes on a constant list, switch/map lookup to constant strings, enum check), or escaped with the driver's escape function (escape(), escapeId(), format with %L/%I, etc.).`;
 
-export const SEVERITY_GUIDE = `SEVERITY: "critical" if an unauthenticated or low-privilege user can read or modify data beyond their own; "high" for injection reachable only behind authentication or with limited impact; lower only with a clear reason.`;
+/**
+ * Severity as an ordered decision: impact outranks reachability, so a finding that needs a login but
+ * crosses data boundaries is still critical. The first matching rule wins — no overlap between levels.
+ */
+export const SEVERITY_GUIDE = `SEVERITY — check these rules IN ORDER and assign the FIRST one that matches:
+1. "critical" — the attacker can read or modify data beyond their own scope (other users' records, other tenants or organizations, other tables, or the whole database), OR the flaw can be exploited without authentication. Requiring a login does NOT lower severity when this rule matches.
+2. "high" — exploitable, but the impact is confined to the attacker's own data/scope, or is meaningfully constrained by something visible in the code.
+3. "medium" or "low" — only for a specific, clearly stated reason (e.g. a strong precondition, or no sensitive data reachable).
+For SQL injection: unless the code shows otherwise, an injectable query can rewrite its own filter (e.g. drop a WHERE condition, add UNION SELECT), so it normally reaches data beyond the attacker's scope.`;
 
 /** Prefixes each line with its 1-based number so the model can cite exact lines. */
 export function numberLines(source: string): string {
