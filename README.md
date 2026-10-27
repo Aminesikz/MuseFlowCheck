@@ -4,7 +4,7 @@ Flowcheck is an AI agent for shift-left secure-code review of JavaScript/TypeScr
 
 Intentionally built for the Meta Global AI Developer Hackathon.
 
-**Status:** WIP — SQL injection and broken access control / IDOR: project-wide scanning with cross-file tracing and model judgment (no self-verification pass yet).
+**Status:** WIP — SQL injection and broken access control / IDOR: project-wide scanning with cross-file tracing, model judgment, and optional self-verification that proves findings against a running local target.
 
 ## Quick start
 
@@ -70,6 +70,31 @@ Calls are resolved syntactically across CommonJS and ES modules:
 - Destructured parameters, mapped by key when the argument is an object literal.
 
 A tainted call that can't be followed is listed, never dropped. The trace output shows it either as **unresolved** (project code the tracer couldn't follow, such as a dynamic `require`, a missing export, or taint passed into a constructor and stored in a field) or as **leaving the project** (a package, a global, or a caller-supplied parameter).
+
+## Verification (proving findings)
+
+Analysis reports findings as `"suspected"`. When you pass `--target`, Flowcheck tries to prove each finding by executing it against a running instance you control, and marks it `"confirmed"` or `"unverified"`.
+
+> **Safety.** Verification sends real exploit requests, so it runs **only** against a loopback target you configure explicitly — `localhost`, `127.0.0.1`, `::1`, or a `*.localhost` / `*.test` host. Any other host is refused. There is no host discovery; without `--target`, verification never runs and behavior is exactly as before.
+
+For each finding the model proposes a benign **baseline** request and an **exploit** request, plus a success condition the tool checks by comparing the two real responses (a tenant of injected rows the baseline doesn't return, a UNION marker, a cross-tenant field, or an unblocked status). A finding is only `"confirmed"` when that comparison shows the exploit did something the baseline did not; otherwise it is `"unverified"` and says so.
+
+```bash
+# start the target yourself (example: the bundled vulnerable fixture)
+cd ../MetaVulnSite && npm run seed && npm start      # prints seeded per-tenant bearer tokens
+
+# SQL injection, proved as a low-privilege tenant:
+node dist/cli.js scan ../MetaVulnSite/server \
+  --target http://localhost:4000 --token <seeded-tenant-token> --identity "it belongs to shop 1"
+
+# Broken access control / IDOR:
+node dist/cli.js scan ../MetaVulnSite/server --mode access \
+  --target http://localhost:4000 --token <seeded-tenant-token>
+```
+
+Instead of `--token`, you can pass `--login-path /api/auth/login --login-body '{"email":"…","password":"…"}'` and Flowcheck exchanges the credentials for a token (`--token-field` names the field, default `token`).
+
+With `--verify-patch`, a confirmed finding's `suggestedPatch` is applied to a throwaway copy of the project (the original is never touched), the copy is started (`--start-cmd`, default `npm start`), and the exact PoC is re-run: the patch is "blocked" only if the exploit now fails while a benign request still works. Patches that aren't a clean single-function replacement are reported as `not-attempted` rather than guessed at.
 
 ## License
 

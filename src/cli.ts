@@ -24,8 +24,18 @@ import {
   type AccessContext,
   type AccessRoute,
 } from "./engine/access/index.js";
+import {
+  Target,
+  TargetError,
+  verifyFindings,
+  verifyPatch,
+  type AuthConfig,
+  type VerifyDeps,
+} from "./engine/verify/index.js";
+import { startPatchedServer } from "./engine/verify/server.js";
+import { complete } from "./llm/meta-client.js";
 import { describeApiError, loadDotEnv } from "./llm/errors.js";
-import { SEVERITIES, type Finding } from "./types/index.js";
+import { CONFIDENCES, SEVERITIES, type Confidence, type Finding, type Verification } from "./types/index.js";
 
 const VERSION = "0.0.0";
 const USAGE = `flowcheck v${VERSION}
@@ -46,9 +56,21 @@ Usage:
                                                      Access-control Stage 1 only (no API call)
   flowcheck --version
 
-  --mode   sqli (default) or access
-  --route  only judge (or show prompts for) routes whose "METHOD /path" contains <text>
-  --json   print the findings as a JSON Finding[] on stdout (progress and summary go to stderr)
+  --mode    sqli (default) or access
+  --route   only judge (or show prompts for) routes whose "METHOD /path" contains <text>
+  --json    print the findings as a JSON Finding[] on stdout (progress and summary go to stderr)
+
+Verification (optional; proves findings by executing them against a target you run):
+  --target <url>        a LOCAL target to verify against (localhost / 127.0.0.1 / ::1 / *.localhost / *.test only);
+                        without it, findings stay "suspected" and nothing is executed
+  --token <bearer>      bearer token the PoC requests use (a seeded low-privilege tenant token)
+  --login-path <path>   instead of --token, POST credentials here and read a token from the response
+  --login-body <json>   JSON credentials body for --login-path (e.g. '{"email":"a@b.test","password":"x"}')
+  --token-field <name>  field holding the token in the login response (default "token")
+  --identity <text>     describes the token's own scope for the PoC prompt (e.g. "it belongs to shop 1")
+  --verify-patch        also apply each confirmed finding's patch to a throwaway copy and re-run the PoC
+  --start-cmd <cmd>     command that starts the patched copy, honoring PORT (default "npm start")
+  --ready-path <path>   path polled until the patched server answers (default "/")
 
 Exit codes: 0 no high/critical findings, 1 high/critical finding(s), 2 error`;
 
@@ -58,11 +80,30 @@ const EXIT_ERROR = 2;
 /** Human-readable output: stdout normally, stderr when stdout is reserved for --json. */
 let say: (text: string) => void = (text) => console.log(text);
 
+/** When a target is configured, findings are proved against it after analysis. */
+interface VerifyRuntime {
+  target: Target;
+  deps: VerifyDeps;
+}
+let verify: VerifyRuntime | undefined;
+
 function indent(text: string, prefix = "    "): string {
   return text
     .split("\n")
     .map((line) => prefix + line)
     .join("\n");
+}
+
+function formatEvidence(label: string, e: NonNullable<Verification["baseline"]>): string {
+  return `    ${label}: ${e.method} ${e.path} → ${e.status}\n      response: ${e.responseExcerpt}`;
+}
+
+function formatVerification(v: Verification): string[] {
+  const lines = [`  Verification (${v.outcome}):`, indent(v.summary)];
+  if (v.baseline) lines.push(formatEvidence("baseline", v.baseline));
+  if (v.exploit) lines.push(formatEvidence("exploit ", v.exploit));
+  if (v.patchProof) lines.push(`  Patch proof (${v.patchProof.outcome}):`, indent(v.patchProof.summary));
+  return lines;
 }
 
 function formatFinding(f: Finding, n: number): string {
@@ -76,7 +117,35 @@ function formatFinding(f: Finding, n: number): string {
     indent(f.explanation),
     `  Suggested patch:`,
     indent(f.suggestedPatch),
+    ...(f.verification ? formatVerification(f.verification) : []),
   ].join("\n");
+}
+
+/** Counts by confidence, for the summary line when verification ran (e.g. "2 confirmed, 1 unverified"). */
+function confidenceBreakdown(findings: Finding[]): string {
+  return CONFIDENCES.map((c) => [c, findings.filter((f) => f.confidence === c).length] as const)
+    .filter(([, n]) => n > 0)
+    .map(([c, n]) => `${n} ${c}`)
+    .join(", ");
+}
+
+/**
+ * When a target is configured, proves each finding against it and returns the updated list. A bad target or a
+ * failed login aborts verification (configuration error) and is reported; analysis findings are returned as-is.
+ */
+async function finalizeFindings(findings: Finding[], label: string): Promise<{ findings: Finding[]; error?: boolean }> {
+  if (!verify || findings.length === 0) return { findings };
+  say(`\nVerification — proving ${findings.length} finding(s) against ${verify.target.base} ...\n`);
+  try {
+    return { findings: await verifyFindings(findings, verify.target, verify.deps) };
+  } catch (err) {
+    if (err instanceof TargetError) {
+      console.error(`✗ Verification aborted: ${err.message}`);
+      return { findings, error: true };
+    }
+    console.error(`✗ Verification error: ${describeError(err, label)}`);
+    return { findings, error: true };
+  }
 }
 
 function formatEntryPoint(e: EntryPoint): string {
@@ -140,20 +209,27 @@ function emitFindings(findings: Finding[], json: boolean): number {
   return gatedCount(findings) > 0 ? EXIT_GATE : 0;
 }
 
-function printFindings(findings: Finding[], json: boolean): number {
-  const code = emitFindings(findings, json);
-  say(`Summary: ${findings.length} finding(s), ${gatedCount(findings)} high/critical.`);
-  return code;
-}
 
 async function scan(file: string, json: boolean): Promise<number> {
   loadDotEnv();
   say(`Scanning ${file} for SQL injection...\n`);
+  let findings: Finding[];
   try {
-    return printFindings(await analyzeFile(file), json);
+    findings = await analyzeFile(file);
   } catch (err) {
     return reportError(err, file);
   }
+  const final = await finalizeFindings(findings, file);
+  const code = emitFindings(final.findings, json);
+  say(summaryLine(final.findings));
+  return final.error ? EXIT_ERROR : code;
+}
+
+/** "Summary: N finding(s), M high/critical[, confidence breakdown when verified]." */
+function summaryLine(findings: Finding[]): string {
+  const verified = findings.some((f) => f.confidence !== "suspected");
+  const conf = verified ? ` (${confidenceBreakdown(findings)})` : "";
+  return `Summary: ${findings.length} finding(s), ${gatedCount(findings)} high/critical${conf}.`;
 }
 
 /** Stage 2 plus output for a finished trace; shared by single-entry and project scans. */
@@ -166,7 +242,9 @@ async function judgeAndReport(trace: TraceResult, label: string, json: boolean, 
     say(`Stage 2 — asking the model to judge ${groups.length} SQL execution call(s)...\n`);
     result = await judgeTrace(trace);
   }
-  const findings = [...result.findings].sort(bySeverity);
+  const judged = [...result.findings].sort(bySeverity);
+  const final = await finalizeFindings(judged, label);
+  const findings = final.findings;
 
   if (project) {
     const counts = SEVERITIES.map((s) => `${s} ${findings.filter((f) => f.severity === s).length}`).join(", ");
@@ -177,17 +255,18 @@ async function judgeAndReport(trace: TraceResult, label: string, json: boolean, 
         `  Entry points:   ${trace.handlers} (${readingInput(trace)} read request input)`,
         `  SQL sinks:      ${result.sinks} judged (${result.calls} model call(s)); ${trace.paths.filter((p) => !p.sqlText).length} path(s) reach SQL only as bound parameters`,
         `  Findings:       ${findings.length} — ${counts}`,
+        ...(findings.some((f) => f.confidence !== "suspected") ? [`  Confidence:     ${confidenceBreakdown(findings)}`] : []),
         `  Unresolved:     ${trace.unresolved.length} call(s)`,
         "",
       ].join("\n"),
     );
   }
   let code = emitFindings(findings, json);
-  if (!project) say(`Summary: ${findings.length} finding(s), ${gatedCount(findings)} high/critical.`);
+  if (!project) say(summaryLine(findings));
   if (project) say(formatUnresolved(trace));
 
   for (const f of result.failures) console.error(`✗ Judging ${f.sink} failed: ${describeError(f.error, label)}`);
-  if (result.failures.length > 0 && code === 0) code = EXIT_ERROR; // an unjudged sink is not a clean result
+  if ((result.failures.length > 0 || final.error) && code === 0) code = EXIT_ERROR; // an unjudged sink, or a verification error, is not a clean result
   return code;
 }
 
@@ -321,7 +400,9 @@ async function scanAccess(dir: string, filter: string | undefined, json: boolean
     ].join("\n"),
   );
   const result = toJudge.length > 0 ? await judgeAccess(ctx, filter) : { findings: [], failures: [], cleared: [], calls: 0 };
-  const findings = [...result.findings].sort(bySeverity);
+  const judged = [...result.findings].sort(bySeverity);
+  const final = await finalizeFindings(judged, dir);
+  const findings = final.findings;
   const counts = SEVERITIES.map((s) => `${s} ${findings.filter((f) => f.severity === s).length}`).join(", ");
   say(
     [
@@ -330,18 +411,50 @@ async function scanAccess(dir: string, filter: string | undefined, json: boolean
       `  Routes:         ${ctx.routes.length} (${ctx.routes.filter((r) => r.status === "guarded").length} guarded)`,
       `  Judged:         ${result.calls} route(s); ${result.cleared.length} judged not vulnerable`,
       `  Findings:       ${findings.length} — ${counts}`,
+      ...(findings.some((f) => f.confidence !== "suspected") ? [`  Confidence:     ${confidenceBreakdown(findings)}`] : []),
       "",
     ].join("\n"),
   );
   let code = emitFindings(findings, json);
   for (const r of result.cleared) say(`Judged not vulnerable: ${routeLabel(r)}`);
   for (const f of result.failures) console.error(`✗ Judging ${f.route} failed: ${describeError(f.error, dir)}`);
-  if (result.failures.length > 0 && code === 0) code = EXIT_ERROR;
+  if ((result.failures.length > 0 || final.error) && code === 0) code = EXIT_ERROR;
   return code;
 }
 
-/** Flags that take a value: `--root <dir>`, `--mode <name>`, `--route <text>`. */
-const VALUE_FLAGS = new Set(["root", "mode", "route"]);
+/** Flags that take a value. */
+const VALUE_FLAGS = new Set(["root", "mode", "route", "target", "token", "login-path", "login-body", "token-field", "identity", "start-cmd", "ready-path"]);
+
+/** Builds the verification runtime from the flags, or undefined when no `--target` is given. Throws on bad config. */
+function buildVerifyRuntime(value: (name: string) => string | undefined, patch: boolean, dir: string): VerifyRuntime | undefined {
+  const url = value("target");
+  if (url === undefined) return undefined;
+
+  let auth: AuthConfig = { kind: "none" };
+  const token = value("token");
+  const loginPath = value("login-path");
+  if (token !== undefined) {
+    auth = { kind: "token", token };
+  } else if (loginPath !== undefined) {
+    let body: Record<string, unknown> = {};
+    try {
+      body = JSON.parse(value("login-body") ?? "{}");
+    } catch {
+      throw new TargetError("--login-body must be valid JSON");
+    }
+    auth = { kind: "login", path: loginPath, body, tokenField: value("token-field") ?? "token" };
+  }
+
+  const target = new Target({ url, auth }); // throws TargetError for a non-local host
+  const deps: VerifyDeps = { complete, identityHint: value("identity") };
+  if (patch) {
+    deps.patchProof = verifyPatch({
+      projectDir: dir,
+      start: (copyDir) => startPatchedServer(copyDir, { command: value("start-cmd") ?? "npm start", readyPath: value("ready-path"), auth }),
+    });
+  }
+  return { target, deps };
+}
 
 /** Splits argv into positionals and `--flag [value]` options. */
 function parseArgs(args: string[]): { positional: string[]; flags: Map<string, string | true> } {
@@ -376,6 +489,14 @@ async function main(argv: string[]): Promise<number> {
   const emptyValue = [...VALUE_FLAGS].some((f) => flags.get(f) === "");
   if (positional.length === 1 && !emptyValue && (mode === "sqli" || mode === "access")) {
     const [target] = positional;
+    if (command === "scan") {
+      try {
+        verify = buildVerifyRuntime(value, flags.has("verify-patch"), target);
+      } catch (err) {
+        console.error(`✗ ${err instanceof TargetError ? err.message : describeError(err, target)}`);
+        return EXIT_ERROR;
+      }
+    }
     if (mode === "access") {
       if (!isDirectory(target)) {
         console.error("✗ --mode access scans a project directory (routes, middleware and schema are read together).");

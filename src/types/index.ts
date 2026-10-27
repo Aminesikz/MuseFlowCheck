@@ -3,8 +3,11 @@
 export const SEVERITIES = ["critical", "high", "medium", "low"] as const;
 export type Severity = (typeof SEVERITIES)[number];
 
-export const CONFIDENCES = ["confirmed", "suspected"] as const;
-/** "suspected" until the self-verification pass promotes a finding to "confirmed". */
+export const CONFIDENCES = ["confirmed", "suspected", "unverified"] as const;
+/**
+ * Analysis reports "suspected". The self-verification pass, when a local target is configured, promotes a finding
+ * to "confirmed" (its PoC demonstrably succeeded) or marks it "unverified" (execution did not confirm it).
+ */
 export type Confidence = (typeof CONFIDENCES)[number];
 
 export interface Finding {
@@ -33,4 +36,28 @@ export interface Finding {
   /** Corrected code for the sink. */
   suggestedPatch: string;
   confidence: Confidence;
+  /** Attached by the self-verification pass when a local target is configured; drives `confidence`. */
+  verification?: Verification;
+}
+
+/** One HTTP request sent during verification, recorded as evidence. */
+export interface EvidenceRequest {
+  method: string;
+  path: string;
+  status: number;
+  /** A short, truncated excerpt of the response body. */
+  responseExcerpt: string;
+}
+
+/** The result of attempting to prove a finding against the configured local target. */
+export interface Verification {
+  /** "confirmed" when the exploit demonstrably succeeded against the baseline; "unverified" otherwise. */
+  outcome: "confirmed" | "unverified";
+  /** Plain-language account of what was attempted and what the comparison showed. */
+  summary: string;
+  /** The benign request and the exploit request, for the evidence trail. */
+  baseline?: EvidenceRequest;
+  exploit?: EvidenceRequest;
+  /** Result of re-running the PoC against a patched copy: did the exploit stop working while a benign request still succeeded? */
+  patchProof?: { outcome: "blocked" | "still-exploitable" | "not-attempted"; summary: string };
 }
