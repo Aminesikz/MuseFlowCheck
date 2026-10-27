@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import orders, { findUser as lookupUser } from "../db/index.js";
 import * as reports from "../services/reports.js";
 import runReport from "../services/run.js";
+import { ledger } from "../services/ledger.js";
 
 export const router = Router();
 
@@ -19,4 +20,8 @@ router.get("/monthly", async (req: Request, res: Response) => {
 
 router.post("/run", async (req: Request, res: Response) => {
   res.json(await runReport(req.body.name));
+});
+
+router.get("/ledger", async (req: Request, res: Response) => {
+  res.json(await ledger.find(String(req.query.account)));
 });

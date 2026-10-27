@@ -33,10 +33,11 @@ Calls are resolved syntactically across CommonJS and ES modules:
 - `require` / `import`: namespace, default, named, aliased, destructured, and `require('./x').fn`.
 - Re-exports: barrel `index` files, `module.exports = { ...require('./x') }`, `export { x } from`, `export { default } from`, and `export * from`.
 - Methods on exported objects, class instances (including `this.method()`), and objects returned by single-return factories.
+- Constructor-injected dependencies: `this.repo = repo`, TypeScript parameter properties, and `super(...)` chains, resolved from the `new` site's arguments.
 - Handlers defined in another file and registered by reference (`router.get('/x', controller.list)`).
 - Destructured parameters, mapped by key when the argument is an object literal.
 
-A tainted call that can't be followed is listed, never dropped. The trace output shows it either as **unresolved** (project code the tracer couldn't follow, such as a dynamic `require`, a missing export, or a constructor-injected dependency) or as **leaving the project** (a package, a global, or a caller-supplied parameter).
+A tainted call that can't be followed is listed, never dropped. The trace output shows it either as **unresolved** (project code the tracer couldn't follow, such as a dynamic `require`, a missing export, or taint passed into a constructor and stored in a field) or as **leaving the project** (a package, a global, or a caller-supplied parameter).
 
 ## License
 

@@ -12,9 +12,11 @@ import {
   type CallExpression,
   type ClassDeclaration,
   type ClassExpression,
+  type ConstructorDeclaration,
   type FunctionDeclaration,
   type FunctionExpression,
   type MethodDeclaration,
+  type NewExpression,
   type ObjectLiteralExpression,
   type SourceFile,
   type VariableDeclaration,
@@ -81,14 +83,18 @@ interface Taint {
 type Env = Map<string, Taint[]>;
 
 /** What an expression statically refers to, as far as the tracer can tell. */
+type Thunk = () => Value;
 type Value =
-  | { kind: "function"; fn: Fn }
+  | { kind: "function"; fn: Fn; self?: Value } // self: what `this` is bound to when called as a method
+
   | { kind: "module"; sf: SourceFile }
   | { kind: "object"; obj: ObjectLiteralExpression }
   | { kind: "class"; cls: Cls }
-  | { kind: "instance"; cls: Cls }
+  | { kind: "instance"; cls: Cls; args?: Thunk[] } // args: constructor arguments from the `new` site, when known
   | { kind: "external"; what: string }
   | { kind: "unresolved"; reason: string };
+/** A request handler to trace from: `req` is its request parameter, `self` its `this` when it is a method. */
+type Handler = { fn: Fn; req: string; self?: Value };
 type ProjectValue = Extract<Value, { kind: "module" | "object" | "class" | "instance" }>;
 type Callee = Value | { kind: "sink" };
 
@@ -190,6 +196,8 @@ class Tracer {
   /** Declarations / exports currently being resolved, to stop on circular definitions and re-exports. */
   private readonly resolvingDecls = new Set<Node>();
   private readonly resolvingExports = new Set<string>();
+  /** `this` binding of each function being analyzed (top = current), set when it was entered as a method call. */
+  private readonly selfStack: (Value | undefined)[] = [];
   readonly paths: CandidatePath[] = [];
   readonly unresolved: UnresolvedCall[] = [];
   readonly external: ExternalCall[] = [];
@@ -201,8 +209,8 @@ class Tracer {
   }
 
   /** Request handlers in a file: functions whose first parameter is read as `<param>.query|params|body`. */
-  handlers(sf: SourceFile): { fn: Fn; req: string }[] {
-    const found: { fn: Fn; req: string }[] = [];
+  handlers(sf: SourceFile): Handler[] {
+    const found: Handler[] = [];
     for (const node of sf.getDescendants()) {
       const req = isFn(node) ? this.handlerReq(node) : undefined;
       if (req) found.push({ fn: node as Fn, req });
@@ -214,8 +222,8 @@ class Tracer {
    * Handlers defined in other files but referenced from this one, e.g. `router.get('/x', controller.list)`.
    * Only arguments of calls outside function bodies (route registration) are considered.
    */
-  referencedHandlers(sf: SourceFile): { fn: Fn; req: string }[] {
-    const found = new Map<Fn, string>();
+  referencedHandlers(sf: SourceFile): Handler[] {
+    const found = new Map<Fn, Omit<Handler, "fn">>();
     for (const call of sf.getDescendantsOfKind(SyntaxKind.CallExpression)) {
       if (call.getFirstAncestor(isFn)) continue;
       for (const arg of call.getArguments()) {
@@ -223,10 +231,10 @@ class Tracer {
         const v = this.resolveExpr(arg);
         if (v.kind !== "function" || v.fn.getSourceFile() === sf) continue;
         const req = this.handlerReq(v.fn);
-        if (req) found.set(v.fn, req);
+        if (req) found.set(v.fn, { req, self: v.self });
       }
     }
-    return [...found].map(([fn, req]) => ({ fn, req }));
+    return [...found].map(([fn, h]) => ({ fn, ...h }));
   }
 
   private handlerReq(fn: Fn): string | undefined {
@@ -353,16 +361,18 @@ class Tracer {
 
   // ---- intraprocedural walk ---------------------------------------------------------------
 
-  analyze(fn: Fn, env: Env, depth: number, req?: string): void {
+  analyze(fn: Fn, env: Env, depth: number, req?: string, self?: Value): void {
     const body = fn.getBody();
     if (!body || depth > MAX_DEPTH || this.onStack.has(fn)) return;
     this.onStack.add(fn);
+    this.selfStack.push(self);
     const ref = this.fnRef(fn);
 
     const visit = (node: Node) => {
       if (Node.isVariableDeclaration(node)) this.onDeclaration(node, env, ref, req);
       else if (Node.isBinaryExpression(node)) this.onAssignment(node, env, ref, req);
       else if (Node.isCallExpression(node)) this.onCall(node, env, ref, depth, req);
+      else if (Node.isNewExpression(node)) this.onNew(node, env, ref, req);
     };
     if (!Node.isBlock(body)) visit(body); // expression-bodied arrow: `(x) => run(x)`
     body.forEachDescendant((node, traversal) => {
@@ -370,6 +380,7 @@ class Tracer {
       visit(node);
     });
 
+    this.selfStack.pop();
     this.onStack.delete(fn);
   }
 
@@ -423,7 +434,7 @@ class Tracer {
     const at = { file: ref.file, line: call.getStartLineNumber(), call: excerpt(call.getExpression()) };
     switch (callee.kind) {
       case "function":
-        return this.enterCallee(call, callee.fn, argTaints, env, ref, depth, req);
+        return this.enterCallee(call, callee.fn, argTaints, env, ref, depth, req, callee.self);
       case "sink":
         return this.recordSink(call, argTaints, ref);
       case "external":
@@ -435,6 +446,22 @@ class Tracer {
     }
   }
 
+  /**
+   * Tainted constructor arguments. Taint stored in instance fields is not tracked, so a project class is reported
+   * as unresolved (not dropped); a package class is a call leaving the project.
+   */
+  private onNew(expr: NewExpression, env: Env, ref: FunctionRef, req?: string): void {
+    if ((expr.getArguments() ?? []).every((arg) => this.exprTaints(arg, env, ref, req).length === 0)) return;
+    const ctor = this.resolveExpr(expr.getExpression());
+    const at = { file: ref.file, line: expr.getStartLineNumber(), call: `new ${excerpt(expr.getExpression())}` };
+    if (ctor.kind === "external") return this.addEdge(this.external, { ...at, target: ctor.what });
+    const reason =
+      ctor.kind === "unresolved"
+        ? ctor.reason
+        : "tainted constructor argument — taint stored in instance fields is not tracked";
+    this.addEdge(this.unresolved, { ...at, reason });
+  }
+
   private addEdge<T extends { file: string; line: number; call: string }>(list: T[], edge: T): void {
     const key = `${edge.file}:${edge.line}:${edge.call}`;
     if (this.edgeKeys.has(key)) return;
@@ -444,7 +471,16 @@ class Tracer {
 
   // ---- interprocedural: argument → parameter ------------------------------------------------
 
-  private enterCallee(call: CallExpression, fn: Fn, argTaints: Taint[][], env: Env, ref: FunctionRef, depth: number, req?: string): void {
+  private enterCallee(
+    call: CallExpression,
+    fn: Fn,
+    argTaints: Taint[][],
+    env: Env,
+    ref: FunctionRef,
+    depth: number,
+    req?: string,
+    self?: Value,
+  ): void {
     const calleeRef = this.fnRef(fn);
     const callHop = this.hop(call, "call", ref);
     const paramHop: Hop = { file: calleeRef.file, line: fn.getStartLineNumber(), code: this.signature(fn), kind: "param", fn: calleeRef };
@@ -480,7 +516,7 @@ class Tracer {
       }
     });
 
-    if (calleeEnv.size > 0) this.analyze(fn, calleeEnv, depth + 1);
+    if (calleeEnv.size > 0) this.analyze(fn, calleeEnv, depth + 1, undefined, self);
   }
 
   private recordSink(call: CallExpression, argTaints: Taint[][], ref: FunctionRef): void {
@@ -527,7 +563,7 @@ class Tracer {
     if (Node.isThisExpression(e)) return this.resolveThis(e);
     if (Node.isNewExpression(e)) {
       const ctor = this.resolveExpr(e.getExpression());
-      if (ctor.kind === "class") return { kind: "instance", cls: ctor.cls };
+      if (ctor.kind === "class") return { kind: "instance", cls: ctor.cls, args: (e.getArguments() ?? []).map((a) => () => this.resolveExpr(a)) };
       if (ctor.kind === "function") return { kind: "unresolved", reason: `'new' on constructor function ${this.fnName(ctor.fn)}` };
       return ctor;
     }
@@ -584,7 +620,11 @@ class Tracer {
     const parent = Node.isFunctionExpression(owner) ? owner.getParent()?.getParent() : owner?.getParent();
     if (Node.isClassDeclaration(parent) || Node.isClassExpression(parent)) {
       const isStatic = (Node.isMethodDeclaration(owner) || Node.isPropertyDeclaration(owner)) && owner.isStatic();
-      return { kind: isStatic ? "class" : "instance", cls: parent };
+      if (isStatic) return { kind: "class", cls: parent };
+      // Prefer the receiver this method was called on: it carries the constructor arguments from its `new` site.
+      const self = this.selfStack.at(-1);
+      if (self?.kind === "instance" && this.derivesFrom(self.cls, parent)) return self;
+      return { kind: "instance", cls: parent };
     }
     if (Node.isObjectLiteralExpression(parent)) return { kind: "object", obj: parent };
     return { kind: "unresolved", reason: "'this' outside a class or object method" };
@@ -617,7 +657,7 @@ class Tracer {
   /** A parameter's value is supplied by the caller; constructor-injected ones are project dependencies we can't see. */
   private parameterValue(owner: Node | undefined, name: string): Value {
     if (Node.isConstructorDeclaration(owner)) {
-      return { kind: "unresolved", reason: `'${name}' is injected through the constructor of ${this.ownerName(owner.getParent())}; 'new' call sites are not followed` };
+      return { kind: "unresolved", reason: `'${name}' is injected through the constructor of ${this.ownerName(owner.getParent())}, and no 'new' site with known arguments was traced` };
     }
     return { kind: "external", what: `parameter '${name}'` };
   }
@@ -703,8 +743,9 @@ class Tracer {
       case "object":
         return this.propertyOf(v.obj, name);
       case "class":
+        return this.classMember(v.cls, name, true, v);
       case "instance":
-        return this.classMember(v.cls, name, v.kind === "class");
+        return this.classMember(v.cls, name, false, v, v.args);
     }
   }
 
@@ -739,38 +780,117 @@ class Tracer {
     return blocked;
   }
 
-  /** Methods and fields of a class (and its project base classes); `this.x = …` in the constructor counts as a field. */
-  private classMember(cls: Cls, name: string, isStatic: boolean): Value | undefined {
+  /**
+   * Methods and fields of a class and its project base classes. `this.x = …` in the constructor counts as a field;
+   * when the constructor arguments are known (`args`, from the `new` site or a `super(…)` call), a field assigned
+   * from a constructor parameter resolves to the argument passed for it.
+   * `self` is the receiver methods are bound to (the most-derived instance, or the class for statics).
+   */
+  private classMember(cls: Cls, name: string, isStatic: boolean, self: Value, args?: Thunk[]): Value | undefined {
     for (const m of cls.getMembers()) {
-      if (Node.isMethodDeclaration(m) && m.getName() === name && m.isStatic() === isStatic) return { kind: "function", fn: m };
+      if (Node.isMethodDeclaration(m) && m.getName() === name && m.isStatic() === isStatic) return { kind: "function", fn: m, self };
       if (Node.isPropertyDeclaration(m) && m.getName() === name && m.isStatic() === isStatic) {
         const init = m.getInitializer();
-        return init ? this.resolveExpr(init) : { kind: "unresolved", reason: `field '${name}' of class ${cls.getName() ?? "<anonymous>"} has no initializer` };
+        if (!init) return { kind: "unresolved", reason: `field '${name}' of class ${cls.getName() ?? "<anonymous>"} has no initializer` };
+        const v = this.resolveExpr(init);
+        return v.kind === "function" && Node.isArrowFunction(v.fn) ? { ...v, self } : v;
       }
     }
-    if (!isStatic) {
-      for (const ctor of cls.getConstructors()) {
-        const prop = ctor.getParameters().find((p) => p.isParameterProperty() && p.getName() === name);
-        if (prop) return this.parameterValue(ctor, name);
-        for (const bin of ctor.getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
-          const left = bin.getLeft();
-          if (bin.getOperatorToken().getKind() !== SyntaxKind.EqualsToken || !Node.isPropertyAccessExpression(left)) continue;
-          if (Node.isThisExpression(left.getExpression()) && left.getName() === name) return this.resolveExpr(bin.getRight());
-        }
+    const ctor = cls.getConstructors()[0];
+    if (!isStatic && ctor) {
+      const prop = ctor.getParameters().find((p) => p.isParameterProperty() && p.getName() === name);
+      if (prop) return this.resolveInCtor(prop.getNameNode(), ctor, args);
+      for (const bin of ctor.getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
+        const left = bin.getLeft();
+        if (bin.getOperatorToken().getKind() !== SyntaxKind.EqualsToken || !Node.isPropertyAccessExpression(left)) continue;
+        if (Node.isThisExpression(left.getExpression()) && left.getName() === name) return this.resolveInCtor(bin.getRight(), ctor, args);
       }
     }
     const base = cls.getExtends()?.getExpression();
     if (!base) return undefined;
     const parent = this.resolveExpr(base);
-    return parent.kind === "class" ? this.classMember(parent.cls, name, isStatic) : isProjectValue(parent) ? undefined : parent;
+    if (parent.kind !== "class") return isProjectValue(parent) ? undefined : parent;
+    return this.classMember(parent.cls, name, isStatic, self, isStatic ? undefined : this.superArgs(cls, args));
+  }
+
+  /**
+   * An expression inside a constructor, with the constructor's parameters bound to `args` when known.
+   * Handles plain, destructured (`{ repo }`) and TypeScript parameter-property parameters.
+   */
+  private resolveInCtor(expr: Node, ctor: ConstructorDeclaration, args: Thunk[] | undefined): Value {
+    const e = unwrap(expr);
+    if (!Node.isIdentifier(e)) return this.resolveExpr(e);
+    const name = e.getText();
+    const decl = Node.isParameterDeclaration(e.getParent()) && e.getParent()!.getParent() === ctor ? e.getParent()! : this.lookup(e, name);
+    const param = Node.isParameterDeclaration(decl) ? decl : decl?.getFirstAncestorByKind(SyntaxKind.Parameter);
+    if (!decl || !param || param.getParent() !== ctor) return this.resolveExpr(e);
+
+    const arg = args?.[ctor.getParameters().indexOf(param)];
+    if (!arg) return this.parameterValue(ctor, name);
+    let v = arg();
+    if (Node.isBindingElement(decl)) {
+      const keys: string[] = [];
+      for (let el: Node | undefined = decl; Node.isBindingElement(el); el = el.getParent()?.getParent()) {
+        if (!Node.isObjectBindingPattern(el.getParent())) return { kind: "unresolved", reason: `'${name}' comes from array destructuring` };
+        keys.unshift(keyName(el.getPropertyNameNode() ?? el.getNameNode()));
+      }
+      for (const key of keys) {
+        if (!isProjectValue(v)) return v;
+        const m = this.member(v, key);
+        if (!m) return { kind: "unresolved", reason: this.missingReason(v, key) };
+        v = m;
+      }
+    }
+    return v;
+  }
+
+  /** Arguments a subclass passes to its base constructor: `super(…)`, or its own arguments when it has no constructor. */
+  private superArgs(cls: Cls, args: Thunk[] | undefined): Thunk[] | undefined {
+    const ctor = cls.getConstructors()[0];
+    if (!ctor) return args;
+    const superCall = ctor
+      .getDescendantsOfKind(SyntaxKind.CallExpression)
+      .find((c) => c.getExpression().getKind() === SyntaxKind.SuperKeyword);
+    return superCall?.getArguments().map((a) => () => this.resolveInCtor(a, ctor, args));
+  }
+
+  private derivesFrom(cls: Cls, ancestor: Cls): boolean {
+    for (let c: Cls | undefined = cls, hops = 0; c && hops < MAX_DEPTH; hops++) {
+      if (c === ancestor) return true;
+      const base: Node | undefined = c.getExtends()?.getExpression();
+      const parent: Value | undefined = base ? this.resolveExpr(base) : undefined;
+      c = parent?.kind === "class" ? parent.cls : undefined;
+    }
+    return false;
   }
 
   private resolveImport(from: SourceFile, spec: string, name?: string): Value {
     if (!spec.startsWith(".") && !path.isAbsolute(spec)) return { kind: "external", what: `package '${spec}'` };
     const target = this.resolveModule(from, spec);
     if (!target) return { kind: "unresolved", reason: `cannot resolve module '${spec}' from ${this.rel(from)}` };
-    if (name === undefined) return { kind: "module", sf: target };
+    if (name === undefined) return this.moduleValue(target);
     return this.exportOf(target, name) ?? { kind: "unresolved", reason: `'${spec}' resolves to ${this.rel(target)}, which has no export '${name}'` };
+  }
+
+  /**
+   * The value of a whole module. When `module.exports = X` / `export = X` assigns a function, class or instance,
+   * that is what `require()` returns; otherwise the module stands for its exports.
+   */
+  private moduleValue(sf: SourceFile): Value {
+    const whole = this.wholeExport(sf);
+    if (!whole) return { kind: "module", sf };
+    const value = this.guard(whole, () => this.resolveExpr(whole));
+    return value.kind === "object" ? { kind: "module", sf } : value;
+  }
+
+  private wholeExport(sf: SourceFile): Node | undefined {
+    let whole: Node | undefined = sf.getExportAssignment((a) => a.isExportEquals())?.getExpression();
+    for (const bin of sf.getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
+      if (bin.getOperatorToken().getKind() === SyntaxKind.EqualsToken && bin.getLeft().getText().replace(/\s+/g, "") === "module.exports") {
+        whole ??= bin.getRight();
+      }
+    }
+    return whole;
   }
 
   private exportOf(sf: SourceFile, name: string): Value | undefined {
@@ -789,14 +909,12 @@ class Tracer {
    * (`export function`, `export const`, `export default`), and re-exports (`export { x } from`, `export *`).
    */
   private findExport(sf: SourceFile, name: string): Value | undefined {
-    let whole: Node | undefined; // module.exports = … / export = …
     for (const bin of sf.getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
       if (bin.getOperatorToken().getKind() !== SyntaxKind.EqualsToken) continue;
       const left = bin.getLeft().getText().replace(/\s+/g, "");
       if (left === `exports.${name}` || left === `module.exports.${name}`) return this.resolveExpr(bin.getRight());
-      if (left === "module.exports") whole = bin.getRight();
     }
-    whole = sf.getExportAssignment((a) => a.isExportEquals())?.getExpression() ?? whole;
+    const whole = this.wholeExport(sf); // module.exports = … / export = …
 
     if (name === "default") {
       const assignment = sf.getExportAssignment((a) => !a.isExportEquals());
@@ -862,7 +980,7 @@ export function traceEntry(entry: string, root = findProjectRoot(entry)): TraceR
   const tracer = new Tracer(path.resolve(root));
   const sf = tracer.load(path.resolve(entry));
   const handlers = [...tracer.handlers(sf), ...tracer.referencedHandlers(sf)];
-  for (const { fn, req } of handlers) tracer.analyze(fn, new Map(), 0, req);
+  for (const { fn, req, self } of handlers) tracer.analyze(fn, new Map(), 0, req, self);
 
   const paths = [...tracer.paths].sort((a, b) => {
     const sa = a.hops.at(-1)!;

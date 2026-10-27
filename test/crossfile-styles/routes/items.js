@@ -6,6 +6,9 @@ const controller = require('../controllers/items');
 const plugin = require(process.env.ITEMS_PLUGIN);
 const audit = require('../services/audit');
 const reporter = require('../services/reporter');
+const inventory = require('../services/inventory');
+const Search = require('../services/search');
+const orders = require('../controllers/orders');
 
 const router = express.Router();
 
@@ -40,5 +43,15 @@ router.post('/g', async (req, res) => {
 router.get('/h', async (req, res) => {
   res.json(await reporter.run(req.query.by));
 });
+
+router.get('/i', async (req, res) => {
+  res.json(await inventory.sortedBy(req.query.col));
+});
+
+router.get('/j', async (req, res) => {
+  res.json(await new Search(req.query.j).run());
+});
+
+router.get('/k', orders.list);
 
 module.exports = router;
