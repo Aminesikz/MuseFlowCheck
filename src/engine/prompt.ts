@@ -21,7 +21,7 @@ export function numberLines(source: string): string {
 }
 
 export function buildSqliPrompt(filePath: string, source: string): string {
-  return `You are a security code reviewer. Analyze the single JavaScript/TypeScript file below for SQL injection (CWE-89) ONLY. Ignore every other vulnerability class.
+  return `You are a senior security code reviewer. Analyze the single JavaScript/TypeScript file below for SQL injection (CWE-89) ONLY. Ignore every other vulnerability class.
 
 DEFINITIONS
 - Source: untrusted HTTP input — req.query, req.params, req.body — including any variable assigned, destructured, or derived from them (e.g. \`const { id } = req.params\`, \`const name = req.body.name.trim()\`).
