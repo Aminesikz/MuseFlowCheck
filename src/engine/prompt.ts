@@ -16,6 +16,14 @@ const FINDING_SCHEMA = `interface Finding {
   confidence: "suspected";
 }`;
 
+/** Patterns that neutralize SQL injection, stated as general principles (shared with the cross-file judge). */
+export const SAFE_PATTERNS = `- Parameterized / bound queries: the SQL text contains only placeholders ($1, ?, :name, @name) and the values are passed separately as bindings. This is safe no matter which library is used.
+- Tagged-template SQL helpers that bind interpolations as parameters (e.g. postgres.js sql\`...\`, Prisma $queryRaw\`...\`, slonik sql\`...\`) — but the "Unsafe" variants or plain (untagged) template strings ARE sinks.
+- Query-builder / ORM methods that bind values internally (object or value arguments to where/insert/update/find, etc.).
+- Values neutralized before reaching SQL text: converted to a number (Number(), parseInt(), parseFloat(), unary +) or validated against a fixed allowlist (includes on a constant list, switch/map lookup to constant strings, enum check), or escaped with the driver's escape function (escape(), escapeId(), format with %L/%I, etc.).`;
+
+export const SEVERITY_GUIDE = `SEVERITY: "critical" if an unauthenticated or low-privilege user can read or modify data beyond their own; "high" for injection reachable only behind authentication or with limited impact; lower only with a clear reason.`;
+
 /** Prefixes each line with its 1-based number so the model can cite exact lines. */
 export function numberLines(source: string): string {
   const lines = source.split(/\r?\n/);
@@ -50,14 +58,11 @@ Tainted data becomes part of the SQL TEXT itself, by any form of string construc
 This includes tainted values used as identifiers or keywords (column names, table names, ORDER BY direction, LIMIT) when they are not allowlisted.
 
 4. SAFE — do NOT report
-- Parameterized / bound queries: the SQL text contains only placeholders ($1, ?, :name, @name) and the values are passed separately as bindings. This is safe no matter which library is used.
-- Tagged-template SQL helpers that bind interpolations as parameters (e.g. postgres.js sql\`...\`, Prisma $queryRaw\`...\`, slonik sql\`...\`) — but the "Unsafe" variants or plain (untagged) template strings ARE sinks.
-- Query-builder / ORM methods that bind values internally (object or value arguments to where/insert/update/find, etc.).
-- Values neutralized before reaching SQL text: converted to a number (Number(), parseInt(), parseFloat(), unary +) or validated against a fixed allowlist (includes on a constant list, switch/map lookup to constant strings, enum check), or escaped with the driver's escape function (escape(), escapeId(), format with %L/%I, etc.).
+${SAFE_PATTERNS}
 - Input that flows only into a function defined in ANOTHER file — you cannot see that body, so do not guess.
 Report only flows where both the source and the executing sink are visible in this file. If you are not sure tainted data reaches SQL text without neutralization, do not report it.
 
-SEVERITY: "critical" if an unauthenticated or low-privilege user can read or modify data beyond their own; "high" for injection reachable only behind authentication or with limited impact; lower only with a clear reason.
+${SEVERITY_GUIDE}
 
 OUTPUT
 Return ONLY a JSON array of objects matching this TypeScript schema — no prose, no markdown fences. Return [] if there are no findings.

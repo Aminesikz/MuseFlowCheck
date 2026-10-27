@@ -15,11 +15,13 @@ export interface Finding {
   /** CWE identifier, e.g. "CWE-89". */
   cwe: string;
   severity: Severity;
-  /** Path of the analyzed file. */
+  /** Path of the analyzed file; for cross-file findings, the file containing the source. */
   file: string;
-  /** 1-based line where untrusted input enters. */
+  /** 1-based line where untrusted input enters (in `file`). */
   sourceLine: number;
-  /** 1-based line of the call that executes the query (e.g. `pool.query(sql)`), not where the SQL string is built. */
+  /** File containing the sink, when it differs from `file` (cross-file findings). */
+  sinkFile?: string;
+  /** 1-based line (in `sinkFile ?? file`) of the call that executes the query (e.g. `pool.query(sql)`), not where the SQL string is built. */
   sinkLine: number;
   /**
    * Ordered hops from source to sink, each a short code excerpt with its line:

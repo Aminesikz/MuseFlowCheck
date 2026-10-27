@@ -90,6 +90,26 @@ function toText(value: unknown, field: string, index: number): string {
   return value.trim();
 }
 
+/** The model's judgment of a finding — everything except its locations. */
+export type Judgment = Pick<Finding, "id" | "type" | "cwe" | "severity" | "explanation" | "suggestedPatch">;
+
+/** Validates the location-independent fields of one model-produced finding (throws on bad input). */
+export function validateJudgment(item: unknown, i: number): Judgment {
+  const f = item as Record<string, unknown>;
+  const severity = typeof f.severity === "string" ? f.severity.trim().toLowerCase() : f.severity;
+  if (!SEVERITIES.includes(severity as Severity)) {
+    throw new Error(`finding[${i}].severity must be one of ${SEVERITIES.join("/")}, got ${JSON.stringify(f.severity)}`);
+  }
+  return {
+    ...(typeof f.id === "string" && f.id.trim() ? { id: f.id.trim() } : {}),
+    type: toText(f.type, "type", i),
+    cwe: toText(f.cwe, "cwe", i),
+    severity: severity as Severity,
+    explanation: toText(f.explanation, "explanation", i),
+    suggestedPatch: toText(f.suggestedPatch, "suggestedPatch", i),
+  };
+}
+
 /**
  * Validates raw model output into Finding[]. `file` is always the analyzed path, and confidence is
  * forced to "suspected" — only the verification pass may promote a finding. Line numbers must fall
@@ -100,26 +120,17 @@ export function parseFindings(raw: string, file: string, lineCount: number): Fin
   try {
     return items.map((item, i): Finding => {
       const f = item as Record<string, unknown>;
-
-      const severity = typeof f.severity === "string" ? f.severity.trim().toLowerCase() : f.severity;
-      if (!SEVERITIES.includes(severity as Severity)) {
-        throw new Error(`finding[${i}].severity must be one of ${SEVERITIES.join("/")}, got ${JSON.stringify(f.severity)}`);
-      }
+      const judgment = validateJudgment(item, i);
       if (!Array.isArray(f.taintPath) || f.taintPath.length < 2) {
         throw new Error(`finding[${i}].taintPath must be an array of at least 2 hops (source → ... → execute)`);
       }
 
       return {
-        ...(typeof f.id === "string" && f.id.trim() ? { id: f.id.trim() } : {}),
-        type: toText(f.type, "type", i),
-        cwe: toText(f.cwe, "cwe", i),
-        severity: severity as Severity,
+        ...judgment,
         file,
         sourceLine: toLine(f.sourceLine, "sourceLine", i, lineCount),
         sinkLine: toLine(f.sinkLine, "sinkLine", i, lineCount),
         taintPath: f.taintPath.map((hop, h) => toText(hop, `taintPath[${h}]`, i)),
-        explanation: toText(f.explanation, "explanation", i),
-        suggestedPatch: toText(f.suggestedPatch, "suggestedPatch", i),
         confidence: "suspected",
       };
     });

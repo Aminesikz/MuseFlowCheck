@@ -21,7 +21,8 @@
     "smoke": "tsx scripts/smoke-test.ts"
   },
   "dependencies": {
-    "openai": "^7.44.0"
+    "openai": "^7.44.0",
+    "ts-morph": "^28.0.0"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",

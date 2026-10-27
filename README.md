@@ -18,6 +18,16 @@ node dist/cli.js scan fixtures/sqli-single-file.js
 
 `flowcheck scan <file>` exits `0` when there are no high/critical findings, `1` when there are, and `2` on errors.
 
+### Cross-file (spike)
+
+```bash
+node dist/cli.js trace <route-file>                 # Stage 1: deterministic call-graph taint trace, no API call
+node dist/cli.js trace <route-file> --show-prompt   # ...plus the Stage 2 prompt that would be sent
+node dist/cli.js scan <route-file> --cross-file     # Stage 1 + Stage 2 (model judges each traced SQL sink)
+```
+
+The project root defaults to the nearest folder with a `package.json`; override it with `--root <dir>`.
+
 ## License
 
 [MIT](LICENSE)
