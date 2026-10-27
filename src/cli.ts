@@ -59,6 +59,8 @@ function formatTrace(trace: TraceResult): string {
   for (const p of bound) out.push(`  ${formatHop(p.hops[0])}\n    ⤷ ${formatHop(p.hops.at(-1)!)}`);
   out.push("", `Unresolved calls (where a trace broke): ${trace.unresolved.length || "none"}`);
   for (const u of trace.unresolved) out.push(`  ${u.file}:${u.line}  ${u.call} — ${u.reason}`);
+  out.push("", `Tainted calls leaving the project (not followed): ${trace.external.length || "none"}`);
+  for (const e of trace.external) out.push(`  ${e.file}:${e.line}  ${e.call} — ${e.target}`);
   return out.join("\n");
 }
 
