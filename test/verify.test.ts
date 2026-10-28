@@ -124,6 +124,13 @@ test("the PoC prompt pins the real HTTP route when the finding carries one, and 
   assert.doesNotMatch(buildPocPrompt(sqliFinding), /use that exact method and path/);
 });
 
+test("the PoC prompt asks for a baseline that returns the caller's own data, not a no-match request", () => {
+  const prompt = buildPocPrompt(sqliFinding);
+  assert.match(prompt, /baseline must return some of the caller's own data/);
+  assert.match(prompt, /re-runs the same baseline after a fix is applied/);
+  assert.doesNotMatch(prompt, /few or zero rows/);
+});
+
 test("verifyFinding confirms a SQLi finding when the exploit returns more rows than the baseline", async () => {
   const target = new Target({ url: base, auth: { kind: "token", token: "tenant-1" } });
   const poc = {

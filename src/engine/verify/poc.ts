@@ -35,7 +35,7 @@ export interface Poc {
 
 const CHECK_GUIDE = `"check" — how the tool will DECIDE success by comparing the two real responses (pick the one your exploit proves):
 - {"type":"marker","value":"<sentinel>"}: your exploit injects <sentinel> (e.g. a UNION SELECT of a constant). Confirmed when <sentinel> appears in the exploit response but not the baseline's.
-- {"type":"more-rows","field":"<optional json field holding the array>"}: confirmed when the exploit returns strictly more array items than the baseline (e.g. a WHERE bypass dumps rows the baseline does not). Make the baseline a request that legitimately returns few or zero rows.
+- {"type":"more-rows","field":"<optional json field holding the array>"}: confirmed when the exploit returns strictly more array items than the baseline (e.g. a WHERE bypass dumps rows the baseline does not). Make the baseline a request that legitimately returns some of the caller's own rows, and the exploit one that also returns rows outside the caller's scope.
 - {"type":"field-differs","field":"<field name>"}: both requests succeed, but the exploit's response carries a different owner/scope value in <field> than the baseline's (reading another scope's record). Use for direct-object-reference reads/writes.
 - {"type":"status-unblocked"}: the baseline is rejected (401/403/404) and the exploit succeeds (2xx) with a body.`;
 
@@ -70,6 +70,7 @@ ${CHECK_GUIDE}
 
 Rules:
 - ${routeRule} The baseline is an ordinary, benign request; the exploit differs only by the attack input.
+- The baseline must return some of the caller's own data — never a request built to match nothing (a nonsense search term, a status or id that does not exist). The tool re-runs the same baseline after a fix is applied to check the route still returns the same data, so an empty baseline proves nothing there. (Exception: with status-unblocked, the baseline is the rejected request.)
 - Put the attack payload in the query or body field the finding's source reads (${finding.taintPath[0] ?? "the entry hop"}).
 - Use the provided auth token (authenticated:true) unless proving an unauthenticated-access issue.
 - Do NOT request destructive operations beyond what the finding itself describes.
