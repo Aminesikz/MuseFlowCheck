@@ -9,6 +9,7 @@ import { AddressInfo } from "node:net";
 import { after, before, test } from "node:test";
 import {
   assertLocalTarget,
+  buildPocPrompt,
   evaluate,
   parsePoc,
   Target,
@@ -113,6 +114,13 @@ const idorFinding: Finding = {
 };
 
 const completeWith = (poc: object) => async () => JSON.stringify([poc]);
+
+test("the PoC prompt pins the real HTTP route when the finding carries one, and does not when it doesn't", () => {
+  const withRoute = buildPocPrompt({ ...sqliFinding, httpRoute: "GET /api/barbers/search" });
+  assert.match(withRoute, /GET \/api\/barbers\/search/);
+  assert.match(withRoute, /use that exact method and path/);
+  assert.doesNotMatch(buildPocPrompt(sqliFinding), /use that exact method and path/);
+});
 
 test("verifyFinding confirms a SQLi finding when the exploit returns more rows than the baseline", async () => {
   const target = new Target({ url: base, auth: { kind: "token", token: "tenant-1" } });

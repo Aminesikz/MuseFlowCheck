@@ -49,6 +49,8 @@ export interface CandidatePath {
   sqlText: boolean;
   /** Where the input entered: `file:line:<variable or request expression>`. */
   origin: string;
+  /** The HTTP route this path's entry handler is registered on, e.g. "GET /api/barbers/search", when known. */
+  route?: string;
 }
 
 /** A tainted call into project code that the tracer could not follow — the place a trace breaks. */
@@ -239,6 +241,10 @@ export class Tracer {
   readonly paths: CandidatePath[] = [];
   readonly unresolved: UnresolvedCall[] = [];
   readonly external: ExternalCall[] = [];
+  /** Where each router file is mounted (`app.use('/prefix', router)`), first mount only; built by registeredHandlers. */
+  private readonly mounts = new Map<SourceFile, { prefix: string; parent: SourceFile }>();
+  /** The HTTP route of the handler currently being analyzed, stamped onto the paths it produces. */
+  private currentRoute?: string;
 
   constructor(readonly root: string) {}
 
@@ -282,7 +288,48 @@ export class Tracer {
    * Functions registered on a router/app anywhere in the project: `router.get('/x', fn)`, `app.use(mw)`,
    * `router.post('/x', ctrl.save)`, `ctrl.save.bind(ctrl)`, wrappers like `asyncHandler(fn)`, and arrays of handlers.
    */
+  /** Sets the HTTP route stamped onto the paths produced by the next `analyze` call (reset per handler). */
+  setCurrentRoute(route?: string): void {
+    this.currentRoute = route;
+  }
+
+  /** A string-literal argument's value (route or mount prefix), or "". */
+  private pathLiteral(node: Node | undefined): string {
+    return node && (Node.isStringLiteral(node) || Node.isNoSubstitutionTemplateLiteral(node)) ? node.getLiteralValue() : "";
+  }
+
+  /** Records `app.use('/prefix', router)` mounts so a handler's full path can include its router file's prefix. */
+  private collectMounts(files: SourceFile[]): void {
+    for (const sf of files) {
+      for (const call of sf.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+        const callee = call.getExpression();
+        if (!Node.isPropertyAccessExpression(callee) || callee.getName() !== "use") continue;
+        const args = call.getArguments();
+        const prefix = this.pathLiteral(args[0]);
+        for (const arg of args) {
+          const file = this.requiredFile(arg);
+          if (file && !this.mounts.has(file)) this.mounts.set(file, { prefix, parent: sf });
+        }
+      }
+    }
+  }
+
+  /** The mount prefix a router file inherits, following mounts upward (first mount at each level). */
+  private mountPrefix(file: SourceFile, depth = 0): string {
+    const mount = this.mounts.get(file);
+    if (!mount || depth > 8) return "";
+    return this.mountPrefix(mount.parent, depth + 1) + mount.prefix;
+  }
+
+  /** `METHOD /full/path`: the route-level path joined to the router file's mount prefix and normalized. */
+  private composeRoute(method: string, sf: SourceFile, routePath: string | undefined): string {
+    if (routePath === undefined) return method;
+    const full = (this.mountPrefix(sf) + routePath).replace(/\/{2,}/g, "/").replace(/(.)\/$/, "$1") || "/";
+    return `${method} ${full}`;
+  }
+
   registeredHandlers(files: SourceFile[]): Handler[] {
+    this.collectMounts(files);
     const found = new Map<Fn, Handler>();
     for (const sf of files) {
       for (const call of sf.getDescendantsOfKind(SyntaxKind.CallExpression)) {
@@ -292,7 +339,7 @@ export class Tracer {
         if (isProjectValue(receiver) || receiver.kind === "function") continue; // a project object's own `get`, not a router
         const [first] = call.getArguments();
         const routePath = first && (Node.isStringLiteral(first) || Node.isNoSubstitutionTemplateLiteral(first)) ? first.getLiteralValue() : undefined;
-        const route = `${callee.getName().toUpperCase()}${routePath !== undefined ? ` ${routePath}` : ""}`;
+        const route = this.composeRoute(callee.getName().toUpperCase(), sf, routePath);
         for (const arg of call.getArguments()) {
           for (const v of this.registeredFunctions(arg)) {
             const req = this.requestParam(v.fn);
@@ -684,7 +731,7 @@ export class Tracer {
       const keys = [`${t.origin}->${sinkHop.file}:${sinkHop.line}`, hops.map((h) => `${h.kind}@${h.file}:${h.line}`).join(">")];
       if (keys.some((k) => this.pathKeys.has(k))) continue;
       keys.forEach((k) => this.pathKeys.add(k));
-      this.paths.push({ hops, sqlText, origin: t.origin });
+      this.paths.push({ hops, sqlText, origin: t.origin, ...(this.currentRoute ? { route: this.currentRoute } : {}) });
     }
   }
 
@@ -1148,7 +1195,11 @@ function sortPaths(paths: CandidatePath[]): CandidatePath[] {
 }
 
 function analyzeAll(tracer: Tracer, handlers: Handler[]): void {
-  for (const { fn, req, self } of handlers) tracer.analyze(fn, new Map(), 0, req, self);
+  for (const h of handlers) {
+    tracer.setCurrentRoute(h.entry.route); // stamp this handler's HTTP route onto the paths it produces
+    tracer.analyze(h.fn, new Map(), 0, h.req, h.self);
+  }
+  tracer.setCurrentRoute(undefined);
 }
 
 function result(tracer: Tracer, entry: string, files: number, handlers: Handler[]): TraceResult {

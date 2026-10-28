@@ -50,13 +50,18 @@ export function buildPocPrompt(finding: Finding, identityHint?: string): string 
     ? "Craft an input that makes the query return data a benign request does not — e.g. a boolean/UNION injection that bypasses a filter or echoes an injected marker."
     : "Request a record that belongs to a DIFFERENT scope than the caller's, to show the route returns it without an ownership check.";
 
+  const routeLine = finding.httpRoute ? `\n- HTTP route (the vulnerable endpoint — use this exact method and path): ${finding.httpRoute}` : "";
+  const routeRule = finding.httpRoute
+    ? `Both requests go to \`${finding.httpRoute}\` — use that exact method and path; do not invent a different URL.`
+    : "Both requests go to the same route.";
+
   return `You are a penetration tester proving one finding against a running LOCAL test instance of the application under review. You have a legitimate low-privilege auth token for one tenant; ${identityHint ?? "its scope is not stated"}.
 
 Produce a proof-of-concept: a benign BASELINE request and an EXPLOIT request to the same endpoint, and a success condition the tool will check by comparing the two responses. ${goal}
 
 FINDING
 - ${finding.type} (${finding.cwe}) — ${finding.severity}
-- source ${finding.file}:${finding.sourceLine}; sink ${finding.sinkFile ?? finding.file}:${finding.sinkLine}
+- source ${finding.file}:${finding.sourceLine}; sink ${finding.sinkFile ?? finding.file}:${finding.sinkLine}${routeLine}
 - request path to the vulnerable code (first hop is the HTTP entry point):
 ${finding.taintPath.map((h) => `    ${h}`).join("\n")}
 - why it is thought exploitable: ${finding.explanation}
@@ -64,7 +69,7 @@ ${finding.taintPath.map((h) => `    ${h}`).join("\n")}
 ${CHECK_GUIDE}
 
 Rules:
-- Both requests go to the same route. The baseline is an ordinary, benign request; the exploit differs only by the attack input.
+- ${routeRule} The baseline is an ordinary, benign request; the exploit differs only by the attack input.
 - Put the attack payload in the query or body field the finding's source reads (${finding.taintPath[0] ?? "the entry hop"}).
 - Use the provided auth token (authenticated:true) unless proving an unauthenticated-access issue.
 - Do NOT request destructive operations beyond what the finding itself describes.

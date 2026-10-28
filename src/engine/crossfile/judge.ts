@@ -112,6 +112,7 @@ export function parseJudgment(raw: string, group: SinkGroup): Finding | null {
       ...(sink.file !== source.file ? { sinkFile: sink.file } : {}),
       sinkLine: sink.line,
       taintPath: path.hops.map(formatHop),
+      ...(path.route ? { httpRoute: path.route } : {}),
       confidence: "suspected",
     };
   } catch (err) {

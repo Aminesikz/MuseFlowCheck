@@ -115,6 +115,29 @@ test("discovery honors .gitignore (root and nested) and skips dependencies, buil
   );
 });
 
+test("mounted sub-router: a handler's route and its tainted path include the router's mount prefix", () => {
+  const proj = path.join(tmp, "mounted");
+  mkdirSync(path.join(proj, "routes"), { recursive: true });
+  writeFileSync(
+    path.join(proj, "index.js"),
+    "const express = require('express');\nconst barbers = require('./routes/barbers');\nconst app = express();\napp.use('/api/barbers', barbers);\nmodule.exports = app;\n",
+  );
+  writeFileSync(
+    path.join(proj, "routes", "barbers.js"),
+    "const express = require('express');\nconst db = require('../db');\nconst router = express.Router();\nrouter.get('/search', async (req, res) => {\n  res.json(await db.searchByName(req.query.q));\n});\nmodule.exports = router;\n",
+  );
+  writeFileSync(
+    path.join(proj, "db.js"),
+    "const { Pool } = require('pg');\nconst pool = new Pool();\nasync function searchByName(term) {\n  return pool.query(\"SELECT * FROM barbers WHERE name LIKE '%\" + term + \"%'\");\n}\nmodule.exports = { searchByName };\n",
+  );
+
+  const t = traceProject(proj);
+  assert.equal(t.entryPoints.find((e) => e.file === "routes/barbers.js")?.route, "GET /api/barbers/search");
+  const p = t.paths.find((c) => c.sqlText && c.hops[0].file === "routes/barbers.js");
+  assert.ok(p, "expected a tainted path from the barbers handler");
+  assert.equal(p!.route, "GET /api/barbers/search");
+});
+
 test("cli: scan <dir> --json prints only the Finding[] on stdout, and exits 0 when nothing reaches SQL text", () => {
   const project = path.join(tmp, "safe");
   mkdirSync(path.join(project, "routes"), { recursive: true });
