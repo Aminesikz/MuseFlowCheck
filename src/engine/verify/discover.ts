@@ -47,6 +47,8 @@ export interface Discovered {
   id: number;
   owner: unknown;
   response: TargetResponse;
+  /** Parsed bodies of every resource seen while probing, for harvesting real, app-valid field values. */
+  seen: unknown[];
 }
 
 /**
@@ -62,6 +64,7 @@ export async function discoverCrossScopeId(
   range: number,
 ): Promise<Discovered | undefined> {
   const own = JSON.stringify(ownScope);
+  const seen: unknown[] = [];
   for (let id = 1; id <= range; id++) {
     let res: TargetResponse;
     try {
@@ -70,8 +73,10 @@ export async function discoverCrossScopeId(
       continue; // a request that cannot be sent is not a discovery; keep probing within the bound
     }
     if (!ok(res.status)) continue;
-    const owner = findField(parse(res.body), ownerField);
-    if (owner !== undefined && JSON.stringify(owner) !== own) return { id, owner, response: res };
+    const parsed = parse(res.body);
+    seen.push(parsed);
+    const owner = findField(parsed, ownerField);
+    if (owner !== undefined && JSON.stringify(owner) !== own) return { id, owner, response: res, seen };
   }
   return undefined;
 }

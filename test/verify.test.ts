@@ -344,11 +344,12 @@ test("IDOR write: when the model's value equals the target's current value, a di
   assert.equal(appts[3].status, "cancelled"); // reverted to what it was before the proof
 });
 
-test("IDOR write: synthesizes a changing value when the model sends no body, skipping fields the app ignores", async () => {
+test("IDOR write: when the model sends no body, it harvests a changing value from a probed resource", async () => {
   resetAppts();
-  // Richer rows ordered so customer_name (which the app ignores) is tried before status (which it honors).
-  appts[1] = { id: 1, shop_id: 1, customer_name: "Alice", status: "booked" };
-  appts[3] = { id: 3, shop_id: 2, customer_name: "Carol", status: "cancelled" };
+  // The baseline/own resource shares the foreign's status, so a differing value can only come from ANOTHER probed row.
+  appts[1] = { id: 1, shop_id: 1, status: "cancelled" }; // own (the baseline path) — same status as the foreign
+  appts[2] = { id: 2, shop_id: 1, status: "completed" }; // own, probed — supplies the "completed" the proof uses
+  appts[3] = { id: 3, shop_id: 2, status: "cancelled" }; // foreign target
   const target = new Target({ url: base, auth: idorToken });
   const finding: Finding = { ...idorFinding, cwe: "CWE-862", httpRoute: "PATCH /api/appointments/:id" };
   const poc = {
@@ -358,10 +359,9 @@ test("IDOR write: synthesizes a changing value when the model sends no body, ski
     rationale: "patching another shop's appointment succeeds",
   };
   const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
-  assert.equal(f.confidence, "confirmed"); // derived a changing status from the caller's own resource
-  assert.match(f.verification!.summary, /status changed from "cancelled" to "booked"/);
+  assert.equal(f.confidence, "confirmed"); // the value came from the probed id 2, not the same-status baseline
+  assert.match(f.verification!.summary, /status changed from "cancelled" to "completed"/);
   assert.equal(appts[3].status, "cancelled"); // restored
-  assert.equal(appts[3].customer_name, "Carol"); // the ignored field was never actually changed
 });
 
 // ---- patch proof --------------------------------------------------------------------------------

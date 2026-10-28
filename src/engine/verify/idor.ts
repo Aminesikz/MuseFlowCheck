@@ -54,35 +54,32 @@ function resourceObject(value: unknown, ownerField: string): Record<string, unkn
 }
 
 /**
- * Ordered single-field writes to try on the foreign resource, each a value that differs from its CURRENT one so the
- * write is observable. Drawn only from observed data: the model's exploit body first, then fields the caller's OWN
- * resource carries a different (valid) value for — the access finding often targets the :id and sends no body at all.
- * The owner field and id-like fields are never touched. Bounded to a handful of candidates.
+ * Ordered single-field writes to try on the foreign resource, each set to a value that DIFFERS from its current one so
+ * the write is observable. Drawn only from observed data — the model's exploit body first, then, for each of the
+ * foreign resource's scalar fields, the distinct values that same field carries on the resources already probed (and
+ * the caller's own) — so the values are real and app-valid (e.g. a status the API accepts). The owner field and
+ * id-like fields are never written. Bounded to a handful of candidates.
  */
-function writeCandidates(poc: Poc, before: TargetResponse, ownRead: TargetResponse, ownerField: string): { field: string; value: unknown }[] {
-  const b = parse(before.body);
-  const own = parse(ownRead.body);
+function writeCandidates(poc: Poc, before: TargetResponse, ownRead: TargetResponse, seen: unknown[], ownerField: string): { field: string; value: unknown }[] {
+  const foreign = resourceObject(parse(before.body), ownerField);
   const out: { field: string; value: unknown }[] = [];
   const add = (field: string, value: unknown) => {
-    if (!out.some((c) => c.field === field)) out.push({ field, value });
+    if (!out.some((c) => c.field === field && JSON.stringify(c.value) === JSON.stringify(value))) out.push({ field, value });
   };
   for (const [k, v] of Object.entries(bodyFields(poc))) {
-    const current = findField(b, k);
-    if (differs(v, current)) add(k, v);
-    else {
-      const ownVal = findField(own, k);
-      if (differs(ownVal, current)) add(k, ownVal);
-    }
+    if (differs(v, findField(foreign ?? parse(before.body), k))) add(k, v);
   }
-  const resource = resourceObject(b, ownerField);
-  if (resource) {
-    for (const [k, current] of Object.entries(resource)) {
+  if (foreign) {
+    const pool = [parse(ownRead.body), ...seen]; // resources whose field values are real and accepted by the app
+    for (const [k, current] of Object.entries(foreign)) {
       if (k === ownerField || ID_LIKE.test(k) || !isScalar(current)) continue;
-      const ownVal = findField(own, k);
-      if (isScalar(ownVal) && differs(ownVal, current)) add(k, ownVal);
+      for (const src of pool) {
+        const v = findField(src, k);
+        if (isScalar(v) && differs(v, current)) add(k, v);
+      }
     }
   }
-  return out.slice(0, 8);
+  return out.slice(0, 24);
 }
 
 /**
@@ -193,7 +190,7 @@ export async function proveWriteIdor(poc: Poc, rp: RouteParam, ownerField: strin
     after = await send(target, { method: "GET", path: foreignPath, authenticated: true });
     effect = mutationEffect(before, after, {}, rp.method);
   } else {
-    const candidates = writeCandidates(poc, before, ownRead, ownerField);
+    const candidates = writeCandidates(poc, before, ownRead, disc.seen, ownerField);
     // Fall back to the model's own body so there is always at least one attempt (and a response to report).
     const attempts = candidates.length > 0 ? candidates.map((c) => ({ [c.field]: c.value })) : [bodyFields(poc)];
     mutate = await send(target, { method: rp.method, path: foreignPath, body: attempts[0], authenticated: poc.exploit.authenticated ?? true });
