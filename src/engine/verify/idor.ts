@@ -38,25 +38,51 @@ function bodyFields(poc: Poc): Record<string, unknown> {
   return poc.exploit.body && typeof poc.exploit.body === "object" ? (poc.exploit.body as Record<string, unknown>) : {};
 }
 
+const ID_LIKE = /^id$|_id$|Id$|ID$/;
+const isScalar = (v: unknown): v is string | number | boolean => typeof v === "string" || typeof v === "number" || typeof v === "boolean";
+
+/** The first object in a parsed body that carries `ownerField` — i.e. the resource itself (handles `{resource:{…}}`). */
+function resourceObject(value: unknown, ownerField: string): Record<string, unknown> | undefined {
+  const queue: unknown[] = [value];
+  while (queue.length > 0) {
+    const v = queue.shift();
+    if (!v || typeof v !== "object") continue;
+    if (!Array.isArray(v) && ownerField in (v as object)) return v as Record<string, unknown>;
+    queue.push(...Object.values(v as object));
+  }
+  return undefined;
+}
+
 /**
- * The write body to apply to the foreign resource, with each field set to a value that differs from its CURRENT one so
- * the write is observable: the model's exploit value when it already differs, else a value the caller's own resource
- * carries (a known-valid alternative, e.g. a different status), else the model's value (reported honestly if a no-op).
+ * Ordered single-field writes to try on the foreign resource, each a value that differs from its CURRENT one so the
+ * write is observable. Drawn only from observed data: the model's exploit body first, then fields the caller's OWN
+ * resource carries a different (valid) value for — the access finding often targets the :id and sends no body at all.
+ * The owner field and id-like fields are never touched. Bounded to a handful of candidates.
  */
-function mutationBody(poc: Poc, before: { body: string }, ownRead: { body: string }): Record<string, unknown> {
+function writeCandidates(poc: Poc, before: TargetResponse, ownRead: TargetResponse, ownerField: string): { field: string; value: unknown }[] {
   const b = parse(before.body);
   const own = parse(ownRead.body);
-  const out: Record<string, unknown> = {};
+  const out: { field: string; value: unknown }[] = [];
+  const add = (field: string, value: unknown) => {
+    if (!out.some((c) => c.field === field)) out.push({ field, value });
+  };
   for (const [k, v] of Object.entries(bodyFields(poc))) {
     const current = findField(b, k);
-    if (differs(v, current)) {
-      out[k] = v;
-      continue;
+    if (differs(v, current)) add(k, v);
+    else {
+      const ownVal = findField(own, k);
+      if (differs(ownVal, current)) add(k, ownVal);
     }
-    const ownVal = findField(own, k);
-    out[k] = differs(ownVal, current) ? ownVal : v;
   }
-  return out;
+  const resource = resourceObject(b, ownerField);
+  if (resource) {
+    for (const [k, current] of Object.entries(resource)) {
+      if (k === ownerField || ID_LIKE.test(k) || !isScalar(current)) continue;
+      const ownVal = findField(own, k);
+      if (isScalar(ownVal) && differs(ownVal, current)) add(k, ownVal);
+    }
+  }
+  return out.slice(0, 8);
 }
 
 /**
@@ -119,11 +145,11 @@ function mutationEffect(before: TargetResponse, after: TargetResponse, body: Rec
 }
 
 /** Puts the foreign resource back the way it was, so the fixture is not left mutated. Best-effort; reports the state. */
-async function restore(target: Target, path: string, before: TargetResponse, body: Record<string, unknown>, method: string): Promise<string> {
+async function restore(target: Target, path: string, before: TargetResponse, keys: string[], method: string): Promise<string> {
   if (method === "DELETE" || method === "POST") return "RE-SEED RECOMMENDED: the request created or deleted a record and cannot be reverted automatically";
   const original = parse(before.body);
   const revert: Record<string, unknown> = {};
-  for (const k of Object.keys(body)) {
+  for (const k of keys) {
     const v = findField(original, k);
     if (v !== undefined) revert[k] = v;
   }
@@ -154,31 +180,49 @@ export async function proveWriteIdor(poc: Poc, rp: RouteParam, ownerField: strin
     return { kind: "unverified", reason: `no resource owned by another scope was found probing GET ${rp.template} for ids 1..${range}; cannot prove a cross-scope write` };
   }
   const foreignPath = fillParam(rp, disc.id);
-
   const before = await send(target, { method: "GET", path: foreignPath, authenticated: true });
-  // Choose values that genuinely differ from the foreign resource's current ones, so "the change took effect" is
-  // observable: prefer the model's exploit value, else a value seen on the caller's own resource (never the seed/db).
-  const body = mutationBody(poc, before, ownRead);
-  const sent = Object.keys(body).length > 0 ? body : poc.exploit.body;
-  const mutate = await send(target, { method: rp.method, path: foreignPath, body: sent, authenticated: poc.exploit.authenticated ?? true });
-  const after = await send(target, { method: "GET", path: foreignPath, authenticated: true });
+
+  // Apply the mutation. For a bodyless method (DELETE) there is one attempt; otherwise try candidate single-field
+  // writes one at a time and stop at the first the server actually applies, so only the minimum is changed.
+  let mutate: TargetResponse;
+  let after: TargetResponse;
+  let effect = { tookEffect: false, detail: "no writable field could be derived to change the resource" };
+  let changedField: string | undefined;
+  if (rp.method === "DELETE") {
+    mutate = await send(target, { method: rp.method, path: foreignPath, authenticated: poc.exploit.authenticated ?? true });
+    after = await send(target, { method: "GET", path: foreignPath, authenticated: true });
+    effect = mutationEffect(before, after, {}, rp.method);
+  } else {
+    const candidates = writeCandidates(poc, before, ownRead, ownerField);
+    // Fall back to the model's own body so there is always at least one attempt (and a response to report).
+    const attempts = candidates.length > 0 ? candidates.map((c) => ({ [c.field]: c.value })) : [bodyFields(poc)];
+    mutate = await send(target, { method: rp.method, path: foreignPath, body: attempts[0], authenticated: poc.exploit.authenticated ?? true });
+    after = await send(target, { method: "GET", path: foreignPath, authenticated: true });
+    for (let i = 0; i < attempts.length; i++) {
+      if (i > 0) {
+        mutate = await send(target, { method: rp.method, path: foreignPath, body: attempts[i], authenticated: poc.exploit.authenticated ?? true });
+        after = await send(target, { method: "GET", path: foreignPath, authenticated: true });
+      }
+      const e = mutationEffect(before, after, attempts[i], rp.method);
+      effect = e;
+      if (e.tookEffect) {
+        changedField = Object.keys(attempts[i])[0];
+        break;
+      }
+    }
+  }
   const afterOwner = findField(parse(after.body), ownerField);
-  const effect = mutationEffect(before, after, body, rp.method);
 
   const confirmed = ok(mutate.status) && differs(afterOwner, ownScope) && effect.tookEffect;
-  const state = confirmed ? await restore(target, foreignPath, before, body, rp.method) : "no cross-scope write was confirmed, so nothing was changed to restore";
+  const state = confirmed ? await restore(target, foreignPath, before, changedField ? [changedField] : [], rp.method) : "no cross-scope write was confirmed, so nothing was changed to restore";
 
-  // Best-effort demonstration that the caller may mutate its OWN resource: a no-op write of its current values.
+  // Best-effort demonstration that the caller may mutate its OWN resource: a no-op write of the changed field's own value.
   let ownNote = "the caller can read its own resource";
-  if (rp.method !== "DELETE") {
-    const noop: Record<string, unknown> = {};
-    for (const k of Object.keys(body)) {
-      const v = findField(parse(ownRead.body), k);
-      if (v !== undefined) noop[k] = v;
-    }
-    if (Object.keys(noop).length > 0) {
+  if (confirmed && changedField !== undefined) {
+    const ownVal = findField(parse(ownRead.body), changedField);
+    if (ownVal !== undefined) {
       try {
-        const ownWrite = await send(target, { method: rp.method, path: poc.baseline.path, body: noop, authenticated: true });
+        const ownWrite = await send(target, { method: rp.method, path: poc.baseline.path, body: { [changedField]: ownVal }, authenticated: true });
         ownNote = ok(ownWrite.status) ? "the caller may mutate its own resource (a same-value write succeeded)" : `the caller's own write returned status ${ownWrite.status}`;
       } catch {
         ownNote = "the caller's own write could not be demonstrated";

@@ -85,7 +85,7 @@ let base: string;
 // A tiny in-memory appointments store for the ":id" IDOR tests. The :id route has NO ownership check (the vulnerable
 // behavior): any authenticated caller can read/modify any id. apptLog records the :id requests so a test can assert
 // whether probing happened. shop 1 owns ids 1–2, shop 2 owns ids 3–4.
-type Appt = { id: number; shop_id: number; status: string };
+type Appt = { id: number; shop_id: number; status: string; customer_name?: string };
 let appts: Record<number, Appt> = {};
 const apptLog: string[] = [];
 function resetAppts(): void {
@@ -126,7 +126,10 @@ before(async () => {
         apptLog.push(`${method} ${url.pathname}`);
         const row = appts[id];
         if (!row) return json(404, { error: "not found" });
-        if (method === "PATCH") return (Object.assign(row, body), json(200, row));
+        if (method === "PATCH") {
+          if (typeof body.status === "string") row.status = body.status; // only status is writable (like the fixture)
+          return json(200, row);
+        }
         if (method === "DELETE") return (delete appts[id], json(200, { deleted: id }));
         return json(200, row);
       }
@@ -339,6 +342,26 @@ test("IDOR write: when the model's value equals the target's current value, a di
   assert.equal(f.confidence, "confirmed"); // the proof substituted the caller's own "booked" so the write is observable
   assert.match(f.verification!.summary, /status changed from "cancelled" to "booked"/);
   assert.equal(appts[3].status, "cancelled"); // reverted to what it was before the proof
+});
+
+test("IDOR write: synthesizes a changing value when the model sends no body, skipping fields the app ignores", async () => {
+  resetAppts();
+  // Richer rows ordered so customer_name (which the app ignores) is tried before status (which it honors).
+  appts[1] = { id: 1, shop_id: 1, customer_name: "Alice", status: "booked" };
+  appts[3] = { id: 3, shop_id: 2, customer_name: "Carol", status: "cancelled" };
+  const target = new Target({ url: base, auth: idorToken });
+  const finding: Finding = { ...idorFinding, cwe: "CWE-862", httpRoute: "PATCH /api/appointments/:id" };
+  const poc = {
+    baseline: { method: "PATCH", path: "/api/appointments/1" }, // own resource; no body — the finding targets the :id
+    exploit: { method: "PATCH", path: "/api/appointments/2" }, // guessed id, no body
+    check: idorFieldCheck,
+    rationale: "patching another shop's appointment succeeds",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
+  assert.equal(f.confidence, "confirmed"); // derived a changing status from the caller's own resource
+  assert.match(f.verification!.summary, /status changed from "cancelled" to "booked"/);
+  assert.equal(appts[3].status, "cancelled"); // restored
+  assert.equal(appts[3].customer_name, "Carol"); // the ignored field was never actually changed
 });
 
 // ---- patch proof --------------------------------------------------------------------------------
