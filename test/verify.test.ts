@@ -12,7 +12,9 @@ import {
   buildPocPrompt,
   emptyResult,
   evaluate,
+  fillParam,
   parsePoc,
+  routeParam,
   sameResponse,
   Target,
   TargetError,
@@ -80,24 +82,63 @@ test("parsePoc parses requests and a check; rejects malformed output", () => {
 let server: Server;
 let base: string;
 
+// A tiny in-memory appointments store for the ":id" IDOR tests. The :id route has NO ownership check (the vulnerable
+// behavior): any authenticated caller can read/modify any id. apptLog records the :id requests so a test can assert
+// whether probing happened. shop 1 owns ids 1–2, shop 2 owns ids 3–4.
+type Appt = { id: number; shop_id: number; status: string };
+let appts: Record<number, Appt> = {};
+const apptLog: string[] = [];
+function resetAppts(): void {
+  appts = {
+    1: { id: 1, shop_id: 1, status: "booked" },
+    2: { id: 2, shop_id: 1, status: "completed" },
+    3: { id: 3, shop_id: 2, status: "booked" },
+    4: { id: 4, shop_id: 2, status: "completed" },
+  };
+  apptLog.length = 0;
+}
+
 before(async () => {
   server = createServer((req, res) => {
-    const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    const authed = (req.headers.authorization ?? "") === "Bearer tenant-1";
-    const json = (status: number, body: unknown) => {
-      res.writeHead(status, { "content-type": "application/json" });
-      res.end(JSON.stringify(body));
-    };
-    if (url.pathname === "/api/auth/login") return json(200, { token: "tenant-1" });
-    if (!authed) return json(401, { error: "unauthorized" });
-    if (url.pathname === "/api/appointments") {
-      const status = url.searchParams.get("status") ?? "";
-      const injected = /'|union|or\s+1=1/i.test(status); // the "vulnerable" query dumps all shops
-      return json(200, { appointments: injected ? [{ shop_id: 1 }, { shop_id: 1 }, { shop_id: 2 }, { shop_id: 2 }] : [{ shop_id: 1 }, { shop_id: 1 }] });
-    }
-    const revenue = /^\/api\/shops\/(\d+)\/revenue$/.exec(url.pathname); // IDOR: returns whatever shop is asked for
-    if (revenue) return json(200, { revenue: { shopId: Number(revenue[1]), totalCents: 1000 * Number(revenue[1]) } });
-    return json(404, { error: "not found" });
+    const chunks: Buffer[] = [];
+    req.on("data", (c) => chunks.push(c as Buffer));
+    req.on("end", () => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      const method = (req.method ?? "GET").toUpperCase();
+      const authed = (req.headers.authorization ?? "") === "Bearer tenant-1";
+      const raw = Buffer.concat(chunks).toString();
+      let body: Record<string, unknown> = {};
+      try {
+        body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+      } catch {
+        body = {};
+      }
+      const json = (status: number, b: unknown) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(b));
+      };
+      if (url.pathname === "/api/auth/login") return json(200, { token: "tenant-1" });
+      if (!authed) return json(401, { error: "unauthorized" });
+
+      const byId = /^\/api\/appointments\/(\d+)$/.exec(url.pathname); // :id route — no ownership check
+      if (byId) {
+        const id = Number(byId[1]);
+        apptLog.push(`${method} ${url.pathname}`);
+        const row = appts[id];
+        if (!row) return json(404, { error: "not found" });
+        if (method === "PATCH") return (Object.assign(row, body), json(200, row));
+        if (method === "DELETE") return (delete appts[id], json(200, { deleted: id }));
+        return json(200, row);
+      }
+      if (url.pathname === "/api/appointments") {
+        const status = url.searchParams.get("status") ?? "";
+        const injected = /'|union|or\s+1=1/i.test(status); // the "vulnerable" query dumps all shops
+        return json(200, { appointments: injected ? [{ shop_id: 1 }, { shop_id: 1 }, { shop_id: 2 }, { shop_id: 2 }] : [{ shop_id: 1 }, { shop_id: 1 }] });
+      }
+      const revenue = /^\/api\/shops\/(\d+)\/revenue$/.exec(url.pathname); // IDOR: returns whatever shop is asked for
+      if (revenue) return json(200, { revenue: { shopId: Number(revenue[1]), totalCents: 1000 * Number(revenue[1]) } });
+      return json(404, { error: "not found" });
+    });
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -200,6 +241,87 @@ test("a GET request never carries a body; an object body folds into the query st
   assert.equal(res.status, 200);
   assert.match(res.path, /status=/);
   assert.equal(JSON.parse(res.body).appointments.length, 4); // the injected status still reached the query
+});
+
+// ---- IDOR cross-scope id discovery --------------------------------------------------------------
+
+test("routeParam and fillParam parse and fill the last :param segment", () => {
+  assert.deepEqual(routeParam("GET /api/appointments/:id"), { method: "GET", template: "/api/appointments/:id", param: "id" });
+  assert.equal(fillParam(routeParam("GET /api/appointments/:id")!, 7), "/api/appointments/7");
+  assert.equal(routeParam("GET /api/appointments"), undefined); // no path parameter
+  const nested = routeParam("PATCH /api/shops/:shopId/appointments/:id")!;
+  assert.equal(nested.param, "id");
+  assert.equal(fillParam(nested, 9), "/api/shops/:shopId/appointments/9"); // only the last parameter is filled
+});
+
+const idorToken = { kind: "token" as const, token: "tenant-1" };
+const idorFieldCheck = { type: "field-differs" as const, field: "shop_id" };
+
+test("IDOR read: discovers a cross-scope id when the model's guessed victim is same-scope", async () => {
+  resetAppts();
+  const target = new Target({ url: base, auth: idorToken });
+  const finding: Finding = { ...idorFinding, cwe: "CWE-639", httpRoute: "GET /api/appointments/:id" };
+  const poc = {
+    baseline: { method: "GET", path: "/api/appointments/1" }, // own, shop 1
+    exploit: { method: "GET", path: "/api/appointments/2" }, // model guessed id 2 — also shop 1, so the first try fails
+    check: idorFieldCheck,
+    rationale: "requesting another shop's appointment returns it",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
+  assert.equal(f.confidence, "confirmed");
+  assert.match(f.verification!.summary, /found id 3 owned by shop_id=2/);
+  assert.equal(f.verification!.exploit?.path, "/api/appointments/3");
+});
+
+test("IDOR read: a correct guess confirms on the first try without probing", async () => {
+  resetAppts();
+  const target = new Target({ url: base, auth: idorToken });
+  const finding: Finding = { ...idorFinding, cwe: "CWE-639", httpRoute: "GET /api/appointments/:id" };
+  const poc = {
+    baseline: { method: "GET", path: "/api/appointments/1" }, // shop 1
+    exploit: { method: "GET", path: "/api/appointments/3" }, // shop 2 — the guess is already cross-scope
+    check: idorFieldCheck,
+    rationale: "requesting another shop's appointment returns it",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
+  assert.equal(f.confidence, "confirmed");
+  assert.doesNotMatch(f.verification!.summary, /Probed/); // confirmed on the model's own exploit
+  assert.deepEqual(apptLog, ["GET /api/appointments/1", "GET /api/appointments/3"]); // no probe requests
+});
+
+test("IDOR read: no cross-scope id within the probe range leaves the finding unverified", async () => {
+  resetAppts();
+  const target = new Target({ url: base, auth: idorToken });
+  const finding: Finding = { ...idorFinding, cwe: "CWE-639", httpRoute: "GET /api/appointments/:id" };
+  const poc = {
+    baseline: { method: "GET", path: "/api/appointments/1" },
+    exploit: { method: "GET", path: "/api/appointments/2" }, // same-scope guess; range 2 cannot reach shop 2's ids 3–4
+    check: idorFieldCheck,
+    rationale: "r",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 2 } });
+  assert.equal(f.confidence, "unverified");
+  assert.match(f.verification!.summary, /no resource owned by another scope was found probing GET \/api\/appointments\/:id for ids 1\.\.2/);
+});
+
+test("IDOR write: discovers a foreign id, proves the cross-scope write, restores it, and leaves own data intact", async () => {
+  resetAppts();
+  const target = new Target({ url: base, auth: idorToken });
+  const finding: Finding = { ...idorFinding, cwe: "CWE-862", httpRoute: "PATCH /api/appointments/:id" };
+  const poc = {
+    baseline: { method: "PATCH", path: "/api/appointments/1", body: { status: "completed" } }, // own
+    exploit: { method: "PATCH", path: "/api/appointments/2", body: { status: "cancelled" } }, // guessed id 2 — own
+    check: idorFieldCheck,
+    rationale: "patching another shop's appointment succeeds",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
+  assert.equal(f.confidence, "confirmed");
+  assert.match(f.verification!.summary, /found id 3 owned by shop_id=2/);
+  assert.match(f.verification!.summary, /status changed from "booked" to "cancelled"/);
+  assert.match(f.verification!.summary, /Fixture state: restored/);
+  assert.equal(appts[3].status, "booked"); // the foreign resource was reverted
+  assert.equal(appts[2].status, "completed"); // the model's guessed exploit was never sent
+  assert.equal(appts[1].status, "booked"); // own resource left as-is (the own "baseline" was a no-op write)
 });
 
 // ---- patch proof --------------------------------------------------------------------------------

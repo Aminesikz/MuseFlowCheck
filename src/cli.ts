@@ -70,6 +70,7 @@ Verification (optional; proves findings by executing them against a target you r
   --login-body <json>   JSON credentials body for --login-path (e.g. '{"email":"a@b.test","password":"x"}')
   --token-field <name>  field holding the token in the login response (default "token")
   --identity <text>     describes the token's own scope for the PoC prompt (e.g. "it belongs to shop 1")
+  --probe-range <n>     for :id-style IDOR, probe ids 1..n to discover a cross-scope target (default 20)
   --verify-patch        also apply each confirmed finding's patch to a throwaway copy and re-run the PoC
   --start-cmd <cmd>     command that starts the patched copy, honoring PORT (default "npm start")
   --ready-path <path>   path polled until the patched server answers (default "/")
@@ -425,7 +426,7 @@ async function scanAccess(dir: string, filter: string | undefined, json: boolean
 }
 
 /** Flags that take a value. */
-const VALUE_FLAGS = new Set(["root", "mode", "route", "target", "token", "login-path", "login-body", "token-field", "identity", "start-cmd", "ready-path"]);
+const VALUE_FLAGS = new Set(["root", "mode", "route", "target", "token", "login-path", "login-body", "token-field", "identity", "probe-range", "start-cmd", "ready-path"]);
 
 /** Builds the verification runtime from the flags, or undefined when no `--target` is given. Throws on bad config. */
 function buildVerifyRuntime(value: (name: string) => string | undefined, patch: boolean, dir: string): VerifyRuntime | undefined {
@@ -448,7 +449,12 @@ function buildVerifyRuntime(value: (name: string) => string | undefined, patch: 
   }
 
   const target = new Target({ url, auth }); // throws TargetError for a non-local host
-  const deps: VerifyDeps = { complete, identityHint: value("identity") };
+  const probeRaw = value("probe-range");
+  const range = probeRaw === undefined ? 20 : Number(probeRaw);
+  if (!Number.isInteger(range) || range < 1 || range > 1000) {
+    throw new TargetError(`--probe-range must be an integer between 1 and 1000, got ${JSON.stringify(probeRaw)}`);
+  }
+  const deps: VerifyDeps = { complete, identityHint: value("identity"), probe: { range } };
   if (patch) {
     const { traceRoot, projectRoot } = resolveRoots(dir, value("root"));
     deps.patchProof = verifyPatch({

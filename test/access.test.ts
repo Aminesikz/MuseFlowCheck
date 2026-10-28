@@ -89,6 +89,7 @@ test("judgment: type/CWE come from the access kind; locations and taintPath from
   assert.equal(f.sinkFile, "db/projects.js");
   assert.equal(f.sinkLine, 8);
   assert.equal(f.confidence, "suspected");
+  assert.equal(f.httpRoute, "DELETE /projects/:projectId"); // route carried to the verifier for :id discovery
   assert.ok(f.taintPath.length >= 4);
   assert.equal(parseAccessJudgment("[]", r), null);
   assert.throws(() => parseAccessJudgment('[{"severity":"urgent"}]', r), FindingParseError);

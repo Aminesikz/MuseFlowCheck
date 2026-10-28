@@ -1,14 +1,19 @@
 // Self-verification stage: after analysis, prove each finding against a configured LOCAL target.
 // Purely additive — with no target this stage never runs and findings keep confidence "suspected".
-import type { EvidenceRequest, Finding, Verification } from "../../types/index.js";
+import type { Finding, Verification } from "../../types/index.js";
 import { FindingParseError } from "../parse.js";
+import { discoverCrossScopeId, fillParam, isMutating, routeParam } from "./discover.js";
 import { evaluate, type RawResponse } from "./evaluate.js";
+import { evidence } from "./evidence.js";
+import { isAccessFinding, proveReadIdor, proveWriteIdor } from "./idor.js";
 import { buildPocPrompt, parsePoc, type PocRequest } from "./poc.js";
 import { Target, TargetError, type TargetResponse } from "./target.js";
 
 export { assertLocalTarget, Target, TargetError, type AuthConfig, type FetchLike } from "./target.js";
 export { buildPocPrompt, parsePoc, type Poc } from "./poc.js";
-export { emptyResult, evaluate, sameResponse } from "./evaluate.js";
+export { emptyResult, evaluate, findField, parse, sameResponse } from "./evaluate.js";
+export { discoverCrossScopeId, fillParam, isMutating, routeParam, type RouteParam } from "./discover.js";
+export { isAccessFinding, proveReadIdor, proveWriteIdor } from "./idor.js";
 export { type PatchProver, verifyPatch } from "./patch.js";
 
 /** Model call plus optional context/patch-proof; injectable so the stage is testable without a network. */
@@ -24,15 +29,8 @@ export interface VerifyDeps {
     finding: Finding,
     poc: { baseline: PocRequest; exploit: PocRequest; check: ReturnType<typeof parsePoc>["check"]; originalBaseline: RawResponse },
   ) => Promise<Verification["patchProof"]>;
-}
-
-function excerpt(body: string, max = 300): string {
-  const clean = body.replace(/\s+/g, " ").trim();
-  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
-}
-
-function evidence(res: TargetResponse): EvidenceRequest {
-  return { method: res.method, path: res.path, status: res.status, responseExcerpt: excerpt(res.body) };
+  /** When present, enables bounded cross-scope id discovery for ":id"-style IDOR findings (probe ids 1..range). */
+  probe?: { range: number };
 }
 
 /** Attaches a verification result to a copy of `finding`, setting confidence to confirmed or unverified. */
@@ -51,6 +49,22 @@ export async function verifyFinding(finding: Finding, target: Target, deps: Veri
     throw err; // API/transport errors propagate; the caller decides how to report them
   }
 
+  // ":id"-style IDOR: the owner/scope field the model's check compares, and the route's path parameter.
+  const rp = routeParam(finding.httpRoute);
+  const idorField = poc.check.type === "field-differs" ? poc.check.field : undefined;
+
+  // A cross-scope WRITE is proved up front, before the generic (state-changing) exploit request is ever sent, so the
+  // proof controls every mutation and can restore what it changes.
+  if (deps.probe && isAccessFinding(finding) && rp && idorField && isMutating(rp.method)) {
+    try {
+      const proof = await proveWriteIdor(poc, rp, idorField, target, deps.probe.range);
+      return proof.kind === "confirmed" ? { ...finding, confidence: "confirmed", verification: proof.verification } : unverified(proof.reason);
+    } catch (err) {
+      if (err instanceof TargetError) throw err;
+      return unverified(`the IDOR write proof could not be executed against the target: ${(err as Error).message}`);
+    }
+  }
+
   let baseline: TargetResponse;
   let exploit: TargetResponse;
   try {
@@ -65,6 +79,17 @@ export async function verifyFinding(finding: Finding, target: Target, deps: Veri
   const baseEv = evidence(baseline);
   const exploitEv = evidence(exploit);
   if (!result.success) {
+    // Read IDOR: the model's guessed victim id may belong to the caller's own scope. Discover a foreign-owned id and
+    // prove it against that instead of giving up.
+    if (deps.probe && isAccessFinding(finding) && rp && idorField && !isMutating(rp.method)) {
+      try {
+        const proof = await proveReadIdor(poc, rp, idorField, target, baseline, deps.probe.range);
+        if (proof.kind === "confirmed") return { ...finding, confidence: "confirmed", verification: proof.verification };
+        return unverified(proof.reason, { baseline: baseEv, exploit: exploitEv });
+      } catch (err) {
+        if (err instanceof TargetError) throw err; // otherwise fall through to the generic unverified result
+      }
+    }
     return unverified(`execution did not confirm the finding: ${result.detail}. ${poc.rationale}`, { baseline: baseEv, exploit: exploitEv });
   }
 

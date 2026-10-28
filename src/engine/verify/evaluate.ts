@@ -16,7 +16,8 @@ export interface Evaluation {
 const ok = (status: number) => status >= 200 && status < 300;
 const rejected = (status: number) => status === 401 || status === 403 || status === 404;
 
-function parse(body: string): unknown {
+/** Parses a response body as JSON, or undefined when it is not JSON. */
+export function parse(body: string): unknown {
   try {
     return JSON.parse(body);
   } catch {
@@ -38,7 +39,7 @@ function findArray(value: unknown, field?: string): unknown[] | undefined {
 }
 
 /** First occurrence of `field` anywhere in a JSON value (breadth-first), or undefined. */
-function findField(value: unknown, field: string): unknown {
+export function findField(value: unknown, field: string): unknown {
   const queue: unknown[] = [value];
   while (queue.length > 0) {
     const v = queue.shift();

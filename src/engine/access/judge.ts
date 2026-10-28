@@ -179,6 +179,7 @@ export function parseAccessJudgment(raw: string, route: AccessRoute): Finding | 
       ...(sink.file !== source.file ? { sinkFile: sink.file } : {}),
       sinkLine: sink.line,
       taintPath: access.path.hops.map(formatHop),
+      httpRoute: routeLabel(route), // metadata for the verifier (e.g. "GET /api/x/:id"); not used by analysis
       confidence: "suspected",
     };
   } catch (err) {
