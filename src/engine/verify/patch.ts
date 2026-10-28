@@ -20,9 +20,13 @@ export type PatchProof = NonNullable<Verification["patchProof"]>;
 export type StartPatched = (projectDir: string) => Promise<{ target: Target; stop: () => Promise<void> }>;
 
 export interface PatchProverOptions {
-  /** The target project directory (its files are copied, never edited). */
+  /**
+   * The runnable project root: the directory with the `package.json`/`node_modules` the start command needs.
+   * Its files are copied (never edited) and the start command runs there. This is usually an ancestor of the
+   * scanned directory (e.g. the repo root when only its `server/` subtree was scanned), not the scan dir itself.
+   */
   projectDir: string;
-  /** Path the finding's `file`/`sinkFile` are relative to (defaults to projectDir). */
+  /** The trace root the finding's `file`/`sinkFile` are relative to (defaults to projectDir). */
   sourceRoot?: string;
   start: StartPatched;
 }
@@ -71,13 +75,14 @@ function applyNamedFunctions(file: SourceFile, patch: string, names: string[]): 
  * Applies `finding.suggestedPatch` to the copied project in `dir`. Returns the reason it could not be applied,
  * or undefined on success. Only clean single-file named-function replacements are applied.
  */
-function applyPatch(dir: string, sourceRoot: string, finding: Finding): string | undefined {
+function applyPatch(copyRoot: string, relOffset: string, finding: Finding): string | undefined {
   const names = patchedFunctionNames(finding.suggestedPatch);
   if (names.length === 0) {
     return "the suggested patch is not a named-function replacement (e.g. an inline route handler); apply it by hand to patch-prove this one";
   }
   const rel = finding.sinkFile ?? finding.file;
-  const abs = path.join(dir, path.relative(sourceRoot, path.join(sourceRoot, rel)));
+  // The finding's path is relative to the trace root; the trace root sits at relOffset inside the copied project.
+  const abs = path.join(copyRoot, relOffset, rel);
   const project = new Project({ compilerOptions: { allowJs: true }, skipAddingFilesFromTsConfig: true });
   let file: SourceFile;
   try {
@@ -96,6 +101,7 @@ function applyPatch(dir: string, sourceRoot: string, finding: Finding): string |
 /** Builds the patchProof function passed to verifyFinding, bound to one project and a way to run patched copies. */
 export function verifyPatch(opts: PatchProverOptions): PatchProver {
   const sourceRoot = opts.sourceRoot ?? opts.projectDir;
+  const relOffset = path.relative(opts.projectDir, sourceRoot); // where the scanned subtree sits in the project copy
   return async (finding, poc) => {
     const copy = mkdtempSync(path.join(tmpdir(), "flowcheck-patch-"));
     try {
@@ -107,7 +113,7 @@ export function verifyPatch(opts: PatchProverOptions): PatchProver {
         /* no node_modules to share; the copy already has whatever was not excluded */
       }
 
-      const reason = applyPatch(copy, sourceRoot, finding);
+      const reason = applyPatch(copy, relOffset, finding);
       if (reason) return { outcome: "not-attempted", summary: reason };
 
       const { target, stop } = await opts.start(copy);

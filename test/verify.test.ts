@@ -2,7 +2,7 @@
 // end-to-end verifyFinding against a loopback mock server, and patch-proof orchestration. No model or real app.
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AddressInfo } from "node:net";
@@ -218,6 +218,42 @@ test("patch proof: a named-function patch is applied, and a blocked exploit repo
   assert.match(appliedSource, /return 'SAFE'/); // the patch reached the copy
   assert.equal(result?.outcome, "blocked");
   assert.match(result!.summary, /exploit was blocked/);
+});
+
+test("patch proof: copies the runnable project root and resolves the sink under the scanned subtree", async () => {
+  // A repo whose package.json is at the root, but only its server/ subtree was scanned (sourceRoot = server).
+  const projectDir = mkdtempSync(path.join(tmpdir(), "flowcheck-root-"));
+  writeFileSync(path.join(projectDir, "package.json"), '{ "name": "app", "scripts": { "start": "node server/index.js" } }\n');
+  mkdirSync(path.join(projectDir, "server", "db"), { recursive: true });
+  writeFileSync(path.join(projectDir, "server", "db", "appointments.js"), "function findByShop(shopId, status) {\n  return 'VULNERABLE ' + status;\n}\nmodule.exports = { findByShop };\n");
+  let appliedSource = "";
+  let copyHadPackageJson = false;
+
+  const start = async (copyDir: string) => {
+    copyHadPackageJson = existsSync(path.join(copyDir, "package.json")); // the runnable root was copied, not just the subtree
+    appliedSource = readFileSync(path.join(copyDir, "server", "db", "appointments.js"), "utf8");
+    const patched = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ appointments: [{ shop_id: 1 }, { shop_id: 1 }] }));
+    });
+    await new Promise<void>((r) => patched.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${(patched.address() as AddressInfo).port}`;
+    return { target: new Target({ url }), stop: () => new Promise<void>((r) => patched.close(() => r())) };
+  };
+
+  const prover = verifyPatch({ projectDir, sourceRoot: path.join(projectDir, "server"), start });
+  const finding: Finding = { ...sqliFinding, file: "routes/appointments.js", sinkFile: "db/appointments.js", suggestedPatch: "function findByShop(shopId, status) {\n  return 'SAFE';\n}" };
+  const poc = {
+    baseline: { method: "GET", path: "/api/appointments", query: { status: "booked" } },
+    exploit: { method: "GET", path: "/api/appointments", query: { status: "' OR '1'='1" } },
+    check: { type: "more-rows" as const, field: "appointments" },
+  };
+  const result = await prover(finding, poc);
+  rmSync(projectDir, { recursive: true, force: true });
+
+  assert.equal(copyHadPackageJson, true);
+  assert.match(appliedSource, /return 'SAFE'/); // the patch reached the right file inside the subtree
+  assert.equal(result?.outcome, "blocked");
 });
 
 test("patch proof: an inline-handler patch (no named function) reports 'not-attempted'", async () => {

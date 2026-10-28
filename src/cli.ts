@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // CLI entrypoint: `flowcheck scan` / `flowcheck trace` — exit 0 clean, 1 high/critical finding, 2 usage/runtime error.
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
+import path from "node:path";
 import { analyzeFile, FindingParseError } from "./engine/index.js";
 import {
   buildJudgePrompt,
+  findProjectRoot,
   formatHop,
   groupBySink,
   judgeTrace,
@@ -448,12 +450,29 @@ function buildVerifyRuntime(value: (name: string) => string | undefined, patch: 
   const target = new Target({ url, auth }); // throws TargetError for a non-local host
   const deps: VerifyDeps = { complete, identityHint: value("identity") };
   if (patch) {
+    const { traceRoot, projectRoot } = resolveRoots(dir, value("root"));
     deps.patchProof = verifyPatch({
-      projectDir: dir,
+      projectDir: projectRoot, // copied and started; has the package.json/node_modules `npm start` needs
+      sourceRoot: traceRoot, // what the findings' file paths are relative to
       start: (copyDir) => startPatchedServer(copyDir, { command: value("start-cmd") ?? "npm start", readyPath: value("ready-path"), auth }),
     });
   }
   return { target, deps };
+}
+
+/**
+ * Splits the scan target into the trace root (what findings' paths are relative to) and the runnable project root
+ * (the nearest directory with a package.json, which patch proof copies and starts). They differ when only a subtree
+ * of a project is scanned, e.g. `scan ./server` in a repo whose package.json is at the root.
+ */
+function resolveRoots(target: string, rootFlag: string | undefined): { traceRoot: string; projectRoot: string } {
+  const abs = path.resolve(target);
+  if (isDirectory(abs)) {
+    const projectRoot = existsSync(path.join(abs, "package.json")) ? abs : findProjectRoot(abs);
+    return { traceRoot: abs, projectRoot };
+  }
+  // A single entry file: the trace root is --root or the file's own project root.
+  return { traceRoot: path.resolve(rootFlag ?? findProjectRoot(abs)), projectRoot: findProjectRoot(abs) };
 }
 
 /** Splits argv into positionals and `--flag [value]` options. */
