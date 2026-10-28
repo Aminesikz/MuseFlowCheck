@@ -94,7 +94,7 @@ node dist/cli.js scan ../MetaVulnSite/server --mode access \
 
 Instead of `--token`, you can pass `--login-path /api/auth/login --login-body '{"email":"…","password":"…"}'` and Flowcheck exchanges the credentials for a token (`--token-field` names the field, default `token`).
 
-With `--verify-patch`, a confirmed finding's `suggestedPatch` is applied to a throwaway copy of the project (the original is never touched), the copy is started (`--start-cmd`, default `npm start`), and the exact PoC is re-run: the patch is "blocked" only if the exploit now fails while a benign request still works. Patches that aren't a clean single-function replacement are reported as `not-attempted` rather than guessed at.
+With `--verify-patch`, a confirmed finding's `suggestedPatch` is applied to a throwaway copy of the project (the original is never touched), the copy is started (`--start-cmd`, default `npm start`), and the exact PoC is re-run: the patch is `blocked` only if the exploit now fails **and** the benign request returns the same response as before the patch (same status, same body). If the exploit fails but the benign response changed, the patch is reported as `breaks-route`; if the exploit still works, `still-exploitable`. When the benign response was empty, a `blocked` result says so, since it then shows the route answers the same way rather than that real results are unchanged. Patches that aren't a clean single-function replacement are reported as `not-attempted` rather than guessed at.
 
 ## License
 

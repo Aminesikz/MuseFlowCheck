@@ -60,6 +60,10 @@ export interface Verification {
   /** The benign request and the exploit request, for the evidence trail. */
   baseline?: EvidenceRequest;
   exploit?: EvidenceRequest;
-  /** Result of re-running the PoC against a patched copy: did the exploit stop working while a benign request still succeeded? */
-  patchProof?: { outcome: "blocked" | "still-exploitable" | "not-attempted"; summary: string };
+  /**
+   * Result of re-running the PoC against a patched copy: "blocked" when the exploit stopped working and the benign
+   * request returned the same response as before the patch; "breaks-route" when the exploit stopped but the benign
+   * response changed; "still-exploitable" when the exploit still worked; "not-attempted" when the patch was not applied.
+   */
+  patchProof?: { outcome: "blocked" | "breaks-route" | "still-exploitable" | "not-attempted"; summary: string };
 }

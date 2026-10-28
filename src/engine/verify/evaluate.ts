@@ -49,6 +49,48 @@ function findField(value: unknown, field: string): unknown {
   return undefined;
 }
 
+/** JSON with object keys sorted (recursively), so bodies that differ only in key order compare equal. */
+function canonical(value: unknown): string {
+  return JSON.stringify(value, (_key, v) =>
+    v && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : v,
+  );
+}
+
+function excerpt(body: string, max = 120): string {
+  const clean = body.replace(/\s+/g, " ").trim();
+  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+}
+
+/**
+ * Whether a patched copy answered a request exactly as the original did: same status and same body (JSON compared
+ * ignoring key order, anything else as trimmed text). Used by patch proof to show a patch kept the route's behavior.
+ */
+export function sameResponse(original: RawResponse, patched: RawResponse): Evaluation {
+  if (original.status !== patched.status) {
+    return { success: false, detail: `status ${patched.status}, originally ${original.status}` };
+  }
+  const a = parse(original.body);
+  const b = parse(patched.body);
+  const same = a !== undefined && b !== undefined ? canonical(a) === canonical(b) : original.body.trim() === patched.body.trim();
+  if (same) return { success: true, detail: `same status (${patched.status}) and same body as before the patch` };
+  const ra = findArray(a);
+  const rb = findArray(b);
+  const rows = ra && rb && ra.length !== rb.length ? ` — ${rb.length} row(s), originally ${ra.length}` : "";
+  return {
+    success: false,
+    detail: `same status (${patched.status}) but a different body${rows} (originally ${JSON.stringify(excerpt(original.body))}, now ${JSON.stringify(excerpt(patched.body))})`,
+  };
+}
+
+/** True when a response carries no data: an empty body, `[]`, `{}`, or an object whose values are all empty arrays or null. */
+export function emptyResult(response: RawResponse): boolean {
+  const v = parse(response.body);
+  if (v === undefined) return response.body.trim() === "";
+  if (Array.isArray(v)) return v.length === 0;
+  if (v && typeof v === "object") return Object.values(v).every((x) => x === null || (Array.isArray(x) && x.length === 0));
+  return false;
+}
+
 /** Evaluates a check against the baseline and exploit responses. Never throws. */
 export function evaluate(check: Check, baseline: RawResponse, exploit: RawResponse): Evaluation {
   switch (check.type) {

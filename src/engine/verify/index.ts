@@ -2,13 +2,13 @@
 // Purely additive — with no target this stage never runs and findings keep confidence "suspected".
 import type { EvidenceRequest, Finding, Verification } from "../../types/index.js";
 import { FindingParseError } from "../parse.js";
-import { evaluate } from "./evaluate.js";
+import { evaluate, type RawResponse } from "./evaluate.js";
 import { buildPocPrompt, parsePoc, type PocRequest } from "./poc.js";
 import { Target, TargetError, type TargetResponse } from "./target.js";
 
 export { assertLocalTarget, Target, TargetError, type AuthConfig, type FetchLike } from "./target.js";
 export { buildPocPrompt, parsePoc, type Poc } from "./poc.js";
-export { evaluate } from "./evaluate.js";
+export { emptyResult, evaluate, sameResponse } from "./evaluate.js";
 export { type PatchProver, verifyPatch } from "./patch.js";
 
 /** Model call plus optional context/patch-proof; injectable so the stage is testable without a network. */
@@ -16,8 +16,14 @@ export interface VerifyDeps {
   complete: (prompt: string) => Promise<string>;
   /** Describes the configured token's own scope, passed to the PoC prompt (e.g. "it belongs to tenant/shop 1"). */
   identityHint?: string;
-  /** When present, re-runs the confirmed PoC against a patched copy of the project (patch proof). */
-  patchProof?: (finding: Finding, poc: { baseline: PocRequest; exploit: PocRequest; check: ReturnType<typeof parsePoc>["check"] }) => Promise<Verification["patchProof"]>;
+  /**
+   * When present, re-runs the confirmed PoC against a patched copy of the project (patch proof). `originalBaseline`
+   * is the benign response from the unpatched target, which the patched copy must reproduce.
+   */
+  patchProof?: (
+    finding: Finding,
+    poc: { baseline: PocRequest; exploit: PocRequest; check: ReturnType<typeof parsePoc>["check"]; originalBaseline: RawResponse },
+  ) => Promise<Verification["patchProof"]>;
 }
 
 function excerpt(body: string, max = 300): string {
@@ -68,7 +74,9 @@ export async function verifyFinding(finding: Finding, target: Target, deps: Veri
     baseline: baseEv,
     exploit: exploitEv,
   };
-  if (deps.patchProof) verification.patchProof = await deps.patchProof(finding, { baseline: poc.baseline, exploit: poc.exploit, check: poc.check });
+  if (deps.patchProof) {
+    verification.patchProof = await deps.patchProof(finding, { baseline: poc.baseline, exploit: poc.exploit, check: poc.check, originalBaseline: baseline });
+  }
   return { ...finding, confidence: "confirmed", verification };
 }
 

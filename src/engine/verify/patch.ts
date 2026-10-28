@@ -1,5 +1,6 @@
 // Patch proof (the second half of verification): re-run a confirmed PoC against a copy of the project with the
-// finding's suggestedPatch applied, and check the exploit now fails while a benign request still works.
+// finding's suggestedPatch applied, and check the exploit now fails while the benign request returns exactly the
+// response it returned before the patch.
 //
 // The original project is never modified: everything happens in a throwaway copy that is removed afterwards.
 // Patch application is deliberately conservative — it replaces a named function the patch redefines in the sink
@@ -10,7 +11,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Project, SyntaxKind, type SourceFile } from "ts-morph";
 import type { Finding, Verification } from "../../types/index.js";
-import { evaluate } from "./evaluate.js";
+import { emptyResult, evaluate, sameResponse } from "./evaluate.js";
 import type { Check, PocRequest } from "./poc.js";
 import { Target } from "./target.js";
 
@@ -30,8 +31,6 @@ export interface PatchProverOptions {
   sourceRoot?: string;
   start: StartPatched;
 }
-
-const ok = (status: number) => status >= 200 && status < 300;
 
 /** Top-level function names a patch snippet defines: `function f`, `const f = () =>`, `exports.f = function`. */
 function patchedFunctionNames(patch: string): string[] {
@@ -122,8 +121,20 @@ export function verifyPatch(opts: PatchProverOptions): PatchProver {
         const exploit = await run(target, poc.exploit);
         const stillWorks = evaluate(poc.check, baseline, exploit).success;
         if (stillWorks) return { outcome: "still-exploitable", summary: `after applying the patch the exploit still succeeded (exploit status ${exploit.status})` };
-        if (!ok(baseline.status)) return { outcome: "still-exploitable", summary: `the exploit was blocked, but the patched route no longer serves a benign request (baseline status ${baseline.status}) — the patch broke the route` };
-        return { outcome: "blocked", summary: `patch verified: the exploit was blocked (exploit status ${exploit.status}) while a benign request still succeeded (baseline status ${baseline.status})` };
+        const benign = sameResponse(poc.originalBaseline, baseline);
+        if (!benign.success) {
+          return {
+            outcome: "breaks-route",
+            summary: `the exploit was blocked (exploit status ${exploit.status}), but the patched route no longer answers the benign request the same way: ${benign.detail}`,
+          };
+        }
+        const note = emptyResult(poc.originalBaseline)
+          ? " Note: the benign response carried no data, so this shows the route answers the same way, not that real results are unchanged."
+          : "";
+        return {
+          outcome: "blocked",
+          summary: `patch verified: the exploit was blocked (exploit status ${exploit.status}) and the benign request returned the same response as before the patch (status ${baseline.status}).${note}`,
+        };
       } finally {
         await stop();
       }
