@@ -324,6 +324,23 @@ test("IDOR write: discovers a foreign id, proves the cross-scope write, restores
   assert.equal(appts[1].status, "booked"); // own resource left as-is (the own "baseline" was a no-op write)
 });
 
+test("IDOR write: when the model's value equals the target's current value, a differing own value is used", async () => {
+  resetAppts();
+  appts[3].status = "cancelled"; // the foreign resource already has the status the model will try to set
+  const target = new Target({ url: base, auth: idorToken });
+  const finding: Finding = { ...idorFinding, cwe: "CWE-862", httpRoute: "PATCH /api/appointments/:id" };
+  const poc = {
+    baseline: { method: "PATCH", path: "/api/appointments/1", body: { status: "booked" } },
+    exploit: { method: "PATCH", path: "/api/appointments/2", body: { status: "cancelled" } }, // same as id 3's current value → a no-op
+    check: idorFieldCheck,
+    rationale: "patching another shop's appointment succeeds",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
+  assert.equal(f.confidence, "confirmed"); // the proof substituted the caller's own "booked" so the write is observable
+  assert.match(f.verification!.summary, /status changed from "cancelled" to "booked"/);
+  assert.equal(appts[3].status, "cancelled"); // reverted to what it was before the proof
+});
+
 // ---- patch proof --------------------------------------------------------------------------------
 
 const twoRows = JSON.stringify({ appointments: [{ shop_id: 1 }, { shop_id: 1 }] });

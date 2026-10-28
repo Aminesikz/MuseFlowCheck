@@ -39,6 +39,27 @@ function bodyFields(poc: Poc): Record<string, unknown> {
 }
 
 /**
+ * The write body to apply to the foreign resource, with each field set to a value that differs from its CURRENT one so
+ * the write is observable: the model's exploit value when it already differs, else a value the caller's own resource
+ * carries (a known-valid alternative, e.g. a different status), else the model's value (reported honestly if a no-op).
+ */
+function mutationBody(poc: Poc, before: { body: string }, ownRead: { body: string }): Record<string, unknown> {
+  const b = parse(before.body);
+  const own = parse(ownRead.body);
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(bodyFields(poc))) {
+    const current = findField(b, k);
+    if (differs(v, current)) {
+      out[k] = v;
+      continue;
+    }
+    const ownVal = findField(own, k);
+    out[k] = differs(ownVal, current) ? ownVal : v;
+  }
+  return out;
+}
+
+/**
  * Read IDOR: run as a fallback after the model's own exploit failed to differ. `baseline` is the model's benign
  * own-scope response, already fetched, used to anchor the caller's own scope.
  */
@@ -133,10 +154,13 @@ export async function proveWriteIdor(poc: Poc, rp: RouteParam, ownerField: strin
     return { kind: "unverified", reason: `no resource owned by another scope was found probing GET ${rp.template} for ids 1..${range}; cannot prove a cross-scope write` };
   }
   const foreignPath = fillParam(rp, disc.id);
-  const body = bodyFields(poc);
 
   const before = await send(target, { method: "GET", path: foreignPath, authenticated: true });
-  const mutate = await send(target, { method: rp.method, path: foreignPath, body: poc.exploit.body, authenticated: poc.exploit.authenticated ?? true });
+  // Choose values that genuinely differ from the foreign resource's current ones, so "the change took effect" is
+  // observable: prefer the model's exploit value, else a value seen on the caller's own resource (never the seed/db).
+  const body = mutationBody(poc, before, ownRead);
+  const sent = Object.keys(body).length > 0 ? body : poc.exploit.body;
+  const mutate = await send(target, { method: rp.method, path: foreignPath, body: sent, authenticated: poc.exploit.authenticated ?? true });
   const after = await send(target, { method: "GET", path: foreignPath, authenticated: true });
   const afterOwner = findField(parse(after.body), ownerField);
   const effect = mutationEffect(before, after, body, rp.method);
