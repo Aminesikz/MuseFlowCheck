@@ -178,6 +178,10 @@ export async function proveWriteIdor(poc: Poc, rp: RouteParam, ownerField: strin
   }
   const foreignPath = fillParam(rp, disc.id);
   const before = await send(target, { method: "GET", path: foreignPath, authenticated: true });
+  // Abort-before-write invariant: never mutate a resource we could not first snapshot, or we cannot restore it.
+  if (!ok(before.status) || resourceObject(parse(before.body), ownerField) === undefined) {
+    return { kind: "unverified", reason: `could not snapshot foreign resource ${foreignPath} (status ${before.status}) before writing, so no write was performed` };
+  }
 
   // Apply the mutation. For a bodyless method (DELETE) there is one attempt; otherwise try candidate single-field
   // writes one at a time and stop at the first the server actually applies, so only the minimum is changed.

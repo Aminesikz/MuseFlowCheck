@@ -100,7 +100,7 @@ Return ONLY a JSON array with one object — no prose, no fences:
   "payload": "<the executing payload containing ${MARKER_PLACEHOLDER}>",
   "benign": "<an ordinary non-executing bio/value>"
 }]
-The tool snapshots the stored value via readBack, writes the payload, loads render, then restores the original value — so write to a record you own. For a server-rendered page set client:false, authenticated:false. For the React client view set client:true.`;
+The tool snapshots the stored value via readBack BEFORE writing and will NOT write the payload unless that snapshot succeeds. So "readBack" MUST be a route that actually returns the same field you write in "bodyField" — pick a detail/profile route that includes that field, not a list or summary route that omits it. Write to a record you own. For a server-rendered page set client:false, authenticated:false. For the React client view set client:true.`;
 }
 
 function asRender(v: unknown): RenderTarget {
@@ -144,6 +144,17 @@ function withMarker(payload: string, marker: string): string {
 
 const ok = (s: number | null): boolean => s !== null && s >= 200 && s < 300;
 
+/**
+ * Ordered read-back routes to snapshot the written field from: the model's own read-back first, then routes derived
+ * structurally from the write path — its parent resource, a sibling detail/profile route, and the field as its own
+ * GET resource — so a snapshot succeeds even when the model names a route that omits the field. Deduplicated.
+ */
+function readBackCandidates(plan: StoredPlan): string[] {
+  const parent = plan.write.path.replace(/\/[^/]+$/, ""); // /api/x/:id/field -> /api/x/:id
+  const candidates = [plan.readBack.path, parent, `${parent}/profile`, `${parent}/details`, plan.write.path];
+  return [...new Set(candidates.filter((p) => p.startsWith("/")))];
+}
+
 function loadEvidence(load: LoadResult, note: string) {
   return { method: "GET", path: load.url, status: load.status ?? 0, responseExcerpt: note };
 }
@@ -161,28 +172,68 @@ export async function proveXss(finding: Finding, plan: XssPlan, target: Target, 
   const marker = `FCX-${randomUUID()}`;
   const payload = withMarker(plan.payload, marker);
   return plan.kind === "reflected"
-    ? proveReflected(plan, payload, marker, target, deps)
+    ? proveReflected(finding, plan, payload, marker, target, deps)
     : proveStored(plan, payload, marker, target, deps);
 }
 
-async function proveReflected(plan: ReflectedPlan, payload: string, marker: string, target: Target, deps: XssProofDeps): Promise<XssProof> {
-  const url = renderUrl(plan.render, target, deps.clientBase);
-  const build = (value: string) => (plan.render.in === "path" ? url.replace(/\/[^/]*$/, `/${encodeURIComponent(value)}`) : `${url}?${plan.render.param}=${encodeURIComponent(value)}`);
-  const exploit = await deps.browser.load(build(payload), plan.render.authenticated);
-  const baseline = await deps.browser.load(build(plan.benign), plan.render.authenticated);
-  return decide(exploit, baseline, marker, `Reflected XSS: payload in "${plan.render.param}" was rendered and executed in the browser.`);
+// A valid value for a structural path parameter: route ids are numeric, and 1 is the lowest seeded id and the
+// authenticated caller's own scope, so it renders a real page. The payload never goes in a structural param.
+const PATH_PARAM_ID = "1";
+
+/** The sink route's path template, from the finding's HTTP route when present, else the model's render path. */
+function routeTemplate(finding: Finding, plan: ReflectedPlan): string {
+  const fromFinding = finding.httpRoute?.replace(/^\S+\s+/, "");
+  return fromFinding ?? plan.render.path;
+}
+
+async function proveReflected(finding: Finding, plan: ReflectedPlan, payload: string, marker: string, target: Target, deps: XssProofDeps): Promise<XssProof> {
+  // Build the path from the authoritative route template, filling STRUCTURAL path params with ids the route accepts
+  // (not model-invented strings like "shop123"); the payload goes only in the injectable query/path param.
+  const template = routeTemplate(finding, plan);
+  const buildPath = (value: string) =>
+    template.replace(/:([A-Za-z_]\w*)/g, (_m, name: string) => (plan.render.in === "path" && name === plan.render.param ? encodeURIComponent(value) : PATH_PARAM_ID));
+  const buildUrl = (value: string) => {
+    const base = (plan.render.client ? deps.clientBase : target.base) ?? target.base;
+    const path = buildPath(value);
+    assertLocalTarget(base + path); // defense in depth
+    return plan.render.in === "path" ? base + path : `${base + path}?${plan.render.param}=${encodeURIComponent(value)}`;
+  };
+  const exploit = await deps.browser.load(buildUrl(payload), plan.render.authenticated);
+  const baseline = await deps.browser.load(buildUrl(plan.benign), plan.render.authenticated);
+  return decide(exploit, baseline, marker, `Reflected XSS: payload in "${plan.render.param}" was rendered and executed in the browser (${buildPath("…")}).`);
 }
 
 async function proveStored(plan: StoredPlan, payload: string, marker: string, target: Target, deps: XssProofDeps): Promise<XssProof> {
   const url = renderUrl(plan.render, target, deps.clientBase);
-  const read = async (): Promise<string | undefined> => {
-    const res = await target.request("GET", plan.readBack.path, { authenticated: true });
-    const v = findField(parse(res.body), plan.readBack.field);
+  const field = plan.write.bodyField; // the field written and restored; the read-back must return this one
+  // Read the field through a given route, or undefined when that route does not carry it.
+  const readFrom = async (path: string): Promise<string | undefined> => {
+    const res = await target.request("GET", path, { authenticated: true });
+    if (!ok(res.status)) return undefined;
+    const v = findField(parse(res.body), field);
     return typeof v === "string" ? v : v === undefined ? undefined : JSON.stringify(v);
   };
-  const write = (value: string) => target.request(plan.write.method, plan.write.path, { body: { [plan.write.bodyField]: value }, authenticated: true });
+  // Snapshot via a route that actually returns the field, without trusting the model's guess: try its read-back, then
+  // routes derived from the write path (its resource, a sibling detail/profile route, the field as its own resource).
+  let readPath: string | undefined;
+  let original: string | undefined;
+  for (const path of readBackCandidates(plan)) {
+    const v = await readFrom(path);
+    if (v !== undefined) {
+      [readPath, original] = [path, v];
+      break;
+    }
+  }
+  // Abort-before-write invariant: a resource we cannot snapshot (and therefore cannot restore) is never mutated.
+  if (original === undefined || readPath === undefined) {
+    return {
+      kind: "unverified",
+      reason: `could not snapshot the target field "${field}" via any read-back route (tried ${readBackCandidates(plan).join(", ")}), so no payload was written (left the fixture unchanged).`,
+    };
+  }
 
-  const original = await read(); // snapshot, so the write can be undone
+  const read = () => readFrom(readPath!);
+  const write = (value: string) => target.request(plan.write.method, plan.write.path, { body: { [field]: value }, authenticated: true });
   let exploit: LoadResult, baseline: LoadResult, restored = false;
   try {
     const w1 = await write(payload);
@@ -191,12 +242,10 @@ async function proveStored(plan: StoredPlan, payload: string, marker: string, ta
     await write(plan.benign);
     baseline = await deps.browser.load(url, plan.render.authenticated);
   } finally {
-    if (original !== undefined) {
-      const back = await write(original);
-      restored = ok(back.status) && (await read()) === original;
-    }
+    const back = await write(original);
+    restored = ok(back.status) && (await read()) === original;
   }
-  const restoreNote = original === undefined ? " The record had no prior value to restore." : restored ? " The original value was restored." : " RE-SEED RECOMMENDED: the original value could not be restored.";
+  const restoreNote = restored ? " The original value was restored." : " RE-SEED RECOMMENDED: the original value could not be restored.";
   return decide(
     exploit,
     baseline,

@@ -102,6 +102,28 @@ test("reflected: confirmed when the payload executes and the benign baseline doe
   assert.equal(browser.loads.length, 2);
 });
 
+test("reflected: structural path params are filled from the route template with a valid id, not the model's string", async () => {
+  // Mimics the fixture: a non-numeric :shopId 404s and never renders; a numeric one renders the reflected q.
+  const base = await listen((req, res) => {
+    const m = /^\/book\/([^/]+)\/search$/.exec(new URL(req.url!, "http://x").pathname);
+    if (!m || !/^\d+$/.test(m[1])) {
+      res.statusCode = 404;
+      res.end("not found");
+      return;
+    }
+    const q = new URL(req.url!, "http://x").searchParams.get("q") ?? "";
+    res.setHeader("content-type", "text/html");
+    res.end(`<!doctype html><h1>results for ${q}</h1>`);
+  });
+  const browser = new FetchBrowser();
+  // The model's render.path has a bad non-numeric shopId; the authoritative route template drives the real path.
+  const plan = parseXssPlan(`[{"kind":"reflected","render":{"path":"/book/shop123/search","param":"q","in":"query"},"payload":${JSON.stringify(PAYLOAD)},"benign":"hello"}]`);
+  const f = { ...finding("Cross-Site Scripting (Reflected)"), httpRoute: "GET /book/:shopId/search" };
+  const proof = await proveXss(f, plan, new Target({ url: base }), { browser });
+  assert.equal(proof.kind, "confirmed");
+  assert.ok(browser.loads.every((u) => u.includes("/book/1/search")), `path params filled with a valid id; loaded ${browser.loads.join(", ")}`);
+});
+
 test("reflected: NOT confirmed when the reflection is HTML-escaped (the escaped-output discrimination)", async () => {
   const base = await listen((req, res) => {
     const q = new URL(req.url!, "http://x").searchParams.get("q") ?? "";
@@ -117,7 +139,7 @@ test("reflected: NOT confirmed when the reflection is HTML-escaped (the escaped-
 // ---- stored proof: write, render, restore -----------------------------------------------------
 
 /** An in-memory bio store with a PUT writer, a JSON read-back, and an HTML render (optionally escaped). */
-function bioServer(opts: { escape?: boolean; alwaysPayload?: boolean } = {}) {
+function bioServer(opts: { escape?: boolean; alwaysPayload?: boolean; readBackOmitsField?: boolean; profileReturnsField?: boolean } = {}) {
   const state = { bio: "the original bio", writes: [] as string[] };
   const handler: http.RequestListener = (req, res) => {
     const u = new URL(req.url!, "http://x");
@@ -132,6 +154,18 @@ function bioServer(opts: { escape?: boolean; alwaysPayload?: boolean } = {}) {
       return;
     }
     if (u.pathname === "/json") {
+      res.setHeader("content-type", "application/json");
+      // readBackOmitsField mimics a route that returns the resource WITHOUT the written field (e.g. a summary route).
+      res.end(JSON.stringify({ barber: opts.readBackOmitsField ? { name: "x" } : { bio: state.bio } }));
+      return;
+    }
+    if (u.pathname === "/profile") {
+      // A sibling detail route that DOES return the field; the tool derives it from the write path.
+      if (!opts.profileReturnsField) {
+        res.statusCode = 404;
+        res.end();
+        return;
+      }
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ barber: { bio: state.bio } }));
       return;
@@ -176,4 +210,24 @@ test("stored: NOT confirmed when the baseline also executes (execution not attri
   const proof = await proveXss(finding("Cross-Site Scripting (Stored)"), storedPlan(), new Target({ url: base }), { browser: new FetchBrowser() });
   assert.equal(proof.kind, "unverified");
   assert.match((proof as { reason: string }).reason, /baseline also executed/);
+});
+
+test("stored: snapshot recovers via a derived read-back route when the model's omits the field — confirmed and restored", async () => {
+  // The model's read-back (/json) omits the field, but the tool derives /profile from the write path, which returns it.
+  const srv = bioServer({ readBackOmitsField: true, profileReturnsField: true });
+  const base = await listen(srv.handler);
+  const proof = await proveXss(finding("Cross-Site Scripting (Stored)"), storedPlan(), new Target({ url: base }), { browser: new FetchBrowser() });
+  assert.equal(proof.kind, "confirmed");
+  assert.match(proof.verification!.summary, /The original value was restored\./);
+  assert.equal(srv.state.bio, "the original bio", "restored to the snapshot taken via the derived route");
+});
+
+test("stored: abort-before-write — a snapshot that cannot read the field writes NOTHING and leaves the fixture clean", async () => {
+  const srv = bioServer({ readBackOmitsField: true }); // readBack returns the resource without the written field
+  const base = await listen(srv.handler);
+  const proof = await proveXss(finding("Cross-Site Scripting (Stored)"), storedPlan(), new Target({ url: base }), { browser: new FetchBrowser() });
+  assert.equal(proof.kind, "unverified");
+  assert.match((proof as { reason: string }).reason, /could not snapshot the target field .* so no payload was written/);
+  assert.equal(srv.state.writes.length, 0, "no write happened — the fixture was never mutated");
+  assert.equal(srv.state.bio, "the original bio");
 });
