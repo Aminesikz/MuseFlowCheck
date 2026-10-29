@@ -569,9 +569,11 @@ export class Tracer {
       else if (Node.isNewExpression(node)) this.onNew(node, env, ref, req);
     };
     if (!Node.isBlock(body)) visit(body); // expression-bodied arrow: `(x) => run(x)`
+    // Nested functions (callbacks) are not entered yet. The callback must not return `traversal.skip()`:
+    // ts-morph ends the whole walk when it returns a value, which left every statement after a callback unvisited.
     body.forEachDescendant((node, traversal) => {
-      if (isFn(node)) return traversal.skip(); // nested callbacks are not followed yet
-      visit(node);
+      if (isFn(node)) traversal.skip();
+      else visit(node);
     });
 
     this.selfStack.pop();

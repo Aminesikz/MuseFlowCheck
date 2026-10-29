@@ -84,3 +84,22 @@ test("empty judgment means not exploitable", () => {
 test("bad judgment keeps the raw response", () => {
   assert.throws(() => parseJudgment('[{"severity":"urgent"}]', groupBySink(trace.paths)[0]), FindingParseError);
 });
+
+test("statements after a callback are still traced (route .map(), service .filter())", () => {
+  const dir = fileURLToPath(new URL("./crossfile-callbacks", import.meta.url));
+  const t = traceEntry(`${dir}/routes/reports.js`, dir);
+  const [p] = t.paths.filter((c) => c.sqlText);
+  assert.ok(p, "the SQL sink after the callbacks is reached");
+  assert.deepEqual(
+    p.hops.map((h) => `${h.kind} ${h.file}:${h.line}`),
+    [
+      "source routes/reports.js:5",
+      "call routes/reports.js:5",
+      "param services/reports.js:3",
+      "build services/reports.js:5",
+      "call services/reports.js:6",
+      "param db.js:5",
+      "sink db.js:5",
+    ],
+  );
+});
