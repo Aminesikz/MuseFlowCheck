@@ -32,3 +32,7 @@ service-account*.json
 .DS_Store
 .idea/
 .vscode/
+
+# Local-only working notes (never commit)
+HANDOFF.md
+CLAUDE.md
