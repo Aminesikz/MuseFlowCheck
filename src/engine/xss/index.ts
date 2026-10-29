@@ -1,11 +1,12 @@
-// XSS analysis: Stage 1 traces request input to HTML output across files; Stage 2 has the model judge each raw output.
+// XSS analysis: Stage 1 traces request input — directly, or stored and read back — to HTML output across files and
+// into browser code; Stage 2 has the model judge each raw output.
 import type { Finding } from "../../types/index.js";
 import { formatHop } from "../crossfile/judge.js";
 import { groupXssBySink, judgeXssGroup, xssGroupSignature, type XssSinkGroup } from "./judge.js";
 import { traceXssProject, type XssTraceResult } from "./trace.js";
 
-export { buildXssPrompt, groupXssBySink, parseXssJudgment, xssGroupSignature, XSS_CWE, XSS_TYPE, type XssSinkGroup } from "./judge.js";
-export { traceXssProject, XssTracer, type TaintState, type XssPath, type XssTraceResult } from "./trace.js";
+export { buildXssPrompt, groupXssBySink, parseXssJudgment, xssGroupSignature, xssType, XSS_CWE, XSS_STORED_TYPE, XSS_TYPE, type XssSinkGroup } from "./judge.js";
+export { sqlRead, sqlWrite, traceXssProject, XssTracer, type TaintState, type XssContext, type XssPath, type XssTraceResult } from "./trace.js";
 
 export interface XssJudgeResult {
   findings: Finding[];

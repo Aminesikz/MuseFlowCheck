@@ -10,6 +10,7 @@ import { SEVERITY_GUIDE } from "../prompt.js";
 import type { XssPath } from "./trace.js";
 
 export const XSS_TYPE = "Cross-Site Scripting (Reflected)";
+export const XSS_STORED_TYPE = "Cross-Site Scripting (Stored)";
 export const XSS_CWE = "CWE-79";
 /** Encoded outputs of the same input shown for contrast; the rest are counted. */
 const MAX_CONTRAST = 5;
@@ -20,14 +21,20 @@ export interface XssSinkGroup {
   paths: XssPath[];
   omitted: number;
   contrast: XssPath[];
+  /** Stored XSS: the `table.column` the input is persisted to (every path of the group goes through it). */
+  stored?: string;
+}
+
+export function xssType(group: XssSinkGroup): string {
+  return group.stored ? XSS_STORED_TYPE : XSS_TYPE;
 }
 
 export function groupXssBySink(paths: XssPath[]): XssSinkGroup[] {
   const groups = new Map<string, XssSinkGroup>();
   for (const p of paths.filter((c) => !c.encoded)) {
     const sink = p.hops.at(-1)!;
-    const key = `${sink.file}:${sink.line}`;
-    if (!groups.has(key)) groups.set(key, { sink, paths: [], omitted: 0, contrast: [] });
+    const key = `${sink.file}:${sink.line}:${p.stored ?? ""}`;
+    if (!groups.has(key)) groups.set(key, { sink, paths: [], omitted: 0, contrast: [], ...(p.stored ? { stored: p.stored } : {}) });
     const group = groups.get(key)!;
     if (group.paths.length < MAX_PATHS_PER_SINK) group.paths.push(p);
     else group.omitted++;
@@ -42,7 +49,7 @@ export function groupXssBySink(paths: XssPath[]): XssSinkGroup[] {
 /** Identifies what the model is asked about: the output plus every hop of every path shown. */
 export function xssGroupSignature(group: XssSinkGroup): string {
   const path = (p: XssPath) => p.hops.map((h) => `${h.kind}@${h.file}:${h.line}`).join(">");
-  return `xss|${group.sink.file}:${group.sink.line}|${group.paths.map(path).join("|")}`;
+  return `xss|${group.stored ?? ""}|${group.sink.file}:${group.sink.line}|${group.paths.map(path).join("|")}`;
 }
 
 function functionsOn(paths: XssPath[]): FunctionRef[] {
@@ -59,12 +66,28 @@ const numbered = (p: XssPath, i: number) =>
 
 /** How the ordered severity rules apply when the impact is script running in a victim's browser. */
 const XSS_SEVERITY = `For cross-site scripting, read the rules in terms of what injected script can do in a victim's browser on this origin: act with the victim's session (cookies, tokens held by the page, authenticated requests), read what the victim can see, or perform actions as them. A reflected XSS only runs when a victim opens an attacker-crafted link or page — that is a precondition, so "exploitable without authentication" in rule 1 does not apply merely because the vulnerable page is public. State what a victim's session on this origin could reach, and the reasoning behind the severity.`;
+const XSS_STORED_SEVERITY = `A stored XSS needs no crafted link: it runs for every viewer of the page or screen that renders the stored value, which typically raises severity — weigh who views it (anonymous visitors, other users, staff or administrators) and who can write it.`;
+
+/** What kind of output the paths end at, in the words the judge needs. */
+const OUTPUT_KIND: Record<XssPath["context"], string> = {
+  markup: "interpolated or concatenated into a string whose literal text is HTML markup, which the server sends as a page",
+  response: "written to the HTTP response as-is",
+  "dom-html": "inserted into the page as HTML in the browser (React dangerouslySetInnerHTML, or innerHTML / insertAdjacentHTML / document.write), where the string is parsed as markup",
+  "jsx-text": "rendered as a JSX text child",
+};
+
+/** For stored XSS: the two requests, and where the paths cross from one to the other. */
+function storedNote(group: XssSinkGroup): string {
+  if (!group.stored) return "";
+  const writer = group.paths.find((p) => p.writtenBy)?.writtenBy;
+  return `\n\nThis is a STORED flow across two requests: request input is written to the database column ${group.stored}${writer ? ` by ${writer}` : ""}, and a later request reads that column back and renders it. In each path, the hops up to [store] are the write; [entry] and [load] mark where the rendering side begins and reads the stored value back; the rest is how it reaches the output. Anyone who can make the write controls what every later viewer receives. Check the write side for validation or encoding before storage as well as the render side.`;
+}
 
 export function buildXssPrompt(group: XssSinkGroup): string {
   const paths = group.paths.map(numbered).join("\n\n");
   const contrast =
     group.contrast.length > 0
-      ? `\n\nOTHER OUTPUTS OF THE SAME INPUT — Stage 1 found these pass an HTML-encoding step first (${group.contrast
+      ? `\n\nOTHER OUTPUTS OF THE SAME INPUT — Stage 1 found these encoded or escaped on the way (${group.contrast
           .map((p) => p.encoder)
           .filter(Boolean)
           .filter((e, i, all) => all.indexOf(e) === i)
@@ -74,7 +97,8 @@ export function buildXssPrompt(group: XssSinkGroup): string {
       : "";
   const imports = group.paths[0].sinkImports;
 
-  return `You are a senior security code reviewer. A deterministic cross-file tracer followed HTTP request input through the function calls below until it was placed into HTML output: interpolated or concatenated into a string whose literal text is HTML markup, or written to the HTTP response as-is. The tracer follows values across files and recognizes some encoding steps, but it over-approximates. Decide whether this is genuinely exploitable cross-site scripting (CWE-79): can an attacker, by choosing the input, make a victim's browser run script?
+  const kind = OUTPUT_KIND[group.paths[0].context];
+  return `You are a senior security code reviewer. A deterministic cross-file tracer followed HTTP request input through the function calls below until it reached an HTML output — here: ${kind}. The tracer follows values across files and recognizes some encoding steps, but it over-approximates. Decide whether this is genuinely exploitable cross-site scripting (CWE-79): can an attacker, by choosing the input, make a victim's browser run script?${storedNote(group)}
 
 The heart of the decision is whether the value is HTML-encoded or sanitized ON THE WAY TO THIS OUTPUT. Check every hop of every path. A path is NOT exploitable if, anywhere along it:
 - the value is HTML-encoded for the context it lands in (& < > " ' replaced with character entities — by a project helper or a library function), or passed through an HTML sanitizer that strips script-capable markup;
@@ -93,7 +117,7 @@ CODE — every function on the paths, with real file line numbers prefixed as "N
 ${functionsOn(group.paths).map(codeSlice).join("\n\n")}
 
 ${SEVERITY_GUIDE}
-${XSS_SEVERITY}
+${XSS_SEVERITY}${group.stored ? `\n${XSS_STORED_SEVERITY}` : ""}
 Route registration and middleware are not shown; state any assumption you make about who can reach the page and who would view it.
 
 OUTPUT
@@ -101,11 +125,11 @@ Return ONLY a JSON array — no prose, no markdown fences.
 - [] if no path is exploitable.
 - Otherwise exactly ONE object (one finding for this output):
 {
-  "type": "${XSS_TYPE}",
+  "type": "${xssType(group)}",
   "cwe": "${XSS_CWE}",
   "severity": "critical" | "high" | "medium" | "low",
   "path": number,            // the "Path N" number above that most clearly demonstrates the flaw
-  "explanation": string,     // plain language: why it is exploitable across these files and what an attacker could do (include an example payload), AND confirm, hop by hop, that no encoding or sanitization is applied on the way to this output
+  "explanation": string,     // plain language: why it is exploitable across these files and what an attacker could do (include an example payload), AND confirm, hop by hop, that no encoding or sanitization is applied on the way to this output${group.stored ? `; say that the input is stored (persisted) and who it reaches` : ""}
   "suggestedPatch": string   // corrected code for the function containing the output, HTML-encoding the value where it enters the markup — reuse an encoding helper the project already imports, if there is one — multi-line and formatted like the original
 }
 Do not include file, line, or taintPath fields — the tool fills those in from the traced path.`;
@@ -123,7 +147,7 @@ export function parseXssJudgment(raw: string, group: XssSinkGroup): Finding | nu
     const sink = path.hops.at(-1)!;
     return {
       ...judgment,
-      type: XSS_TYPE,
+      type: xssType(group),
       cwe: XSS_CWE,
       file: source.file,
       sourceLine: source.line,

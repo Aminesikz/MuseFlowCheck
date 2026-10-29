@@ -23,7 +23,7 @@ import {
   type VariableDeclaration,
 } from "ts-morph";
 
-export type HopKind = "source" | "propagate" | "build" | "call" | "param" | "sink";
+export type HopKind = "source" | "propagate" | "build" | "call" | "param" | "sink" | "entry" | "store" | "load";
 
 /** A function on a traced path, with its source text for the Stage 2 code slice. */
 export interface FunctionRef {
@@ -720,7 +720,7 @@ export class Tracer {
         if (!Node.isIdentifier(el.getNameNode())) continue;
         const topLevel = el.getParent() === nameNode && Node.isObjectBindingPattern(nameNode) && !el.getDotDotDotToken();
         if (!byKey || !topLevel) {
-          bind(el.getName(), taints);
+          bind(el.getName(), topLevel ? this.propertyTaints(taints, keyName(el.getPropertyNameNode() ?? el.getNameNode())) : taints);
           continue;
         }
         const key = keyName(el.getPropertyNameNode() ?? el.getNameNode());
@@ -731,6 +731,11 @@ export class Tracer {
     });
 
     if (calleeEnv.size > 0 || calleeReq) this.analyze(fn, calleeEnv, depth + 1, calleeReq, self);
+  }
+
+  /** Taint of property `key` of a value carrying `taints` (destructured from a whole argument); other analyses refine it. */
+  protected propertyTaints(taints: Taint[], _key: string): Taint[] {
+    return taints;
   }
 
   protected recordSink(call: CallExpression, argTaints: Taint[][], ref: FunctionRef): void {

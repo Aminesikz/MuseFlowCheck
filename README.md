@@ -4,7 +4,7 @@ Flowcheck is an AI agent for shift-left secure-code review of JavaScript/TypeScr
 
 Intentionally built for the Meta Global AI Developer Hackathon.
 
-**Status:** WIP — SQL injection, broken access control / IDOR, and reflected cross-site scripting: project-wide scanning with cross-file tracing, model judgment, and optional self-verification that proves findings against a running local target.
+**Status:** WIP — SQL injection, broken access control / IDOR, and cross-site scripting (reflected and stored, server and React): project-wide scanning with cross-file tracing, model judgment, and optional self-verification that proves findings against a running local target.
 
 ## Quick start
 
@@ -53,7 +53,7 @@ Routes that are unauthenticated, already checked, or that only touch tables the 
 ### Cross-site scripting (reflected)
 
 ```bash
-node dist/cli.js trace <dir> --mode xss                 # Stage 1 only: every HTML output request input reaches, no API call
+node dist/cli.js trace <dir> --mode xss                 # Stage 1 only: every HTML or DOM output request input reaches, no API call
 node dist/cli.js trace <dir> --mode xss --show-prompt   # ...plus the Stage 2 prompt for each raw output
 node dist/cli.js scan <dir> --mode xss                  # Stage 1 + Stage 2
 ```
@@ -64,7 +64,13 @@ XSS uses the same cross-file tracer as SQL injection, with a different sink: req
 - **Encoded:** the input passed a step that HTML-encodes it — a `.replace` that maps `<` to an entity (directly or through a lookup table or callback), or an encoding/sanitizing package (`escape-html`, `he`, `sanitize-html`, DOMPurify, lodash `escape`, …). Listed, never sent. Encoders are recognized by what the code does, not by name: a helper called `escape` that only trims is still raw.
 - **Already markup:** HTML built earlier and passed on (to a layout, to `res.send`) is not a new output; the place it was built is where the input was judged.
 
-Numbers (`Number(x)`), JSON responses, and values read back from the database are not treated as reflected input. Each raw output is judged once, together with any encoded outputs of the same input for contrast; the judge confirms hop by hop that no encoding occurs and proposes a patch that encodes at the output. Findings are reported as `Cross-Site Scripting (Reflected)` (CWE-79). Verification against a target is not available for XSS yet.
+Numbers (`Number(x)`) and JSON responses are not HTML outputs. Each raw output is judged once, together with any encoded outputs of the same input for contrast; the judge confirms hop by hop that no encoding occurs and proposes a patch that encodes at the output. Verification against a target is not available for XSS yet.
+
+**Stored XSS** spans two requests, so the trace runs in two passes. The first records which database column each SQL write (`UPDATE … SET col = $1`, `INSERT INTO t (col) VALUES (?)`) fills from raw request input. The second treats every read of such a column (`SELECT`, `RETURNING`) as a source — only that property of the returned rows is tainted, so `post.body` is a candidate while a column the app never writes from input is not — and follows it to outputs on any route, including routes with no request input of their own. Its path shows the write (up to `[store]`), where the rendering request begins (`[entry]`) and reads the value back (`[load]`), and how it reaches the output.
+
+**Browser code** — files of a package that depends on a UI library such as React — is walked after the server: a stored value the server sends as JSON is what `fetch` (or an HTTP client package) returns there, and it is followed through `useState` setters, component props and promise callbacks. In the browser, only DOM HTML sinks are outputs: `dangerouslySetInnerHTML`, `innerHTML`/`outerHTML`, `insertAdjacentHTML`, `document.write`. A JSX text child (`<p>{text}</p>`) is escaped by React, so it is listed, never sent. Scan the directory that contains both the server and the client to connect them.
+
+Findings are reported as `Cross-Site Scripting (Reflected)` or `Cross-Site Scripting (Stored)` (CWE-79).
 
 ### Single entry file
 
