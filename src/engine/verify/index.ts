@@ -8,6 +8,8 @@ import { evidence } from "./evidence.js";
 import { isAccessFinding, proveReadIdor, proveWriteIdor } from "./idor.js";
 import { buildPocPrompt, parsePoc, type PocRequest } from "./poc.js";
 import { Target, TargetError, type TargetResponse } from "./target.js";
+import { BrowserError } from "./browser.js";
+import { buildXssPocPrompt, isXssFinding, parseXssPlan, proveXss, type XssProofDeps } from "./xss.js";
 
 export { assertLocalTarget, Target, TargetError, type AuthConfig, type FetchLike } from "./target.js";
 export { buildPocPrompt, parsePoc, type Poc } from "./poc.js";
@@ -15,6 +17,19 @@ export { emptyResult, evaluate, findField, parse, sameResponse } from "./evaluat
 export { discoverCrossScopeId, fillParam, isMutating, routeParam, type RouteParam } from "./discover.js";
 export { isAccessFinding, proveReadIdor, proveWriteIdor } from "./idor.js";
 export { type PatchProver, verifyPatch } from "./patch.js";
+export { BrowserError, DETECT_GLOBAL, ExecBrowser, type BrowserAuth, type BrowserOptions, type LoadResult } from "./browser.js";
+export {
+  buildXssPocPrompt,
+  isXssFinding,
+  MARKER_PLACEHOLDER,
+  parseXssPlan,
+  proveXss,
+  type BrowserLike,
+  type XssPlan,
+  type XssProof,
+  type XssProofDeps,
+} from "./xss.js";
+export type { Finding } from "../../types/index.js";
 
 /** Model call plus optional context/patch-proof; injectable so the stage is testable without a network. */
 export interface VerifyDeps {
@@ -31,6 +46,8 @@ export interface VerifyDeps {
   ) => Promise<Verification["patchProof"]>;
   /** When present, enables bounded cross-scope id discovery for ":id"-style IDOR findings (probe ids 1..range). */
   probe?: { range: number };
+  /** When present, XSS findings are proved by executing a payload in a headless browser; otherwise they stay suspected. */
+  xss?: XssProofDeps;
 }
 
 /** Attaches a verification result to a copy of `finding`, setting confidence to confirmed or unverified. */
@@ -40,6 +57,29 @@ export async function verifyFinding(finding: Finding, target: Target, deps: Veri
     confidence: "unverified",
     verification: { outcome: "unverified", summary, ...extra },
   });
+
+  // XSS is proved by executing a payload in a headless browser, not by the request/response PoC oracle below.
+  // Without a configured browser the stage is purely additive: the finding keeps its "suspected" confidence.
+  if (isXssFinding(finding)) {
+    if (!deps.xss) return finding;
+    let plan;
+    try {
+      plan = parseXssPlan(await deps.complete(buildXssPocPrompt(finding, deps.identityHint)));
+    } catch (err) {
+      if (err instanceof FindingParseError) return unverified(`could not generate a usable XSS payload: ${err.message}`);
+      throw err;
+    }
+    try {
+      const proof = await proveXss(finding, plan, target, deps.xss);
+      if (proof.kind === "confirmed") return { ...finding, confidence: "confirmed", verification: proof.verification };
+      const ev = proof.verification ? { baseline: proof.verification.baseline, exploit: proof.verification.exploit } : {};
+      return unverified(proof.reason, ev);
+    } catch (err) {
+      if (err instanceof TargetError) throw err;
+      if (err instanceof BrowserError) return unverified(`the XSS execution proof could not run: ${err.message}`);
+      return unverified(`the XSS proof could not be executed against the target: ${(err as Error).message}`);
+    }
+  }
 
   let poc;
   try {

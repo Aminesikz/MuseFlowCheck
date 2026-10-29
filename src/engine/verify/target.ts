@@ -63,6 +63,11 @@ export class Target {
     if (this.auth.kind === "token") this.bearer = this.auth.token;
   }
 
+  /** The resolved bearer token (exchanging login credentials on first use), for callers that drive a browser. */
+  async bearerToken(): Promise<string | undefined> {
+    return this.token();
+  }
+
   /** Resolves the bearer token, exchanging login credentials for one on first use. */
   private async token(): Promise<string | undefined> {
     if (this.bearer !== undefined || this.auth.kind !== "login") return this.bearer;

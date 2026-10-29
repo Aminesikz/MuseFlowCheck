@@ -27,13 +27,19 @@ import {
   type AccessRoute,
 } from "./engine/access/index.js";
 import {
+  assertLocalTarget,
+  BrowserError,
+  ExecBrowser,
+  isXssFinding,
   Target,
   TargetError,
   verifyFindings,
   verifyPatch,
   type AuthConfig,
+  type BrowserAuth,
   type VerifyDeps,
 } from "./engine/verify/index.js";
+import { existsSync as fileExists } from "node:fs";
 import { startPatchedServer } from "./engine/verify/server.js";
 import { buildXssPrompt, groupXssBySink, judgeXss, traceXssProject, type XssPath, type XssTraceResult } from "./engine/xss/index.js";
 import { complete } from "./llm/meta-client.js";
@@ -80,6 +86,11 @@ Verification (optional; proves findings by executing them against a target you r
   --start-cmd <cmd>     command that starts the patched copy, honoring PORT (default "npm start")
   --ready-path <path>   path polled until the patched server answers (default "/")
 
+XSS execution proof (optional; proves XSS findings by executing a payload in a headless browser):
+  --browser-path <path> Chrome/Chromium binary to drive (auto-detected if omitted); without one, XSS stays "suspected"
+  --xss-client <url>    LOCAL base URL of the client app, for findings whose sink renders in browser code (e.g. React)
+  --xss-token-store <s> how the client app reads its token: "localStorage:<key>", "sessionStorage:<key>" or "window:<path>"
+
 Exit codes: 0 no high/critical findings, 1 high/critical finding(s), 2 error`;
 
 const EXIT_GATE = 1;
@@ -92,8 +103,26 @@ let say: (text: string) => void = (text) => console.log(text);
 interface VerifyRuntime {
   target: Target;
   deps: VerifyDeps;
+  /** XSS execution-proof config: the browser binary to launch, the client origin, and how to inject the token. */
+  xss?: { browserPath: string; clientBase?: string; tokenStore?: BrowserAuth["via"] };
 }
 let verify: VerifyRuntime | undefined;
+
+/** Common install locations of a Chrome/Chromium binary, tried when --browser-path is not given. */
+const CHROME_CANDIDATES = [
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/Applications/Chromium.app/Contents/MacOS/Chromium",
+  "/usr/bin/google-chrome",
+  "/usr/bin/google-chrome-stable",
+  "/usr/bin/chromium",
+  "/usr/bin/chromium-browser",
+  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+];
+function findChrome(flag: string | undefined): string | undefined {
+  if (flag) return fileExists(flag) ? flag : undefined;
+  return CHROME_CANDIDATES.find((p) => fileExists(p));
+}
 
 function indent(text: string, prefix = "    "): string {
   return text
@@ -144,6 +173,7 @@ function confidenceBreakdown(findings: Finding[]): string {
 async function finalizeFindings(findings: Finding[], label: string): Promise<{ findings: Finding[]; error?: boolean }> {
   if (!verify || findings.length === 0) return { findings };
   say(`\nVerification — proving ${findings.length} finding(s) against ${verify.target.base} ...\n`);
+  const browser = await openXssBrowser(findings);
   try {
     return { findings: await verifyFindings(findings, verify.target, verify.deps) };
   } catch (err) {
@@ -153,6 +183,33 @@ async function finalizeFindings(findings: Finding[], label: string): Promise<{ f
     }
     console.error(`✗ Verification error: ${describeError(err, label)}`);
     return { findings, error: true };
+  } finally {
+    await browser?.close();
+  }
+}
+
+/**
+ * Launches the headless browser for XSS execution proofs when the findings include XSS and a browser is configured,
+ * and attaches it to the verify deps for the duration. Returns the browser to close afterwards, or undefined when no
+ * XSS proof will run (no XSS findings, or no browser) — in which case XSS findings stay "suspected" (purely additive).
+ */
+async function openXssBrowser(findings: Finding[]): Promise<ExecBrowser | undefined> {
+  if (!verify?.xss || !findings.some(isXssFinding)) return undefined;
+  const { browserPath, clientBase, tokenStore } = verify.xss;
+  try {
+    let auth: BrowserAuth | undefined;
+    if (tokenStore) {
+      const token = await verify.target.bearerToken();
+      if (token) auth = { token, via: tokenStore };
+    }
+    const browser = await ExecBrowser.launch({ executablePath: browserPath }, auth);
+    verify.deps.xss = { browser, clientBase };
+    say(`  XSS execution proof: headless browser ready (${browserPath}).\n`);
+    return browser;
+  } catch (err) {
+    const why = err instanceof BrowserError ? err.message : (err as Error).message;
+    say(`  XSS execution proof unavailable (${why}); XSS findings stay "suspected".\n`);
+    return undefined;
   }
 }
 
@@ -530,7 +587,7 @@ async function scanXss(dir: string, json: boolean): Promise<number> {
 }
 
 /** Flags that take a value. */
-const VALUE_FLAGS = new Set(["root", "mode", "route", "target", "token", "login-path", "login-body", "token-field", "identity", "probe-range", "start-cmd", "ready-path"]);
+const VALUE_FLAGS = new Set(["root", "mode", "route", "target", "token", "login-path", "login-body", "token-field", "identity", "probe-range", "start-cmd", "ready-path", "browser-path", "xss-client", "xss-token-store"]);
 
 /** Builds the verification runtime from the flags, or undefined when no `--target` is given. Throws on bad config. */
 function buildVerifyRuntime(value: (name: string) => string | undefined, patch: boolean, dir: string): VerifyRuntime | undefined {
@@ -567,7 +624,28 @@ function buildVerifyRuntime(value: (name: string) => string | undefined, patch: 
       start: (copyDir) => startPatchedServer(copyDir, { command: value("start-cmd") ?? "npm start", readyPath: value("ready-path"), auth }),
     });
   }
-  return { target, deps };
+  return { target, deps, xss: xssConfig(value) };
+}
+
+/** XSS execution-proof config from the flags; undefined when no headless browser is available. */
+function xssConfig(value: (name: string) => string | undefined): VerifyRuntime["xss"] | undefined {
+  const browserPath = findChrome(value("browser-path"));
+  if (!browserPath) {
+    if (value("browser-path") !== undefined) throw new TargetError(`--browser-path ${JSON.stringify(value("browser-path"))} is not a file`);
+    return undefined; // no browser found; XSS findings will stay "suspected"
+  }
+  const clientRaw = value("xss-client");
+  const clientBase = clientRaw !== undefined ? assertLocalTarget(clientRaw) : undefined; // throws for a non-local client
+  let tokenStore: BrowserAuth["via"] | undefined;
+  const store = value("xss-token-store");
+  if (store !== undefined) {
+    const [kind, ...rest] = store.split(":");
+    const spec = rest.join(":");
+    if ((kind === "localStorage" || kind === "sessionStorage") && spec) tokenStore = { kind, key: spec };
+    else if (kind === "window" && spec) tokenStore = { kind: "window", path: spec };
+    else throw new TargetError('--xss-token-store must be "localStorage:<key>", "sessionStorage:<key>" or "window:<path>"');
+  }
+  return { browserPath, clientBase, tokenStore };
 }
 
 /**
