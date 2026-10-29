@@ -58,7 +58,8 @@ function resourceObject(value: unknown, ownerField: string): Record<string, unkn
  * the write is observable. Drawn only from observed data — the model's exploit body first, then, for each of the
  * foreign resource's scalar fields, the distinct values that same field carries on the resources already probed (and
  * the caller's own) — so the values are real and app-valid (e.g. a status the API accepts). The owner field and
- * id-like fields are never written. Bounded to a handful of candidates.
+ * id-like fields are never written, nor is a field the snapshot does not carry (it could not be restored). Bounded to
+ * a handful of candidates.
  */
 function writeCandidates(poc: Poc, before: TargetResponse, ownRead: TargetResponse, seen: unknown[], ownerField: string): { field: string; value: unknown }[] {
   const foreign = resourceObject(parse(before.body), ownerField);
@@ -67,7 +68,8 @@ function writeCandidates(poc: Poc, before: TargetResponse, ownRead: TargetRespon
     if (!out.some((c) => c.field === field && JSON.stringify(c.value) === JSON.stringify(value))) out.push({ field, value });
   };
   for (const [k, v] of Object.entries(bodyFields(poc))) {
-    if (differs(v, findField(foreign ?? parse(before.body), k))) add(k, v);
+    const current = findField(foreign ?? parse(before.body), k);
+    if (current !== undefined && differs(v, current)) add(k, v);
   }
   if (foreign) {
     const pool = [parse(ownRead.body), ...seen]; // resources whose field values are real and accepted by the app
@@ -195,8 +197,11 @@ export async function proveWriteIdor(poc: Poc, rp: RouteParam, ownerField: strin
     effect = mutationEffect(before, after, {}, rp.method);
   } else {
     const candidates = writeCandidates(poc, before, ownRead, disc.seen, ownerField);
-    // Fall back to the model's own body so there is always at least one attempt (and a response to report).
-    const attempts = candidates.length > 0 ? candidates.map((c) => ({ [c.field]: c.value })) : [bodyFields(poc)];
+    // Abort-before-write, per field: only fields the snapshot returned are written, so every write can be restored.
+    if (candidates.length === 0) {
+      return { kind: "unverified", reason: `no field returned by the snapshot of ${foreignPath} could be changed, so no write was performed` };
+    }
+    const attempts = candidates.map((c) => ({ [c.field]: c.value }));
     mutate = await send(target, { method: rp.method, path: foreignPath, body: attempts[0], authenticated: poc.exploit.authenticated ?? true });
     after = await send(target, { method: "GET", path: foreignPath, authenticated: true });
     for (let i = 0; i < attempts.length; i++) {
@@ -215,7 +220,8 @@ export async function proveWriteIdor(poc: Poc, rp: RouteParam, ownerField: strin
   const afterOwner = findField(parse(after.body), ownerField);
 
   const confirmed = ok(mutate.status) && differs(afterOwner, ownScope) && effect.tookEffect;
-  const state = confirmed ? await restore(target, foreignPath, before, changedField ? [changedField] : [], rp.method) : "no cross-scope write was confirmed, so nothing was changed to restore";
+  // Restore whenever a write took effect, confirmed or not, so the fixture is never left mutated.
+  const state = effect.tookEffect ? await restore(target, foreignPath, before, changedField ? [changedField] : [], rp.method) : "no write took effect, so nothing was changed to restore";
 
   // Best-effort demonstration that the caller may mutate its OWN resource: a no-op write of the changed field's own value.
   let ownNote = "the caller can read its own resource";

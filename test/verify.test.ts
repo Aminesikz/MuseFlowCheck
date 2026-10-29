@@ -364,6 +364,23 @@ test("IDOR write: when the model sends no body, it harvests a changing value fro
   assert.equal(appts[3].status, "cancelled"); // restored
 });
 
+test("IDOR write: abort-before-write — a body field the snapshot does not return is never written", async () => {
+  resetAppts();
+  for (const a of Object.values(appts)) a.status = "booked"; // no probed row offers a differing status to harvest
+  const target = new Target({ url: base, auth: idorToken });
+  const finding: Finding = { ...idorFinding, cwe: "CWE-862", httpRoute: "PATCH /api/appointments/:id" };
+  const poc = {
+    baseline: { method: "PATCH", path: "/api/appointments/1" },
+    exploit: { method: "PATCH", path: "/api/appointments/2", body: { notes: "pwned" } }, // "notes" is absent from the snapshot
+    check: idorFieldCheck,
+    rationale: "patching another shop's appointment succeeds",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
+  assert.equal(f.confidence, "unverified");
+  assert.match(f.verification!.summary, /no field returned by the snapshot of \/api\/appointments\/3 could be changed, so no write was performed/);
+  assert.deepEqual(apptLog.filter((l) => l.startsWith("PATCH")), [], "no mutation was sent");
+});
+
 // ---- patch proof --------------------------------------------------------------------------------
 
 const twoRows = JSON.stringify({ appointments: [{ shop_id: 1 }, { shop_id: 1 }] });

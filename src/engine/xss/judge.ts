@@ -209,6 +209,7 @@ export function parseXssJudgment(raw: string, group: XssSinkGroup): Finding | nu
     const source = path.hops[0];
     const sink = path.hops.at(-1)!;
     const severity = judgment.severity === "critical" || judgment.severity === "high" ? xssSeverity(group) : judgment.severity;
+    const writeRoute = path.writtenBy ?? group.paths.find((p) => p.writtenBy)?.writtenBy;
     return {
       ...judgment,
       severity,
@@ -220,6 +221,7 @@ export function parseXssJudgment(raw: string, group: XssSinkGroup): Finding | nu
       sinkLine: sink.line,
       taintPath: path.hops.map(formatHop),
       ...(path.route ? { httpRoute: path.route } : {}),
+      ...(writeRoute ? { writeRoute } : {}),
       confidence: "suspected",
     };
   } catch (err) {

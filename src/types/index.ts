@@ -37,6 +37,8 @@ export interface Finding {
   suggestedPatch: string;
   /** The HTTP route the tainted input enters through, e.g. "GET /api/barbers/search", when traced from a registered handler. */
   httpRoute?: string;
+  /** Stored flows: the HTTP route that wrote the value, e.g. "PUT /api/barbers/:id/bio", when traced from a registered handler. */
+  writeRoute?: string;
   confidence: Confidence;
   /** Attached by the self-verification pass when a local target is configured; drives `confidence`. */
   verification?: Verification;

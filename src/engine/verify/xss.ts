@@ -90,7 +90,7 @@ Build "render.path" from the finding's HTTP route (keep the mount prefix). "in" 
 
   return `${common}
 
-This is STORED XSS across two requests: a WRITE request persists the payload, and a later page renders it. ${identityHint ?? "You have a low-privilege token for one tenant."}
+This is STORED XSS across two requests: a WRITE request persists the payload, and a later page renders it. ${identityHint ?? "You have a low-privilege token for one tenant."}${finding.writeRoute ? `\nThe write route traced in the code is ${finding.writeRoute} — use that exact method and path for "write", filling its parameters with the record you own.` : ""}
 Return ONLY a JSON array with one object — no prose, no fences:
 [{
   "kind": "stored",
@@ -173,12 +173,28 @@ export async function proveXss(finding: Finding, plan: XssPlan, target: Target, 
   const payload = withMarker(plan.payload, marker);
   return plan.kind === "reflected"
     ? proveReflected(finding, plan, payload, marker, target, deps)
-    : proveStored(plan, payload, marker, target, deps);
+    : proveStored({ ...plan, write: { ...plan.write, ...tracedWrite(finding, plan) } }, payload, marker, target, deps);
 }
 
 // A valid value for a structural path parameter: route ids are numeric, and 1 is the lowest seeded id and the
 // authenticated caller's own scope, so it renders a real page. The payload never goes in a structural param.
 const PATH_PARAM_ID = "1";
+
+/**
+ * The write request from the route Stage 1 traced as the writer, when there is one: its method and path template are
+ * authoritative (the model may drop a segment, e.g. "/api/barbers/2" for "/api/barbers/:id/bio"). Each path param
+ * takes the model's numeric id at the same position — the record it chose to write — else a valid id.
+ */
+function tracedWrite(finding: Finding, plan: StoredPlan): { method: string; path: string } {
+  const m = /^(\S+)\s+(\/\S*)$/.exec(finding.writeRoute ?? "");
+  if (!m) return plan.write;
+  const chosen = plan.write.path.split(/[?#]/)[0].split("/");
+  const path = m[2]
+    .split("/")
+    .map((seg, i) => (seg.startsWith(":") ? (/^\d+$/.test(chosen[i] ?? "") ? chosen[i] : PATH_PARAM_ID) : seg))
+    .join("/");
+  return { method: m[1].toUpperCase(), path };
+}
 
 /** The sink route's path template, from the finding's HTTP route when present, else the model's render path. */
 function routeTemplate(finding: Finding, plan: ReflectedPlan): string {

@@ -231,3 +231,41 @@ test("stored: abort-before-write — a snapshot that cannot read the field write
   assert.equal(srv.state.writes.length, 0, "no write happened — the fixture was never mutated");
   assert.equal(srv.state.bio, "the original bio");
 });
+
+test("stored: the traced write route overrides a model write path that drops a segment — confirmed via the real routes", async () => {
+  // Mirrors the live barber app: PUT /api/barbers/:id/bio writes, GET /api/barbers/:id omits bio, /:id/profile has it.
+  const state = { bio: "the original bio", writes: [] as string[] };
+  const base = await listen((req, res) => {
+    const u = new URL(req.url!, "http://x");
+    const json = (o: unknown) => (res.setHeader("content-type", "application/json"), res.end(JSON.stringify(o)));
+    if (req.method === "PUT" && u.pathname === "/api/barbers/2/bio") {
+      let b = "";
+      req.on("data", (c) => (b += c));
+      req.on("end", () => {
+        state.bio = JSON.parse(b || "{}").bio ?? "";
+        state.writes.push(u.pathname);
+        json({});
+      });
+      return;
+    }
+    if (req.method === "GET" && u.pathname === "/api/barbers/2") return json({ barber: { id: 2, name: "x" } });
+    if (req.method === "GET" && u.pathname === "/api/barbers/2/profile") return json({ barber: { id: 2, bio: state.bio } });
+    if (u.pathname === "/book/1/barbers/2") return (res.setHeader("content-type", "text/html"), res.end(`<!doctype html><p>${state.bio}</p>`));
+    res.statusCode = 404;
+    res.end();
+  });
+  const plan = parseXssPlan(
+    `[{"kind":"stored","write":{"method":"PUT","path":"/api/barbers/2","bodyField":"bio"},"render":{"path":"/book/1/barbers/2"},"readBack":{"path":"/api/barbers/2","field":"bio"},"payload":${JSON.stringify(PAYLOAD)},"benign":"a benign bio"}]`,
+  );
+  const f = { ...finding("Cross-Site Scripting (Stored)"), writeRoute: "PUT /api/barbers/:id/bio" };
+  const proof = await proveXss(f, plan, new Target({ url: base }), { browser: new FetchBrowser() });
+  assert.equal(proof.kind, "confirmed");
+  assert.match(proof.verification!.summary, /written via PUT \/api\/barbers\/2\/bio .* The original value was restored\./);
+  assert.deepEqual(state.writes, ["/api/barbers/2/bio", "/api/barbers/2/bio", "/api/barbers/2/bio"], "every write went to the traced route, the model's id kept");
+  assert.equal(state.bio, "the original bio");
+});
+
+test("the stored PoC prompt names the traced write route", () => {
+  const p = buildXssPocPrompt({ ...finding("Cross-Site Scripting (Stored)"), writeRoute: "PUT /api/barbers/:id/bio" });
+  assert.match(p, /The write route traced in the code is PUT \/api\/barbers\/:id\/bio — use that exact method and path/);
+});

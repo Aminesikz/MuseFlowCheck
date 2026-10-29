@@ -126,6 +126,7 @@ test("stored groups: type, two-request framing, output kind, and escaped renders
   assert.equal(f.sinkFile, "web/src/PostBody.jsx");
   assert.equal(f.sinkLine, 4);
   assert.equal(f.httpRoute, "GET /forum/posts/:id");
+  assert.equal(f.writeRoute, "POST /forum/posts", "the traced writer is carried to the verifier");
 });
 
 test("reflected groups keep the reflected type", () => {
