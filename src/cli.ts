@@ -565,8 +565,9 @@ async function scanXss(dir: string, json: boolean): Promise<number> {
     ].join("\n"),
   );
   const result = groups.length > 0 ? await judgeXss(trace) : { findings: [], failures: [], sinks: 0, calls: 0 };
-  if (verify) say("Note: verification is not available for XSS findings yet — they stay \"suspected\".\n");
-  const findings = [...result.findings].sort(bySeverity);
+  const judged = [...result.findings].sort(bySeverity);
+  const final = await finalizeFindings(judged, dir); // proves XSS findings in a headless browser when --target is set
+  const findings = final.findings;
   const counts = SEVERITIES.map((s) => `${s} ${findings.filter((f) => f.severity === s).length}`).join(", ");
   say(
     [
@@ -575,6 +576,7 @@ async function scanXss(dir: string, json: boolean): Promise<number> {
       `  Entry points:   ${trace.handlers} (${readingInput(trace)} read request input)`,
       `  HTML outputs:   ${result.sinks} judged (${result.calls} model call(s)); ${encoded.length} path(s) reach output only encoded or escaped`,
       `  Findings:       ${findings.length} — ${counts}`,
+      ...(findings.some((f) => f.confidence !== "suspected") ? [`  Confidence:     ${confidenceBreakdown(findings)}`] : []),
       `  Unresolved:     ${trace.unresolved.length} call(s)`,
       "",
     ].join("\n"),
@@ -582,7 +584,7 @@ async function scanXss(dir: string, json: boolean): Promise<number> {
   let code = emitFindings(findings, json);
   say(formatUnresolved(trace));
   for (const f of result.failures) console.error(`✗ Judging ${f.sink} failed: ${describeError(f.error, dir)}`);
-  if (result.failures.length > 0 && code === 0) code = EXIT_ERROR;
+  if ((result.failures.length > 0 || final.error) && code === 0) code = EXIT_ERROR;
   return code;
 }
 
