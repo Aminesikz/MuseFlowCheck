@@ -6,8 +6,8 @@ import type { Finding } from "../../types/index.js";
 import { codeSlice, formatHop, MAX_PATHS_PER_SINK } from "../crossfile/judge.js";
 import type { FunctionRef, Hop } from "../crossfile/trace.js";
 import { extractJsonArray, FindingParseError, validateJudgment } from "../parse.js";
-import { SEVERITY_GUIDE } from "../prompt.js";
-import type { XssPath } from "./trace.js";
+import type { Severity } from "../../types/index.js";
+import type { Reach, XssPath } from "./trace.js";
 
 export const XSS_TYPE = "Cross-Site Scripting (Reflected)";
 export const XSS_STORED_TYPE = "Cross-Site Scripting (Stored)";
@@ -64,9 +64,51 @@ function functionsOn(paths: XssPath[]): FunctionRef[] {
 const numbered = (p: XssPath, i: number) =>
   `Path ${i + 1}:\n${p.hops.map((h, n) => `  ${n + 1}. [${h.kind}] ${formatHop(h)}`).join("\n")}`;
 
-/** How the ordered severity rules apply when the impact is script running in a victim's browser. */
-const XSS_SEVERITY = `For cross-site scripting, read the rules in terms of what injected script can do in a victim's browser on this origin: act with the victim's session (cookies, tokens held by the page, authenticated requests), read what the victim can see, or perform actions as them. A reflected XSS only runs when a victim opens an attacker-crafted link or page — that is a precondition, so "exploitable without authentication" in rule 1 does not apply merely because the vulnerable page is public. State what a victim's session on this origin could reach, and the reasoning behind the severity.`;
-const XSS_STORED_SEVERITY = `A stored XSS needs no crafted link: it runs for every viewer of the page or screen that renders the stored value, which typically raises severity — weigh who views it (anonymous visitors, other users, staff or administrators) and who can write it.`;
+/** Who receives the output: from Stage 1 for a stored value; a reflected value reaches only a victim lured by a link. */
+export type XssReach = Reach["level"] | "crafted-link";
+
+const WIDEST: XssReach[] = ["public", "authenticated", "own-scope"];
+
+/** The group's reach: the widest of its paths' (stored), or a crafted link (reflected). */
+export function xssReach(group: XssSinkGroup): { level: XssReach; reach?: Reach } {
+  if (!group.stored) return { level: "crafted-link" };
+  const reaches = group.paths.map((p) => p.reach).filter((r): r is Reach => r !== undefined);
+  const reach = WIDEST.map((l) => reaches.find((r) => r.level === l)).find((r) => r !== undefined);
+  return reach ? { level: reach.level, reach } : { level: "public" }; // unknown: assume the page is reachable by anyone
+}
+
+/** The ordered XSS severity rule: stored and reaching beyond the writer's own scope is critical; otherwise high. */
+export function xssSeverity(group: XssSinkGroup): Severity {
+  const { level } = xssReach(group);
+  return level === "public" || level === "authenticated" ? "critical" : "high";
+}
+
+function reachText(group: XssSinkGroup): string {
+  const { level, reach } = xssReach(group);
+  const route = reach?.route ? `${reach.route} ` : "the route ";
+  const serves = group.paths[0].context === "dom-html" ? "serves the stored value to the browser code that renders it" : "renders the stored value";
+  switch (level) {
+    case "crafted-link":
+      return "crafted link — reflected input: the script runs only for a victim who opens an attacker-crafted link or page.";
+    case "public":
+      return `public — ${route}${serves}, and its handler${reach ? ` (${reach.at})` : ""} reads no authenticated identity: anyone who opens it receives it, including anonymous visitors.`;
+    case "authenticated":
+      return `any signed-in user — ${route}${serves}; it reads an authenticated identity (${reach!.at}: ${reach!.code}) but does not restrict the record to it, so other users and tenants receive it.`;
+    case "own-scope":
+      return `the owning scope only — ${route}${serves} and restricts the record to the caller's identity (${reach!.at}: ${reach!.code}): only users within the scope that owns the record — the writer's own scope — receive it.`;
+  }
+}
+
+/** The XSS severity rule, stated as a rule with this output's reach and resulting level — applied, not re-derived. */
+function severityRule(group: XssSinkGroup): string {
+  return `VIEWER REACH (from Stage 1, read from the code of the route that ${group.stored ? "renders or serves the stored value" : "reflects the input"}): ${reachText(group)}
+
+SEVERITY — XSS rule. Check these IN ORDER and assign the FIRST one that matches, using the VIEWER REACH above:
+1. "critical" — stored XSS whose output reaches viewers outside the writer's own scope: anonymous or public visitors (reach: public), or other signed-in users and tenants (reach: any signed-in user). The payload persists and runs in victims' browsers without them doing anything special.
+2. "high" — stored XSS whose output reaches only the writer's own scope (reach: the owning scope only), OR reflected XSS (reach: crafted link) — a victim must open an attacker-crafted link.
+3. "medium" or "low" — only for a specific reason visible in the code that limits the payload itself (e.g. a partial neutralization), stated in the explanation.
+The level follows from this rule and the reach above — do not re-derive impact. For this output the rule gives "${xssSeverity(group)}". State the reach in the explanation.`;
+}
 
 /** What kind of output the paths end at, in the words the judge needs. */
 const OUTPUT_KIND: Record<XssPath["context"], string> = {
@@ -75,6 +117,23 @@ const OUTPUT_KIND: Record<XssPath["context"], string> = {
   "dom-html": "inserted into the page as HTML in the browser (React dangerouslySetInnerHTML, or innerHTML / insertAdjacentHTML / document.write), where the string is parsed as markup",
   "jsx-text": "rendered as a JSX text child",
 };
+
+/** The full HTTP routes the paths enter through (mount prefixes included), for example URLs grounded in the real path. */
+function routesOf(group: XssSinkGroup): string {
+  const routes = [...new Set(group.paths.map((p) => p.route).filter((r): r is string => r !== undefined))];
+  if (routes.length === 0) return "";
+  return `\nHTTP ROUTE${routes.length > 1 ? "S" : ""} (full path, including the prefix the router is mounted under): ${routes.join(", ")}`;
+}
+
+/** What the explanation and patch may rely on: the numbered code, the traced locations and routes, nothing assumed. */
+function grounding(group: XssSinkGroup): string {
+  const path = group.paths[0];
+  const [source, sink] = [path.hops[0], path.hops.at(-1)!];
+  return `GROUNDING — the explanation and patch must stay within the evidence above:
+- Line numbers: cite only line numbers that appear in the numbered CODE above, exactly as shown — never approximate or guess. The tracer's locations are authoritative: the input enters at ${source.file}:${source.line} and the output is at ${sink.file}:${sink.line}; any reference to them must use these lines.
+- Example URLs: build them from the HTTP route given above, in full — keep every path segment, including the mount prefix — and fill path parameters with plausible values. Do not shorten the path or invent segments.
+- Facts: state only what the code and paths above show. Do not assert how requests are authenticated, how sessions are kept, or anything about cookies, headers or tokens unless that code is shown; refer to "an authenticated request" or "the victim's session" instead.`;
+}
 
 /** For stored XSS: the two requests, and where the paths cross from one to the other. */
 function storedNote(group: XssSinkGroup): string {
@@ -107,7 +166,7 @@ The heart of the decision is whether the value is HTML-encoded or sanitized ON T
 Encoding applied to a DIFFERENT output of the same value does not protect this one. Judge only the output the paths below end at.
 A path IS exploitable if attacker-controlled text reaches this output without such neutralization. Consider the context it lands in: element content, a quoted or unquoted attribute value, a URL-valued attribute (javascript: URLs), or inside a <script> or <style> element.
 
-CANDIDATE PATHS (all end at the same output: ${formatHop(group.sink)})
+CANDIDATE PATHS (all end at the same output: ${formatHop(group.sink)})${routesOf(group)}
 ${paths}${group.omitted > 0 ? `\n\n(${group.omitted} more path(s) into this output are not shown.)` : ""}${contrast}
 
 IMPORTS OF ${group.sink.file}
@@ -116,9 +175,9 @@ ${imports.length > 0 ? imports.map((i) => `  ${i}`).join("\n") : "  (none)"}
 CODE — every function on the paths, with real file line numbers prefixed as "N | "
 ${functionsOn(group.paths).map(codeSlice).join("\n\n")}
 
-${SEVERITY_GUIDE}
-${XSS_SEVERITY}${group.stored ? `\n${XSS_STORED_SEVERITY}` : ""}
-Route registration and middleware are not shown; state any assumption you make about who can reach the page and who would view it.
+${severityRule(group)}
+
+${grounding(group)}
 
 OUTPUT
 Return ONLY a JSON array — no prose, no markdown fences.
@@ -129,13 +188,17 @@ Return ONLY a JSON array — no prose, no markdown fences.
   "cwe": "${XSS_CWE}",
   "severity": "critical" | "high" | "medium" | "low",
   "path": number,            // the "Path N" number above that most clearly demonstrates the flaw
-  "explanation": string,     // plain language: why it is exploitable across these files and what an attacker could do (include an example payload), AND confirm, hop by hop, that no encoding or sanitization is applied on the way to this output${group.stored ? `; say that the input is stored (persisted) and who it reaches` : ""}
+  "explanation": string,     // plain language: why it is exploitable across these files and what an attacker could do (include an example payload; any example URL uses the full HTTP route above), AND confirm, hop by hop, that no encoding or sanitization is applied on the way to this output${group.stored ? `; say that the input is stored (persisted)` : ""}; state the viewer reach
   "suggestedPatch": string   // corrected code for the function containing the output, HTML-encoding the value where it enters the markup — reuse an encoding helper the project already imports, if there is one — multi-line and formatted like the original
 }
 Do not include file, line, or taintPath fields — the tool fills those in from the traced path.`;
 }
 
-/** Parses the judge's reply into one Finding (or null when it judged the paths not exploitable). */
+/**
+ * Parses the judge's reply into one Finding (or null when it judged the paths not exploitable). Severity follows the
+ * XSS rule: critical/high is the rule's level for this output's reach; only a medium/low downgrade, which the rule
+ * reserves for a stated reason in the code, is taken from the model.
+ */
 export function parseXssJudgment(raw: string, group: XssSinkGroup): Finding | null {
   const items = extractJsonArray(raw);
   if (items.length === 0) return null;
@@ -145,8 +208,10 @@ export function parseXssJudgment(raw: string, group: XssSinkGroup): Finding | nu
     const path = (Number.isInteger(n) && group.paths[n - 1]) || group.paths[0];
     const source = path.hops[0];
     const sink = path.hops.at(-1)!;
+    const severity = judgment.severity === "critical" || judgment.severity === "high" ? xssSeverity(group) : judgment.severity;
     return {
       ...judgment,
+      severity,
       type: xssType(group),
       cwe: XSS_CWE,
       file: source.file,

@@ -443,9 +443,15 @@ const XSS_OUTPUT: Record<XssPath["context"], string> = {
   "jsx-text": "rendered as JSX text",
 };
 
-/** `(GET /x) — placed into markup, stored in t.col by PUT /y` */
+const XSS_REACH: Record<NonNullable<XssPath["reach"]>["level"], string> = {
+  public: "public",
+  authenticated: "any signed-in user",
+  "own-scope": "owning scope only",
+};
+
+/** `(GET /x) — placed into markup, stored in t.col by PUT /y, reach: public (routes/x.js:3)` */
 function xssHeading(p: XssPath): string {
-  const stored = p.stored ? `, stored in ${p.stored}${p.writtenBy ? ` by ${p.writtenBy}` : ""}` : "";
+  const stored = p.stored ? `, stored in ${p.stored}${p.writtenBy ? ` by ${p.writtenBy}` : ""}${p.reach ? `, reach: ${XSS_REACH[p.reach.level]} (${p.reach.at})` : ""}` : "";
   return `${p.route ? ` (${p.route})` : ""} — ${XSS_OUTPUT[p.context]}${stored}`;
 }
 

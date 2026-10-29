@@ -70,7 +70,7 @@ Numbers (`Number(x)`) and JSON responses are not HTML outputs. Each raw output i
 
 **Browser code** — files of a package that depends on a UI library such as React — is walked after the server: a stored value the server sends as JSON is what `fetch` (or an HTTP client package) returns there, and it is followed through `useState` setters, component props and promise callbacks. In the browser, only DOM HTML sinks are outputs: `dangerouslySetInnerHTML`, `innerHTML`/`outerHTML`, `insertAdjacentHTML`, `document.write`. A JSX text child (`<p>{text}</p>`) is escaped by React, so it is listed, never sent. Scan the directory that contains both the server and the client to connect them.
 
-Findings are reported as `Cross-Site Scripting (Reflected)` or `Cross-Site Scripting (Stored)` (CWE-79).
+Findings are reported as `Cross-Site Scripting (Reflected)` or `Cross-Site Scripting (Stored)` (CWE-79). Severity is an ordered rule on who receives the output, read from the handler of the route that renders or serves a stored value: **critical** when stored input reaches viewers beyond the writer's own scope (the handler reads no authenticated identity, or reads one without restricting the record to it), **high** when it reaches only the scope that owns the record, or when it is reflected (a victim must open a crafted link). The model may only lower that level, with a reason shown in the code.
 
 ### Single entry file
 

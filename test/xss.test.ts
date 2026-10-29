@@ -88,8 +88,20 @@ test("prompt asks about encoding on the way to this output, with paths, contrast
   assert.match(prompt, /IMPORTS OF templates\/results\.js\n {2}const he = require\('he'\);\n {2}const \{ encode, escapeText \} = require\('\.\/encode'\);/);
   assert.match(prompt, /=== templates\/results\.js — summary \(lines 4–6\) ===/);
   assert.match(prompt, /"type": "Cross-Site Scripting \(Reflected\)"/);
-  assert.match(prompt, /does not apply merely because the vulnerable page is public/);
+  assert.match(prompt, /VIEWER REACH[^\n]*: crafted link — reflected input/);
+  assert.match(prompt, /For this output the rule gives "high"\./);
   assert.doesNotMatch(prompt, /Path 2:/);
+});
+
+test("prompt grounds the explanation: full route, authoritative locations, no unseen mechanisms", () => {
+  const group = groupXssBySink(trace.xss).find((g) => g.sink.line === 10)!;
+  const prompt = buildXssPrompt(group);
+  assert.match(prompt, /\nHTTP ROUTE \(full path, including the prefix the router is mounted under\): GET \/library\/find\n/);
+  assert.match(prompt, /the input enters at routes\/catalog\.js:7 and the output is at templates\/results\.js:10/);
+  assert.match(prompt, /cite only line numbers that appear in the numbered CODE above/);
+  assert.match(prompt, /keep every path segment, including the mount prefix/);
+  assert.match(prompt, /Do not assert how requests are authenticated/);
+  assert.doesNotMatch(prompt, /cookies,? tokens held/);
 });
 
 test("judgment: locations, taintPath and route come from the trace; type and CWE are fixed", () => {

@@ -44,6 +44,21 @@ interface XssTaint extends Taint {
   stored?: string;
   /** The HTTP route that read or served the stored value, when the output itself is not on a route (browser code). */
   route?: string;
+  /** Who receives a stored value: decided by the route that serves it to the browser. */
+  reach?: Reach;
+}
+
+/**
+ * Who can receive a stored value, from the handler of the route that renders or serves it: anyone (it reads no
+ * authenticated identity), any signed-in user (it reads one but does not restrict the record to it), or only the
+ * scope that owns the record (it compares the record, or constrains its query, with the identity).
+ */
+export interface Reach {
+  level: "public" | "authenticated" | "own-scope";
+  route?: string;
+  /** `file:line` of the handler, or of the identity check that scopes it. */
+  at: string;
+  code: string;
 }
 
 /** Where an output is: markup built as a string, the response body, the DOM as HTML, or a JSX text child. */
@@ -63,6 +78,8 @@ export interface XssPath {
   /** Stored XSS: the `table.column` the input was persisted to, and the route that wrote it. */
   stored?: string;
   writtenBy?: string;
+  /** Stored XSS: who receives the output (see Reach). */
+  reach?: Reach;
 }
 
 export interface XssTraceResult extends TraceResult {
@@ -132,6 +149,8 @@ const DOM_HTML_METHODS = new Set(["insertAdjacentHTML", "write", "writeln"]);
 /** How deep return-value summaries follow nested project calls. */
 const SUMMARY_DEPTH = 6;
 const RANK: Record<TaintState, number> = { encoded: 0, html: 1, text: 2 };
+/** Request properties that carry an authenticated identity, set by auth middleware (`req.user`, Koa `ctx.state.user`). */
+const IDENTITY_PROPS = new Set(["user", "session", "auth"]);
 
 /** Where an expression is being evaluated: in a traced function (hops are recorded) or inside a return-value summary. */
 interface Scope {
@@ -249,6 +268,9 @@ export class XssTracer extends Tracer {
   private pendingCall?: Hop;
   private analyzed = 0;
   private inBrowser = false;
+  /** The request handler being walked (server side), whose code decides who receives what it renders. */
+  private walking?: { fn: Fn; req?: string };
+  private readonly reaches = new Map<Fn, Reach>();
 
   constructor(root: string, storedWrites?: Map<string, StoredWrite>) {
     super(root);
@@ -295,6 +317,7 @@ export class XssTracer extends Tracer {
         : [];
     this.pendingCall = undefined;
     this.analyzed++;
+    if (depth === 0 && !this.inBrowser) this.walking = { fn, req: req?.name };
     this.chain.push(...entered);
     try {
       super.analyze(fn, env, depth, req, self);
@@ -400,7 +423,7 @@ export class XssTracer extends Tracer {
     for (const t of this.taintsOf(body, env, scope)) {
       if (json && t.stored && !this.exposures.has(t.stored)) {
         const hop = this.hop(call, "propagate", scope.ref!, `${excerpt(call)}  [sent as JSON${this.currentRoute ? ` by ${this.currentRoute}` : ""}]`);
-        this.exposures.set(t.stored, { ...t, hops: [...t.hops, hop], route: this.currentRoute ?? t.route });
+        this.exposures.set(t.stored, { ...t, hops: [...t.hops, hop], route: this.currentRoute ?? t.route, reach: this.currentReach() });
       } else if (!json && RESPONSE_WRITES.has(method) && stateOf(t) !== "html") {
         this.record(t, body, "response", scope.ref!);
       }
@@ -481,6 +504,7 @@ export class XssTracer extends Tracer {
     const route = this.currentRoute ?? t.route;
     const writtenBy = t.stored ? this.storedWrites.get(t.stored)?.route : undefined;
     const by = encoder ?? (encoded ? t.encoder : undefined);
+    const reach = t.stored ? (this.inBrowser ? t.reach : this.currentReach()) : undefined;
     this.xssPaths.push({
       hops: [...t.hops, sink],
       origin: t.origin,
@@ -491,7 +515,21 @@ export class XssTracer extends Tracer {
       sinkImports: imports(sf),
       ...(t.stored ? { stored: t.stored } : {}),
       ...(writtenBy ? { writtenBy } : {}),
+      ...(reach ? { reach } : {}),
     });
+  }
+
+  /** The reach of the handler being walked: who receives what it renders or sends. */
+  private currentReach(): Reach | undefined {
+    const handler = this.walking;
+    if (!handler) return undefined;
+    let reach = this.reaches.get(handler.fn);
+    if (!reach) {
+      reach = reachOf(handler.fn, handler.req, this.relPath(handler.fn.getSourceFile()));
+      if (this.currentRoute) reach.route = this.currentRoute;
+      this.reaches.set(handler.fn, reach);
+    }
+    return reach;
   }
 
   // ---- browser code -------------------------------------------------------------------------------
@@ -867,6 +905,33 @@ export class XssTracer extends Tracer {
     this.summaries.set(key, returned);
     return ownHops(returned);
   }
+}
+
+/**
+ * Who receives what a handler renders or sends. An identity read is `<req>.user|session|auth` (or Koa
+ * `<ctx>.state.user`); it scopes the response when it is compared with something or passed to a call (a lookup or
+ * query constrained by it). No identity read: the route may be reached without signing in.
+ */
+function reachOf(fn: Fn, req: string | undefined, file: string): Reach {
+  const handler = { at: `${file}:${fn.getStartLineNumber()}`, code: excerpt(fn, 80) };
+  if (!req) return { level: "public", ...handler };
+  const reads = fn.getDescendantsOfKind(SyntaxKind.PropertyAccessExpression).filter((pa) => {
+    if (!IDENTITY_PROPS.has(pa.getName())) return false;
+    const target = unwrap(pa.getExpression());
+    const isReq = (n: Node) => Node.isIdentifier(n) && n.getText() === req;
+    return isReq(target) || (Node.isPropertyAccessExpression(target) && target.getName() === "state" && isReq(target.getExpression()));
+  });
+  if (reads.length === 0) return { level: "public", ...handler };
+  const COMPARE = new Set([SyntaxKind.EqualsEqualsEqualsToken, SyntaxKind.ExclamationEqualsEqualsToken, SyntaxKind.EqualsEqualsToken, SyntaxKind.ExclamationEqualsToken]);
+  for (const read of reads) {
+    const scoping = read.getFirstAncestor(
+      (a) => (Node.isBinaryExpression(a) && COMPARE.has(a.getOperatorToken().getKind())) || Node.isCallExpression(a),
+    );
+    if (scoping && scoping.getFirstAncestor(isFn) === fn) {
+      return { level: "own-scope", at: `${file}:${scoping.getStartLineNumber()}`, code: excerpt(scoping, 80) };
+    }
+  }
+  return { level: "authenticated", at: `${file}:${reads[0].getStartLineNumber()}`, code: excerpt(reads[0], 80) };
 }
 
 /** Binds a declaration's name(s): an identifier takes the taint; `{ a, b: c }` takes each property's; `[a, b]` the whole. */
