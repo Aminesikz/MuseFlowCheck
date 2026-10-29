@@ -4,7 +4,7 @@ Flowcheck is an AI agent for shift-left secure-code review of JavaScript/TypeScr
 
 Intentionally built for the Meta Global AI Developer Hackathon.
 
-**Status:** WIP — SQL injection and broken access control / IDOR: project-wide scanning with cross-file tracing, model judgment, and optional self-verification that proves findings against a running local target.
+**Status:** WIP — SQL injection, broken access control / IDOR, and reflected cross-site scripting: project-wide scanning with cross-file tracing, model judgment, and optional self-verification that proves findings against a running local target.
 
 ## Quick start
 
@@ -49,6 +49,22 @@ An access-control bug is a missing check, not a dangerous sink: the query can be
 - **Checks:** comparisons of a request value or a loaded record's owner field with the identity that reject on mismatch (in the handler, services or middleware), and queries constrained by an identity value. A check placed after a write does not count.
 
 Routes that are unauthenticated, already checked, or that only touch tables the schema shows as unowned are not sent to the model. Each remaining route is judged once, with its evidence and the sibling routes that do enforce a check. Only a route with all three signals (identity available, scoped data, no check) is reported. Reads are reported as IDOR (CWE-639), writes as missing authorization (CWE-862).
+
+### Cross-site scripting (reflected)
+
+```bash
+node dist/cli.js trace <dir> --mode xss                 # Stage 1 only: every HTML output request input reaches, no API call
+node dist/cli.js trace <dir> --mode xss --show-prompt   # ...plus the Stage 2 prompt for each raw output
+node dist/cli.js scan <dir> --mode xss                  # Stage 1 + Stage 2
+```
+
+XSS uses the same cross-file tracer as SQL injection, with a different sink: request input placed into a string whose literal text is HTML (a template literal or `+` concatenation containing tags or entities), or written to the response as-is (`res.send(x)`). What matters is whether the value is encoded on the way to that output, so Stage 1 classifies each one:
+
+- **Raw:** the input arrives as text — directly, or through string operations and helpers that return it unchanged. Sent to the model.
+- **Encoded:** the input passed a step that HTML-encodes it — a `.replace` that maps `<` to an entity (directly or through a lookup table or callback), or an encoding/sanitizing package (`escape-html`, `he`, `sanitize-html`, DOMPurify, lodash `escape`, …). Listed, never sent. Encoders are recognized by what the code does, not by name: a helper called `escape` that only trims is still raw.
+- **Already markup:** HTML built earlier and passed on (to a layout, to `res.send`) is not a new output; the place it was built is where the input was judged.
+
+Numbers (`Number(x)`), JSON responses, and values read back from the database are not treated as reflected input. Each raw output is judged once, together with any encoded outputs of the same input for contrast; the judge confirms hop by hop that no encoding occurs and proposes a patch that encodes at the output. Findings are reported as `Cross-Site Scripting (Reflected)` (CWE-79). Verification against a target is not available for XSS yet.
 
 ### Single entry file
 

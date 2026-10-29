@@ -35,6 +35,7 @@ import {
   type VerifyDeps,
 } from "./engine/verify/index.js";
 import { startPatchedServer } from "./engine/verify/server.js";
+import { buildXssPrompt, groupXssBySink, judgeXss, traceXssProject, type XssPath, type XssTraceResult } from "./engine/xss/index.js";
 import { complete } from "./llm/meta-client.js";
 import { describeApiError, loadDotEnv } from "./llm/errors.js";
 import { CONFIDENCES, SEVERITIES, type Confidence, type Finding, type Verification } from "./types/index.js";
@@ -56,9 +57,12 @@ Usage:
                                                      then judge each unchecked route with the model
   flowcheck trace <dir> --mode access [--route <text>] [--show-prompt]
                                                      Access-control Stage 1 only (no API call)
+  flowcheck scan <dir> --mode xss [--json]           Cross-site scripting: trace request input across files to HTML
+                                                     output, then judge each output reached without HTML encoding
+  flowcheck trace <dir> --mode xss [--show-prompt]   XSS Stage 1 only (no API call)
   flowcheck --version
 
-  --mode    sqli (default) or access
+  --mode    sqli (default), access, or xss
   --route   only judge (or show prompts for) routes whose "METHOD /path" contains <text>
   --json    print the findings as a JSON Finding[] on stdout (progress and summary go to stderr)
 
@@ -425,6 +429,86 @@ async function scanAccess(dir: string, filter: string | undefined, json: boolean
   return code;
 }
 
+// ---- XSS mode -------------------------------------------------------------------------------
+
+function formatXssPath(p: XssPath): string[] {
+  return p.hops.map((h) => `    [${h.kind.padEnd(9)}] ${formatHop(h)}`);
+}
+
+function formatXssTrace(trace: XssTraceResult): string {
+  const raw = trace.xss.filter((p) => !p.encoded);
+  const encoded = trace.xss.filter((p) => p.encoded);
+  const out = [`XSS — Stage 1 (root: ${trace.root})`, `  Files scanned: ${trace.files}`];
+  out.push(`  Request handlers found: ${trace.handlers} (${readingInput(trace)} read request input)`);
+  out.push(...trace.entryPoints.map(formatEntryPoint), "", `Candidate paths into HTML output without encoding: ${raw.length}`);
+  raw.forEach((p, i) => out.push(`  Path ${i + 1}${p.route ? ` (${p.route})` : ""} — ${p.context === "response" ? "written to the response" : "placed into markup"}:`, ...formatXssPath(p)));
+  out.push("", `Paths reaching HTML output only through an encoding step (not sent to the model): ${encoded.length}`);
+  for (const p of encoded) out.push(`  ${formatHop(p.hops[0])}\n    ⤷ ${formatHop(p.hops.at(-1)!)}\n      encoded by ${p.encoder ?? "an encoding step"}`);
+  out.push("", formatUnresolved(trace));
+  return out.join("\n");
+}
+
+function traceXss(dir: string, showPrompt: boolean): number {
+  let trace: XssTraceResult;
+  try {
+    trace = traceXssProject(dir);
+  } catch (err) {
+    return reportError(err, dir);
+  }
+  say(formatXssTrace(trace));
+  if (showPrompt) {
+    for (const group of groupXssBySink(trace.xss)) {
+      say(`\n--- Stage 2 prompt for ${formatHop(group.sink)} ---\n${buildXssPrompt(group)}\n--- end prompt ---`);
+    }
+  }
+  return 0;
+}
+
+async function scanXss(dir: string, json: boolean): Promise<number> {
+  loadDotEnv();
+  say(`Scanning project ${dir} for cross-site scripting...\n`);
+  let trace: XssTraceResult;
+  try {
+    trace = traceXssProject(dir);
+  } catch (err) {
+    return reportError(err, dir);
+  }
+  const groups = groupXssBySink(trace.xss);
+  const encoded = trace.xss.filter((p) => p.encoded);
+  say(
+    [
+      `Stage 1 — ${trace.files} file(s), ${trace.handlers} entry point(s) (${readingInput(trace)} read request input)`,
+      `  ${trace.xss.length - encoded.length} candidate path(s) into HTML output without encoding; ${encoded.length} reach HTML output only through an encoding step`,
+      ...encoded.map((p) => `  encoded (not sent): ${formatHop(p.hops.at(-1)!)} — by ${p.encoder ?? "an encoding step"}`),
+      `  Run \`flowcheck trace ${dir} --mode xss\` for every entry point and hop.`,
+      "",
+      groups.length > 0
+        ? `Stage 2 — asking the model to judge ${groups.length} HTML output(s)...\n`
+        : "Stage 1 found no request input reaching HTML output without encoding — nothing sent to the model.\n",
+    ].join("\n"),
+  );
+  const result = groups.length > 0 ? await judgeXss(trace) : { findings: [], failures: [], sinks: 0, calls: 0 };
+  if (verify) say("Note: verification is not available for XSS findings yet — they stay \"suspected\".\n");
+  const findings = [...result.findings].sort(bySeverity);
+  const counts = SEVERITIES.map((s) => `${s} ${findings.filter((f) => f.severity === s).length}`).join(", ");
+  say(
+    [
+      "Summary",
+      `  Files scanned:  ${trace.files}`,
+      `  Entry points:   ${trace.handlers} (${readingInput(trace)} read request input)`,
+      `  HTML outputs:   ${result.sinks} judged (${result.calls} model call(s)); ${encoded.length} path(s) reach HTML output only through encoding`,
+      `  Findings:       ${findings.length} — ${counts}`,
+      `  Unresolved:     ${trace.unresolved.length} call(s)`,
+      "",
+    ].join("\n"),
+  );
+  let code = emitFindings(findings, json);
+  say(formatUnresolved(trace));
+  for (const f of result.failures) console.error(`✗ Judging ${f.sink} failed: ${describeError(f.error, dir)}`);
+  if (result.failures.length > 0 && code === 0) code = EXIT_ERROR;
+  return code;
+}
+
 /** Flags that take a value. */
 const VALUE_FLAGS = new Set(["root", "mode", "route", "target", "token", "login-path", "login-body", "token-field", "identity", "probe-range", "start-cmd", "ready-path"]);
 
@@ -512,7 +596,7 @@ async function main(argv: string[]): Promise<number> {
   const json = flags.has("json");
   if (json) say = (text) => console.error(text);
   const emptyValue = [...VALUE_FLAGS].some((f) => flags.get(f) === "");
-  if (positional.length === 1 && !emptyValue && (mode === "sqli" || mode === "access")) {
+  if (positional.length === 1 && !emptyValue && (mode === "sqli" || mode === "access" || mode === "xss")) {
     const [target] = positional;
     if (command === "scan") {
       try {
@@ -529,6 +613,14 @@ async function main(argv: string[]): Promise<number> {
       }
       if (command === "scan") return scanAccess(target, value("route"), json);
       if (command === "trace") return traceAccess(target, value("route"), flags.has("show-prompt"));
+    }
+    if (mode === "xss") {
+      if (!isDirectory(target)) {
+        console.error("✗ --mode xss scans a project directory.");
+        return EXIT_ERROR;
+      }
+      if (command === "scan") return scanXss(target, json);
+      if (command === "trace") return traceXss(target, flags.has("show-prompt"));
     }
     if (command === "scan") {
       if (isDirectory(target)) return scanProject(target, json);

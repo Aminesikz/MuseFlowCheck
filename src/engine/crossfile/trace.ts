@@ -98,15 +98,15 @@ export interface TraceResult {
 
 export type Fn = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
 type Cls = ClassDeclaration | ClassExpression;
-interface Taint {
+export interface Taint {
   origin: string;
   hops: Hop[];
 }
-type Env = Map<string, Taint[]>;
+export type Env = Map<string, Taint[]>;
 
 /** What an expression statically refers to, as far as the tracer can tell. */
 type Thunk = () => Value;
-type Value =
+export type Value =
   | { kind: "function"; fn: Fn; self?: Value } // self: what `this` is bound to when called as a method
 
   | { kind: "module"; sf: SourceFile }
@@ -119,7 +119,7 @@ type Value =
  * The request object in scope: its parameter name, and the hops that brought it here when a handler passed
  * the whole request on (`service.search(req)`), so sources read further down still start at the handler.
  */
-type Req = { name: string; via: Hop[] };
+export type Req = { name: string; via: Hop[] };
 /** A request handler to trace from: `req` is its request parameter, `self` its `this` when it is a method. */
 export type Handler = {
   fn: Fn;
@@ -130,7 +130,7 @@ export type Handler = {
   registration?: CallExpression;
 };
 type ProjectValue = Extract<Value, { kind: "module" | "object" | "class" | "instance" }>;
-type Callee = Value | { kind: "sink" };
+export type Callee = Value | { kind: "sink" };
 
 /** Request properties that carry attacker-controlled input. */
 const SOURCE_PROPS = new Set(["query", "params", "body"]);
@@ -159,7 +159,7 @@ export function excerpt(node: Node, max = 140): string {
 }
 
 /** Strips wrappers that don't change what an expression refers to. */
-function unwrap(node: Node): Node {
+export function unwrap(node: Node): Node {
   let n = node;
   while (
     Node.isAwaitExpression(n) ||
@@ -180,7 +180,7 @@ function keyName(node: Node): string {
 }
 
 /** The member name of `a.b` / `a['b']`; undefined for computed access. */
-function memberName(node: Node): string | undefined {
+export function memberName(node: Node): string | undefined {
   if (Node.isPropertyAccessExpression(node)) return node.getName();
   if (Node.isElementAccessExpression(node)) {
     const arg = node.getArgumentExpression();
@@ -244,7 +244,7 @@ export class Tracer {
   /** Where each router file is mounted (`app.use('/prefix', router)`), first mount only; built by registeredHandlers. */
   private readonly mounts = new Map<SourceFile, { prefix: string; parent: SourceFile }>();
   /** The HTTP route of the handler currently being analyzed, stamped onto the paths it produces. */
-  private currentRoute?: string;
+  protected currentRoute?: string;
 
   constructor(readonly root: string) {}
 
@@ -437,7 +437,7 @@ export class Tracer {
 
   // ---- naming / hops ----------------------------------------------------------------------
 
-  private rel(sf: SourceFile): string {
+  protected rel(sf: SourceFile): string {
     return path.relative(this.root, sf.getFilePath()) || sf.getBaseName();
   }
 
@@ -455,7 +455,7 @@ export class Tracer {
     return "<object>";
   }
 
-  private fnName(fn: Fn): string {
+  protected fnName(fn: Fn): string {
     if (Node.isMethodDeclaration(fn)) return `${this.ownerName(fn.getParent())}.${fn.getName()}`;
     if (Node.isFunctionDeclaration(fn) && fn.getName()) return fn.getName()!;
     const parent = fn.getParent();
@@ -472,7 +472,7 @@ export class Tracer {
     return "<anonymous>";
   }
 
-  private fnRef(fn: Fn): FunctionRef {
+  protected fnRef(fn: Fn): FunctionRef {
     const sf = fn.getSourceFile();
     const startLine = fn.getStartLineNumber();
     const endLine = fn.getEndLineNumber();
@@ -481,11 +481,11 @@ export class Tracer {
     return { file: this.rel(sf), name: this.fnName(fn), startLine, endLine, code: lines.join("\n") };
   }
 
-  private hop(node: Node, kind: HopKind, fn: FunctionRef, code = excerpt(node)): Hop {
+  protected hop(node: Node, kind: HopKind, fn: FunctionRef, code = excerpt(node)): Hop {
     return { file: this.rel(node.getSourceFile()), line: node.getStartLineNumber(), code, kind, fn };
   }
 
-  private signature(fn: Fn): string {
+  protected signature(fn: Fn): string {
     const body = fn.getBody();
     const head = body ? fn.getText().slice(0, body.getStart() - fn.getStart()) : fn.getText();
     const sig = head.replace(/\s+/g, " ").replace(/\s*(=>)?\s*$/, "").trim();
@@ -497,7 +497,7 @@ export class Tracer {
   // ---- taint queries ----------------------------------------------------------------------
 
   /** `<req>.query|params|body` accesses within a node, and Koa's `<ctx>.request.query|params|body`. */
-  private sourceAccesses(node: Node, req: string | undefined): Node[] {
+  protected sourceAccesses(node: Node, req: string | undefined): Node[] {
     if (!req) return [];
     const all = Node.isPropertyAccessExpression(node) ? [node] : [];
     all.push(...node.getDescendantsOfKind(SyntaxKind.PropertyAccessExpression));
@@ -510,7 +510,7 @@ export class Tracer {
   }
 
   /** Taints carried by variables referenced in `expr` (property names and object keys are not references). */
-  private idTaints(expr: Node, env: Env): Taint[] {
+  protected idTaints(expr: Node, env: Env): Taint[] {
     const ids = Node.isIdentifier(expr) ? [expr] : expr.getDescendantsOfKind(SyntaxKind.Identifier);
     let out: Taint[] = [];
     for (const id of ids) {
@@ -527,7 +527,7 @@ export class Tracer {
    * New taints for request inputs read directly inside `expr` (e.g. a call argument `req.params.id`).
    * The hop points at the enclosing statement so multi-line calls read as one complete line of code.
    */
-  private inlineSourceTaints(expr: Node, req: Req | undefined, ref: FunctionRef): Taint[] {
+  protected inlineSourceTaints(expr: Node, req: Req | undefined, ref: FunctionRef): Taint[] {
     return this.sourceAccesses(expr, req?.name).map((pa) => {
       const stmt =
         pa.getFirstAncestor(
@@ -540,11 +540,11 @@ export class Tracer {
     });
   }
 
-  private exprTaints(expr: Node, env: Env, ref: FunctionRef, req?: Req): Taint[] {
+  protected exprTaints(expr: Node, env: Env, ref: FunctionRef, req?: Req): Taint[] {
     return mergeTaints(this.inlineSourceTaints(expr, req, ref), this.idTaints(expr, env));
   }
 
-  private isStringBuild(expr: Node): boolean {
+  protected isStringBuild(expr: Node): boolean {
     const inner = Node.isAwaitExpression(expr) ? expr.getExpression() : expr;
     return (
       Node.isTemplateExpression(inner) ||
@@ -567,20 +567,30 @@ export class Tracer {
       else if (Node.isBinaryExpression(node)) this.onAssignment(node, env, ref, req);
       else if (Node.isCallExpression(node)) this.onCall(node, env, ref, depth, req);
       else if (Node.isNewExpression(node)) this.onNew(node, env, ref, req);
+      this.visitNode(node, env, ref, req);
     };
     if (!Node.isBlock(body)) visit(body); // expression-bodied arrow: `(x) => run(x)`
-    // Nested functions (callbacks) are not entered yet. The callback must not return `traversal.skip()`:
-    // ts-morph ends the whole walk when it returns a value, which left every statement after a callback unvisited.
-    body.forEachDescendant((node, traversal) => {
-      if (isFn(node)) traversal.skip();
-      else visit(node);
-    });
+    this.walkBody(body, visit);
 
     this.selfStack.pop();
     this.onStack.delete(fn);
   }
 
-  private onDeclaration(decl: VariableDeclaration, env: Env, ref: FunctionRef, req?: Req): void {
+  /**
+   * Visits the nodes of a function body in source order; nested functions (callbacks) are not entered yet.
+   * The callback must not return `traversal.skip()`: ts-morph ends the whole walk when it returns a value.
+   */
+  protected walkBody(body: Node, visit: (node: Node) => void): void {
+    body.forEachDescendant((node, traversal) => {
+      if (isFn(node)) traversal.skip();
+      else visit(node);
+    });
+  }
+
+  /** Called for every node of an analyzed function body, after the built-in handling; other analyses extend it. */
+  protected visitNode(_node: Node, _env: Env, _ref: FunctionRef, _req?: Req): void {}
+
+  protected onDeclaration(decl: VariableDeclaration, env: Env, ref: FunctionRef, req?: Req): void {
     const init = decl.getInitializer();
     if (!init) return;
     const nameNode = decl.getNameNode();
@@ -598,7 +608,7 @@ export class Tracer {
       if (readsSource) {
         taints.push({ origin: `${ref.file}:${decl.getStartLineNumber()}:${name}`, hops: [...req!.via, this.hop(stmt, "source", ref)] });
       }
-      taints = mergeTaints(taints, flowing.map((t) => ({ origin: t.origin, hops: [...t.hops, this.hop(stmt, kind, ref)] })));
+      taints = mergeTaints(taints, flowing.map((t) => ({ ...t, hops: [...t.hops, this.hop(stmt, kind, ref)] })));
       if (taints.length > 0) env.set(name, taints);
       else env.delete(name);
     }
@@ -612,7 +622,7 @@ export class Tracer {
     const right = bin.getRight();
     const kind = op === SyntaxKind.PlusEqualsToken || this.isStringBuild(right) ? "build" : "propagate";
     const incoming = this.exprTaints(right, env, ref, req).map((t) => ({
-      origin: t.origin,
+      ...t,
       hops: [...t.hops, this.hop(bin, kind, ref)],
     }));
 
@@ -622,7 +632,7 @@ export class Tracer {
     else env.delete(name);
   }
 
-  private onCall(call: CallExpression, env: Env, ref: FunctionRef, depth: number, req?: Req): void {
+  protected onCall(call: CallExpression, env: Env, ref: FunctionRef, depth: number, req?: Req): void {
     const argTaints = call.getArguments().map((arg) => this.exprTaints(arg, env, ref, req));
     const forwardsReq = req !== undefined && call.getArguments().some((arg) => Node.isIdentifier(arg) && arg.getText() === req.name);
     if (!forwardsReq && argTaints.every((t) => t.length === 0)) return;
@@ -659,7 +669,7 @@ export class Tracer {
     this.addEdge(this.unresolved, { ...at, reason });
   }
 
-  private addEdge<T extends { file: string; line: number; call: string }>(list: T[], edge: T): void {
+  protected addEdge<T extends { file: string; line: number; call: string }>(list: T[], edge: T): void {
     const key = `${edge.file}:${edge.line}:${edge.call}`;
     if (this.edgeKeys.has(key)) return;
     this.edgeKeys.add(key);
@@ -686,7 +696,7 @@ export class Tracer {
     const bind = (name: string, taints: Taint[]) => {
       if (taints.length === 0) return;
       const hops = [callHop, { ...paramHop, code: `${paramHop.code}  [param ${name}]` }];
-      calleeEnv.set(name, mergeTaints(calleeEnv.get(name) ?? [], taints.map((t) => ({ origin: t.origin, hops: [...t.hops, ...hops] }))));
+      calleeEnv.set(name, mergeTaints(calleeEnv.get(name) ?? [], taints.map((t) => ({ ...t, hops: [...t.hops, ...hops] }))));
     };
 
     fn.getParameters().forEach((param, i) => {
@@ -723,7 +733,7 @@ export class Tracer {
     if (calleeEnv.size > 0 || calleeReq) this.analyze(fn, calleeEnv, depth + 1, calleeReq, self);
   }
 
-  private recordSink(call: CallExpression, argTaints: Taint[][], ref: FunctionRef): void {
+  protected recordSink(call: CallExpression, argTaints: Taint[][], ref: FunctionRef): void {
     const sinkHop = this.hop(call, "sink", ref);
     const sqlText = argTaints[0]?.length > 0;
     const taints = sqlText ? argTaints[0] : argTaints.slice(1).flat();
@@ -743,7 +753,7 @@ export class Tracer {
    * What a call invokes. A method on a project module/object/class resolves to that member; a sink-named
    * method (`.query`, `.execute`) on anything else — a package object, a parameter — is treated as a SQL sink.
    */
-  private resolveCallee(call: CallExpression): Callee {
+  protected resolveCallee(call: CallExpression): Callee {
     const expr = unwrap(call.getExpression());
     if (!Node.isPropertyAccessExpression(expr) && !Node.isElementAccessExpression(expr)) return this.resolveExpr(expr);
 
@@ -760,7 +770,7 @@ export class Tracer {
     return target;
   }
 
-  private resolveExpr(node: Node): Value {
+  protected resolveExpr(node: Node): Value {
     const e = unwrap(node);
     if (isFn(e)) return { kind: "function", fn: e };
     if (Node.isIdentifier(e)) return this.resolveName(e, e.getText());
@@ -892,7 +902,7 @@ export class Tracer {
   }
 
   /** Lexical lookup of `name` from `from` outward: parameters, block/file statements, imports. */
-  private lookup(from: Node, name: string): Node | undefined {
+  protected lookup(from: Node, name: string): Node | undefined {
     for (let scope = from.getParent(); scope; scope = scope.getParent()) {
       if (isFn(scope) || Node.isConstructorDeclaration(scope)) {
         for (const p of scope.getParameters()) {
@@ -1230,8 +1240,7 @@ export function traceEntry(entry: string, root = findProjectRoot(entry)): TraceR
  * Traces a whole project: loads every discovered source file under `dir`, finds the entry points across all of
  * them, and traces each with one shared tracer, so paths and unresolved edges are collected (and deduplicated) once.
  */
-export function traceProject(dir: string): TraceResult {
-  const tracer = new Tracer(path.resolve(dir));
+export function traceProject(dir: string, tracer = new Tracer(path.resolve(dir))): TraceResult {
   const files = discoverFiles(tracer.root).map((f) => tracer.load(f));
   const registered = tracer.registeredHandlers(files);
   analyzeAll(tracer, registered);
