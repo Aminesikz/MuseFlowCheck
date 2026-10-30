@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { assembleAccessContext, buildAccessPrompt, routeLabel, scopingEvidence, secureSiblings } from "../src/engine/access/index.js";
-import { parseAccessJudgment } from "../src/engine/access/judge.js";
+import { accessReach, accessSeverity, parseAccessJudgment } from "../src/engine/access/judge.js";
 import { columnForValue, describeStatement, parseSchema } from "../src/engine/access/sql.js";
 import { FindingParseError } from "../src/engine/parse.js";
 
@@ -80,7 +80,7 @@ test("the prompt carries the three signals and fixes type/CWE by access kind", (
 
 test("judgment: type/CWE come from the access kind; locations and taintPath from the trace", () => {
   const r = route("DELETE /projects/:projectId");
-  const f = parseAccessJudgment('[{"type":"IDOR","cwe":"CWE-639","severity":"Critical","path":1,"explanation":"e","suggestedPatch":"p"}]', r)!;
+  const f = parseAccessJudgment('[{"type":"IDOR","cwe":"CWE-639","severity":"Critical","path":1,"explanation":"e","suggestedPatch":"p"}]', r, ctx)!;
   assert.equal(f.type, "Broken Access Control");
   assert.equal(f.cwe, "CWE-862");
   assert.equal(f.severity, "critical");
@@ -91,8 +91,49 @@ test("judgment: type/CWE come from the access kind; locations and taintPath from
   assert.equal(f.confidence, "suspected");
   assert.equal(f.httpRoute, "DELETE /projects/:projectId"); // route carried to the verifier for :id discovery
   assert.ok(f.taintPath.length >= 4);
-  assert.equal(parseAccessJudgment("[]", r), null);
-  assert.throws(() => parseAccessJudgment('[{"severity":"urgent"}]', r), FindingParseError);
+  assert.equal(parseAccessJudgment("[]", r, ctx), null);
+  assert.throws(() => parseAccessJudgment('[{"severity":"urgent"}]', r, ctx), FindingParseError);
+});
+
+// ---- severity rule ------------------------------------------------------------------------------
+
+test("severity follows the ordered access rule from Stage 1 reach: every unchecked cross-scope access is critical", () => {
+  const severities = Object.fromEntries(ctx.routes.filter((r) => r.status === "candidate").map((r) => [routeLabel(r), accessSeverity(ctx, r)]));
+  assert.deepEqual(severities, {
+    "GET /projects/:projectId": "critical", // reads another team's project
+    "DELETE /projects/:projectId": "critical", // deletes another team's project
+    "PUT /projects/:projectId": "critical", // modifies another team's project
+    "GET /teams/:teamId/report": "critical", // reads another team's documents
+  });
+  const { level, evidence } = accessReach(ctx, route("GET /projects/:projectId"));
+  assert.equal(level, "cross-scope");
+  assert.match(evidence!, /^projects\.team_id \(db\/migrations\/001_init\.sql:8\) ties each projects row to an owner, and the request value params\.projectId reads projects rows/);
+});
+
+test("the parser enforces the rule: the model's critical/high choice cannot move the level; a stated medium/low can lower it", () => {
+  const reply = (severity: string, path = 1) => `[{"type":"IDOR","cwe":"CWE-639","severity":"${severity}","path":${path},"explanation":"e","suggestedPatch":"p"}]`;
+  for (const label of ["GET /projects/:projectId", "DELETE /projects/:projectId", "PUT /projects/:projectId", "GET /teams/:teamId/report"]) {
+    const r = route(label);
+    for (const said of ["critical", "high", "High"]) assert.equal(parseAccessJudgment(reply(said), r, ctx)!.severity, "critical", `${label} said ${said}`);
+    for (let n = 1; n <= r.accesses.length; n++) assert.equal(parseAccessJudgment(reply("high", n), r, ctx)!.severity, "critical", `${label} path ${n}`);
+  }
+  assert.equal(parseAccessJudgment(reply("medium"), route("GET /projects/:projectId"), ctx)!.severity, "medium");
+  assert.equal(parseAccessJudgment(reply("low"), route("GET /projects/:projectId"), ctx)!.severity, "low");
+});
+
+test("without schema evidence of ownership the reach is not established, and the rule gives high", () => {
+  const bare = { ...ctx, schema: [] };
+  const r = route("GET /projects/:projectId");
+  assert.deepEqual(accessReach(bare, r), { level: "unestablished" });
+  assert.equal(accessSeverity(bare, r), "high");
+  assert.equal(parseAccessJudgment('[{"type":"IDOR","cwe":"CWE-639","severity":"critical","path":1,"explanation":"e","suggestedPatch":"p"}]', r, bare)!.severity, "high");
+});
+
+test("the prompt states the rule with the route's reach and the level it gives", () => {
+  const p = buildAccessPrompt(ctx, route("GET /projects/:projectId"));
+  assert.match(p, /ACTOR REACH \(from Stage 1, read from the schema and the route's unchecked accesses\): crosses an ownership boundary — projects\.team_id/);
+  assert.match(p, /SEVERITY — access-control rule\. Check these IN ORDER/);
+  assert.match(p, /For this route the rule gives "critical"\. State the reach in the explanation\./);
 });
 
 // ---- prompt hygiene -----------------------------------------------------------------------------

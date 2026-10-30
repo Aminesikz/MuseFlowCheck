@@ -71,7 +71,8 @@ test("scan <dir> without --mode runs all three classes: one merged Finding[], on
   assert.match(all.stderr, new RegExp(`^  SQL injection: {2}${parts[0].length} finding\\(s\\) \\(high ${parts[0].length}\\)`, "m"));
   assert.match(all.stderr, new RegExp(`^  Access control: ${parts[1].length} finding\\(s\\)`, "m"));
   assert.match(all.stderr, new RegExp(`^  XSS: {12}${parts[2].length} finding\\(s\\)`, "m"));
-  assert.match(all.stderr, new RegExp(`^  Findings: {7}${merged.length} — critical 0, high ${merged.length}, medium 0, low 0$`, "m"));
+  const counts = SEVERITIES.map((s) => `${s} ${merged.filter((f) => f.severity === s).length}`).join(", ");
+  assert.match(all.stderr, new RegExp(`^  Findings: {7}${merged.length} — ${counts}$`, "m"));
 });
 
 test("--mode all is the directory default; a single file still defaults to SQL; --mode all needs a directory", async () => {

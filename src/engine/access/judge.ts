@@ -2,7 +2,7 @@
 // Locations, taintPath, type and CWE come from Stage 1; the model only decides and explains.
 // Keep this prompt codebase-agnostic: describe ownership and checks by behavior, never by any test app's names.
 import { complete } from "../../llm/meta-client.js";
-import type { Finding } from "../../types/index.js";
+import type { Finding, Severity } from "../../types/index.js";
 import { codeSlice, formatHop } from "../crossfile/judge.js";
 import type { FunctionRef } from "../crossfile/trace.js";
 import { extractJsonArray, FindingParseError, validateJudgment } from "../parse.js";
@@ -14,10 +14,59 @@ export const ACCESS_CLASSES: Record<AccessKind, { type: string; cwe: string }> =
   write: { type: "Broken Access Control", cwe: "CWE-862" },
 };
 
-export const ACCESS_SEVERITY_GUIDE = `SEVERITY — check these rules IN ORDER and assign the FIRST one that matches:
-1. "critical" — the caller can modify or delete another scope's records, or read another scope's credentials or financial data.
-2. "high" — the caller can read another scope's records.
-3. "medium" or "low" — only for a specific, clearly stated reason (e.g. only non-sensitive fields are exposed, or a strong precondition limits it).`;
+/**
+ * Whether an unchecked access reaches past the caller's own scope, as Stage 1 establishes it from the schema:
+ * "cross-scope" when the rows it reads or changes belong to an owner (cross-tenant / cross-user data), "unestablished"
+ * when the code does not show that they do.
+ */
+export type AccessReach = "cross-scope" | "unestablished";
+
+/**
+ * The route's reach, read from the schema and the route's unchecked accesses — never from the model. "cross-scope"
+ * when a request value selects rows of a table the schema ties to an owner (an ownership column), or of a table that
+ * is itself a scope record, with no check on the path; otherwise "unestablished" (no schema, or ownership only
+ * inferred from a statement). Taken over all the route's unchecked accesses, so the path the judge cites cannot move it.
+ */
+export function accessReach(ctx: AccessContext, route: AccessRoute): { level: AccessReach; evidence?: string } {
+  const owners = ownerColumns(route.identity);
+  const scopes = scopeTables(ctx.schema, owners);
+  for (const a of route.accesses) {
+    const verb = a.kind === "write" ? "changes" : "reads";
+    for (const table of a.tables) {
+      const schema = ctx.schema.find((t) => t.name === table);
+      const owner = schema?.columns.find((c) => owners.has(c.name));
+      if (owner) {
+        return { level: "cross-scope", evidence: `${table}.${owner.name} (${schema!.file}:${owner.line}) ties each ${table} row to an owner, and the request value ${a.location}.${a.field} ${verb} ${table} rows with no check against the caller's own ${route.identity!.expression}.${owners.get(owner.name)}` };
+      }
+      const scope = scopes.get(table);
+      if (scope) {
+        return { level: "cross-scope", evidence: `${table} is itself a scope record (identified by ${route.identity!.expression}.${scope.field}), and the request value ${a.location}.${a.field} ${verb} ${table} rows with no check against the caller's own` };
+      }
+    }
+  }
+  return { level: "unestablished" };
+}
+
+/** The ordered access-control severity rule: an unchecked read or write across an ownership boundary is critical; otherwise high. */
+export function accessSeverity(ctx: AccessContext, route: AccessRoute): Severity {
+  return accessReach(ctx, route).level === "cross-scope" ? "critical" : "high";
+}
+
+/** The access-control severity rule, stated with this route's reach and resulting level — applied, not re-derived. */
+function severityRule(ctx: AccessContext, route: AccessRoute): string {
+  const { level, evidence } = accessReach(ctx, route);
+  const reach =
+    level === "cross-scope"
+      ? `crosses an ownership boundary — ${evidence}: the caller reaches other users' or tenants' records.`
+      : "not established — the schema does not show that the accessed rows belong to an owner, so reaching beyond the caller's own scope is not shown by the code.";
+  return `ACTOR REACH (from Stage 1, read from the schema and the route's unchecked accesses): ${reach}
+
+SEVERITY — access-control rule. Check these IN ORDER and assign the FIRST one that matches, using the ACTOR REACH above:
+1. "critical" — the unchecked access crosses an ownership boundary (reach: crosses an ownership boundary): the caller reads or modifies another user's or tenant's records — their personal data, financial data, or any record they own — or changes or deletes them.
+2. "high" — reaching beyond the caller's own scope is not established by the code (reach: not established), so the exposure is limited to the caller's own scope or is lower-impact.
+3. "medium" or "low" — only for a specific reason visible in the code that limits the impact (e.g. only non-sensitive fields are exposed, or a strong precondition), stated in the explanation.
+The level follows from this rule and the reach above — do not re-derive impact. For this route the rule gives "${accessSeverity(ctx, route)}". State the reach in the explanation.`;
+}
 
 export function routeLabel(r: AccessRoute): string {
   return `${r.method} ${r.path}`;
@@ -143,7 +192,7 @@ ${siblings.map(siblingLine).join("\n") || "- none found"}
 CODE — the route's functions, the identity middleware, and the sibling checks, with real file line numbers prefixed as "N | "
 ${codeFor(ctx, route, siblings).map(codeSlice).join("\n\n")}
 
-${ACCESS_SEVERITY_GUIDE}
+${severityRule(ctx, route)}
 
 OUTPUT
 Return ONLY a JSON array — no prose, no markdown fences.
@@ -161,18 +210,24 @@ This route ${kind === "write" ? "modifies" : "reads"} the record, so type is "${
 Do not include file, line, or taintPath fields — the tool fills those in from the traced path.`;
 }
 
-/** Parses the judge's reply into one Finding (or null when it judged the route not vulnerable). */
-export function parseAccessJudgment(raw: string, route: AccessRoute): Finding | null {
+/**
+ * Parses the judge's reply into one Finding (or null when it judged the route not vulnerable). Severity follows the
+ * access-control rule: critical/high is the rule's level for this route's reach; only a medium/low downgrade, which
+ * the rule reserves for a stated reason in the code, is taken from the model.
+ */
+export function parseAccessJudgment(raw: string, route: AccessRoute, ctx: AccessContext): Finding | null {
   const items = extractJsonArray(raw);
   if (items.length === 0) return null;
   try {
     const judgment = validateJudgment(items[0], 0);
     const n = Number((items[0] as Record<string, unknown>).path);
     const access = (Number.isInteger(n) && route.accesses[n - 1]) || route.accesses[0];
+    const severity = judgment.severity === "critical" || judgment.severity === "high" ? accessSeverity(ctx, route) : judgment.severity;
     const source = access.path.hops[0];
     const sink = access.path.hops.at(-1)!;
     return {
       ...judgment,
+      severity,
       ...ACCESS_CLASSES[routeKind(route)],
       file: source.file,
       sourceLine: source.line,
@@ -188,5 +243,5 @@ export function parseAccessJudgment(raw: string, route: AccessRoute): Finding | 
 }
 
 export async function judgeRoute(ctx: AccessContext, route: AccessRoute): Promise<Finding | null> {
-  return parseAccessJudgment(await complete(buildAccessPrompt(ctx, route)), route);
+  return parseAccessJudgment(await complete(buildAccessPrompt(ctx, route)), route, ctx);
 }

@@ -4,7 +4,7 @@ import { assembleAccessContext, type AccessContext, type AccessRoute } from "./c
 import { judgeRoute, routeLabel } from "./judge.js";
 
 export { assembleAccessContext, type AccessContext, type AccessRoute, type Guard, type Access } from "./context.js";
-export { buildAccessPrompt, routeKind, routeLabel, scopingEvidence, secureSiblings } from "./judge.js";
+export { accessReach, accessSeverity, buildAccessPrompt, routeKind, routeLabel, scopingEvidence, secureSiblings, type AccessReach } from "./judge.js";
 
 export interface AccessJudgeResult {
   findings: Finding[];
