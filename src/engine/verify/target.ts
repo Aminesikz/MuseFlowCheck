@@ -114,7 +114,7 @@ export class Target {
     }
     const res = await this.fetchImpl(url.toString(), { method, headers, body, redirect: "manual" });
     const text = await res.text();
-    return { status: res.status, body: text, method, path: url.pathname + url.search };
+    return { status: res.status, body: text, method, path: url.pathname + url.search, sent: body };
   }
 }
 

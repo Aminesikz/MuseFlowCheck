@@ -46,6 +46,45 @@ test("evaluate: marker only when present in the exploit and absent from the base
   assert.equal(evaluate({ type: "marker", value: "ZZMARK" }, { status: 200, body: "ZZMARK" }, { status: 200, body: "ZZMARK" }).success, false);
 });
 
+test("evaluate: a marker the target only echoes back never confirms — a missing route, or a page repeating the input", () => {
+  // Express's 404 page repeats the path, so the injected marker came back in the exploit's 404 (a live false confirmation).
+  const page = (path: string) => `<!DOCTYPE html><html lang="en"><head><title>Error</title></head><body><pre>Cannot GET ${path}</pre></body></html>`;
+  const path = "/invoices/0%20UNION%20SELECT%209999,%200,%20&#39;INJECTED1337&#39;".replace(/&#39;/g, "'");
+  const missing = evaluate({ type: "marker", value: "INJECTED1337" }, { status: 404, body: page("/invoices/1"), path: "/invoices/1" }, { status: 404, body: page(path.replace(/'/g, "&#39;")), path });
+  assert.equal(missing.success, false);
+  assert.match(missing.detail, /baseline request returned status 404, so the route did not answer normally on this target/);
+
+  // A search page that answers 200 and repeats q (URL-encoded, HTML-escaped) but returns no injected row.
+  const q = "' UNION SELECT NULL,'PWN_MARK_42',NULL --";
+  const url = `/search?q=${encodeURIComponent(q).replace(/%20/g, "+")}`;
+  const echoPage = `<h1>Results for &#39; UNION SELECT NULL,&#39;PWN_MARK_42&#39;,NULL --</h1><p>No results</p>`;
+  const echo = evaluate({ type: "marker", value: "PWN_MARK_42" }, { status: 200, body: "<h1>Results for shoes</h1><ul><li>Shoe</li></ul>", path: "/search?q=shoes" }, { status: 200, body: echoPage, path: url });
+  assert.equal(echo.success, false);
+  assert.match(echo.detail, /appeared in the exploit response only as an echo of the request \(status 200\), not as data the query returned/);
+
+  // The same page also listing the row the injected SELECT returned: that occurrence is data, so it confirms.
+  const returned = evaluate(
+    { type: "marker", value: "PWN_MARK_42" },
+    { status: 200, body: "<h1>Results for shoes</h1><ul><li>Shoe</li></ul>", path: "/search?q=shoes" },
+    { status: 200, body: `${echoPage.replace("<p>No results</p>", "")}<ul><li>Shoe</li><li>PWN_MARK_42</li></ul>`, path: url },
+  );
+  assert.equal(returned.success, true);
+  assert.equal(returned.detail, 'injected marker "PWN_MARK_42" appeared in the exploit response and not in the baseline');
+
+  // An echo of a JSON body (an error message repeating the input) does not confirm either.
+  const sent = JSON.stringify({ name: "x' UNION SELECT 'BODY_MARK_7' --" });
+  const bodyEcho = evaluate({ type: "marker", value: "BODY_MARK_7" }, { status: 200, body: '{"ok":true}', path: "/api/items" }, { status: 400, body: `{"error":"invalid name: x' UNION SELECT 'BODY_MARK_7' --"}`, path: "/api/items", sent });
+  assert.equal(bodyEcho.success, false);
+
+  // A UNION row in a JSON API response confirms, as before.
+  const api = evaluate(
+    { type: "marker", value: "SQLI_MARKER_ABC" },
+    { status: 200, body: '{"barbers":[{"id":1,"name":"Marcus"}]}', path: "/api/barbers/search?q=mar" },
+    { status: 200, body: '{"barbers":[{"id":null,"shop_id":null,"name":"SQLI_MARKER_ABC","specialty":null}]}', path: "/api/barbers/search?q=%27+UNION+SELECT+NULL%2CNULL%2C%27SQLI_MARKER_ABC%27%2CNULL--+" },
+  );
+  assert.equal(api.success, true);
+});
+
 test("evaluate: more-rows compares array lengths, with an optional field", () => {
   assert.equal(evaluate({ type: "more-rows" }, { status: 200, body: "[1,2]" }, { status: 200, body: "[1,2,3,4]" }).success, true);
   assert.equal(evaluate({ type: "more-rows", field: "rows" }, { status: 200, body: '{"rows":[1]}' }, { status: 200, body: '{"rows":[1,2]}' }).success, true);

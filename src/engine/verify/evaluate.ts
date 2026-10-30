@@ -5,6 +5,9 @@ import type { Check } from "./poc.js";
 export interface RawResponse {
   status: number;
   body: string;
+  /** The request that produced it, when known: its path with the query string, and the body it sent. */
+  path?: string;
+  sent?: string;
 }
 
 export interface Evaluation {
@@ -57,6 +60,47 @@ function canonical(value: unknown): string {
   );
 }
 
+/** Text as a reader sees it: HTML entities and URL percent-escapes decoded and `+` read as a space, so an echo of a request matches it in whichever of those encodings it comes back. */
+function decoded(text: string): string {
+  const entities: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+  return text
+    .replace(/\+/g, " ")
+    .replace(/(?:%[0-9a-f]{2})+/gi, (seq) => {
+      try {
+        return decodeURIComponent(seq);
+      } catch {
+        return seq;
+      }
+    })
+    .replace(/&(?:#(\d+)|#x([0-9a-f]+)|(\w+));/gi, (m, dec, hex, name) =>
+      dec ? String.fromCodePoint(Number(dec)) : hex ? String.fromCodePoint(parseInt(hex, 16)) : (entities[name.toLowerCase()] ?? m),
+    );
+}
+
+/** Characters of context either side of a marker that, when also found in the request, show the marker was echoed. */
+const ECHO_CONTEXT = 6;
+
+/**
+ * Occurrences of a marker in a response that are not just the request echoed back — an error page or a search page
+ * repeating the URL or body. An echo carries the injected text around the marker, so the marker together with a few
+ * characters on either side also appears in the request; a value the database returned sits in the response's own
+ * markup instead. Conservative: an occurrence that might be an echo is not counted.
+ */
+function returnedMarkers(marker: string, response: RawResponse): { total: number; returned: number } {
+  const body = decoded(response.body);
+  const request = decoded(`${response.path ?? ""}\n${response.sent ?? ""}`);
+  let total = 0;
+  let returned = 0;
+  for (let i = body.indexOf(marker); i !== -1; i = body.indexOf(marker, i + 1)) {
+    total++;
+    const before = body.slice(Math.max(0, i - ECHO_CONTEXT), i);
+    const after = body.slice(i + marker.length, i + marker.length + ECHO_CONTEXT);
+    const echoed = (before.length >= 3 && request.includes(before + marker)) || (after.length >= 3 && request.includes(marker + after));
+    if (!echoed) returned++;
+  }
+  return { total, returned };
+}
+
 function excerpt(body: string, max = 120): string {
   const clean = body.replace(/\s+/g, " ").trim();
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
@@ -96,14 +140,18 @@ export function emptyResult(response: RawResponse): boolean {
 export function evaluate(check: Check, baseline: RawResponse, exploit: RawResponse): Evaluation {
   switch (check.type) {
     case "marker": {
-      const inExploit = exploit.body.includes(check.value);
-      const inBaseline = baseline.body.includes(check.value);
-      return {
-        success: inExploit && !inBaseline,
-        detail: inExploit && !inBaseline
-          ? `injected marker ${JSON.stringify(check.value)} appeared in the exploit response and not in the baseline`
-          : `marker ${JSON.stringify(check.value)} ${inExploit ? "appeared in both responses" : "did not appear in the exploit response"}`,
-      };
+      const marker = JSON.stringify(check.value);
+      // A baseline that did not answer normally (a missing route, an error) leaves nothing to compare the exploit with.
+      if (!ok(baseline.status)) {
+        return { success: false, detail: `the baseline request returned status ${baseline.status}, so the route did not answer normally on this target — there is nothing to compare the exploit with` };
+      }
+      if (decoded(baseline.body).includes(check.value)) return { success: false, detail: `marker ${marker} appeared in both responses` };
+      const { total, returned } = returnedMarkers(check.value, exploit);
+      if (total === 0) return { success: false, detail: `marker ${marker} did not appear in the exploit response` };
+      if (returned === 0) {
+        return { success: false, detail: `marker ${marker} appeared in the exploit response only as an echo of the request (status ${exploit.status}), not as data the query returned` };
+      }
+      return { success: true, detail: `injected marker ${marker} appeared in the exploit response and not in the baseline` };
     }
     case "more-rows": {
       const b = findArray(parse(baseline.body), check.field);
