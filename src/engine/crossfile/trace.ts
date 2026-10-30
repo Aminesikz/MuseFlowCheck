@@ -222,12 +222,19 @@ export function findProjectRoot(entry: string): string {
   }
 }
 
-export class Tracer {
-  private readonly project = new Project({
+/**
+ * A ts-morph project for tracing. Tracers keep all their analysis state themselves and only read the syntax trees,
+ * so one project can be shared by every tracer over the same root (each source file is then parsed once per run).
+ */
+export function createProject(): Project {
+  return new Project({
     compilerOptions: { allowJs: true },
     skipAddingFilesFromTsConfig: true,
     skipFileDependencyResolution: true,
   });
+}
+
+export class Tracer {
   private readonly onStack = new Set<Fn>();
   /** Every function analyzed so far, from any entry point. */
   readonly visited = new Set<Fn>();
@@ -246,7 +253,10 @@ export class Tracer {
   /** The HTTP route of the handler currently being analyzed, stamped onto the paths it produces. */
   protected currentRoute?: string;
 
-  constructor(readonly root: string) {}
+  constructor(
+    readonly root: string,
+    private readonly project: Project = createProject(),
+  ) {}
 
   load(file: string): SourceFile {
     return this.project.getSourceFile(file) ?? this.project.addSourceFileAtPath(file);

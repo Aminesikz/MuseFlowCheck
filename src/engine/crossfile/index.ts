@@ -6,9 +6,11 @@ import { traceEntry, traceProject, type TraceResult } from "./trace.js";
 export { buildJudgePrompt, formatHop, groupBySink, groupSignature } from "./judge.js";
 export { discoverFiles } from "./files.js";
 export {
+  createProject,
   findProjectRoot,
   traceEntry,
   traceProject,
+  Tracer,
   type CandidatePath,
   type EntryPoint,
   type ExternalCall,

@@ -3,14 +3,17 @@
 import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { analyzeFile, FindingParseError } from "./engine/index.js";
+import type { Project } from "ts-morph";
 import {
   buildJudgePrompt,
+  createProject,
   findProjectRoot,
   formatHop,
   groupBySink,
   judgeTrace,
   traceEntry,
   traceProject,
+  Tracer,
   type EntryPoint,
   type JudgeResult,
   type TraceResult,
@@ -50,14 +53,19 @@ const VERSION = "0.0.0";
 const USAGE = `flowcheck v${VERSION}
 
 Usage:
-  flowcheck scan <dir> [--json]                      Scan a project: find every entry point, trace request input
+  flowcheck scan <dir> [--json]                      Scan a project for every class at once — SQL injection, broken
+                                                     access control / IDOR, and cross-site scripting — into one
+                                                     merged Finding[], one summary and one exit code
+  flowcheck scan <dir> --mode sqli [--json]          SQL injection only: find every entry point, trace request input
                                                      across files, then judge each SQL sink with the model
   flowcheck scan <file> [--json]                     Scan one JS/TS file for SQL injection (single-file)
   flowcheck scan <entry> --cross-file [--root <dir>] [--json]
                                                      Trace request input from one entry file across files, then judge
   flowcheck trace <dir|entry> [--root <dir>] [--show-prompt]
-                                                     Stage 1 only: print traced paths (no API call);
-                                                     --show-prompt also prints the Stage 2 prompt(s)
+                                                     Stage 1 only: print traced paths (no API call) — every class for
+                                                     a directory, SQL for an entry file; --show-prompt also prints
+                                                     the Stage 2 prompt(s)
+  flowcheck trace <dir> --mode sqli [--show-prompt]  SQL injection Stage 1 only (no API call)
   flowcheck scan <dir> --mode access [--route <text>] [--json]
                                                      Broken access control / IDOR: assemble per-route evidence,
                                                      then judge each unchecked route with the model
@@ -69,7 +77,7 @@ Usage:
   flowcheck trace <dir> --mode xss [--show-prompt]   XSS Stage 1 only (no API call)
   flowcheck --version
 
-  --mode    sqli (default), access, or xss
+  --mode    all (default for a directory), sqli (default for a file), access, or xss
   --route   only judge (or show prompts for) routes whose "METHOD /path" contains <text>
   --json    print the findings as a JSON Finding[] on stdout (progress and summary go to stderr)
 
@@ -170,11 +178,12 @@ function confidenceBreakdown(findings: Finding[]): string {
  * When a target is configured, proves each finding against it and returns the updated list. A bad target or a
  * failed login aborts verification (configuration error) and is reported; analysis findings are returned as-is.
  */
-async function finalizeFindings(findings: Finding[], label: string): Promise<{ findings: Finding[]; error?: boolean }> {
+async function finalizeFindings(findings: Finding[], label: string, shared?: XssBrowserSession): Promise<{ findings: Finding[]; error?: boolean }> {
   if (!verify || findings.length === 0) return { findings };
   say(`\nVerification — proving ${findings.length} finding(s) against ${verify.target.base} ...\n`);
-  const browser = await openXssBrowser(findings);
+  const browser = shared ?? new XssBrowserSession(); // a combined run shares one browser; a single class owns its own
   try {
+    await browser.attach(findings);
     return { findings: await verifyFindings(findings, verify.target, verify.deps) };
   } catch (err) {
     if (err instanceof TargetError) {
@@ -184,17 +193,39 @@ async function finalizeFindings(findings: Finding[], label: string): Promise<{ f
     console.error(`✗ Verification error: ${describeError(err, label)}`);
     return { findings, error: true };
   } finally {
+    if (!shared) await browser.close();
+  }
+}
+
+/**
+ * The headless browser for XSS execution proofs, launched on first need — verification is on, a browser is
+ * configured, and there are XSS findings to prove — then reused until closed. A combined scan holds one session for
+ * the whole run, so it starts Chrome at most once and closes it once, whatever happens in between.
+ */
+class XssBrowserSession {
+  private launched?: Promise<ExecBrowser | undefined>;
+
+  /** Attaches the browser to the verify deps when these findings need it, launching it (or trying to) only once. */
+  async attach(findings: Finding[]): Promise<void> {
+    if (!verify?.xss || !findings.some(isXssFinding)) return;
+    this.launched ??= openXssBrowser();
+    await this.launched;
+  }
+
+  async close(): Promise<void> {
+    const browser = await this.launched;
+    this.launched = undefined;
+    if (verify) delete verify.deps.xss;
     await browser?.close();
   }
 }
 
 /**
- * Launches the headless browser for XSS execution proofs when the findings include XSS and a browser is configured,
- * and attaches it to the verify deps for the duration. Returns the browser to close afterwards, or undefined when no
- * XSS proof will run (no XSS findings, or no browser) — in which case XSS findings stay "suspected" (purely additive).
+ * Launches the headless browser for XSS execution proofs and attaches it to the verify deps. Returns undefined when
+ * it cannot start — in which case XSS findings stay "suspected" (purely additive).
  */
-async function openXssBrowser(findings: Finding[]): Promise<ExecBrowser | undefined> {
-  if (!verify?.xss || !findings.some(isXssFinding)) return undefined;
+async function openXssBrowser(): Promise<ExecBrowser | undefined> {
+  if (!verify?.xss) return undefined;
   const { browserPath, clientBase, tokenStore } = verify.xss;
   try {
     let auth: BrowserAuth | undefined;
@@ -297,8 +328,8 @@ function summaryLine(findings: Finding[]): string {
   return `Summary: ${findings.length} finding(s), ${gatedCount(findings)} high/critical${conf}.`;
 }
 
-/** Stage 2 plus output for a finished trace; shared by single-entry and project scans. */
-async function judgeAndReport(trace: TraceResult, label: string, json: boolean, project: boolean): Promise<number> {
+/** Stage 2 for a finished SQL trace, then verification; shared by single-entry and project scans. */
+async function judgeSqli(trace: TraceResult, label: string, browser?: XssBrowserSession): Promise<{ result: JudgeResult; final: { findings: Finding[]; error?: boolean } }> {
   const groups = groupBySink(trace.paths);
   let result: JudgeResult = { findings: [], failures: [], sinks: 0, calls: 0 };
   if (groups.length === 0) {
@@ -308,31 +339,7 @@ async function judgeAndReport(trace: TraceResult, label: string, json: boolean, 
     result = await judgeTrace(trace);
   }
   const judged = [...result.findings].sort(bySeverity);
-  const final = await finalizeFindings(judged, label);
-  const findings = final.findings;
-
-  if (project) {
-    const counts = SEVERITIES.map((s) => `${s} ${findings.filter((f) => f.severity === s).length}`).join(", ");
-    say(
-      [
-        "Summary",
-        `  Files scanned:  ${trace.files}`,
-        `  Entry points:   ${trace.handlers} (${readingInput(trace)} read request input)`,
-        `  SQL sinks:      ${result.sinks} judged (${result.calls} model call(s)); ${trace.paths.filter((p) => !p.sqlText).length} path(s) reach SQL only as bound parameters`,
-        `  Findings:       ${findings.length} — ${counts}`,
-        ...(findings.some((f) => f.confidence !== "suspected") ? [`  Confidence:     ${confidenceBreakdown(findings)}`] : []),
-        `  Unresolved:     ${trace.unresolved.length} call(s)`,
-        "",
-      ].join("\n"),
-    );
-  }
-  let code = emitFindings(findings, json);
-  if (!project) say(summaryLine(findings));
-  if (project) say(formatUnresolved(trace));
-
-  for (const f of result.failures) console.error(`✗ Judging ${f.sink} failed: ${describeError(f.error, label)}`);
-  if ((result.failures.length > 0 || final.error) && code === 0) code = EXIT_ERROR; // an unjudged sink, or a verification error, is not a clean result
-  return code;
+  return { result, final: await finalizeFindings(judged, label, browser) };
 }
 
 async function scanCrossFile(entry: string, root: string | undefined, json: boolean): Promise<number> {
@@ -345,28 +352,100 @@ async function scanCrossFile(entry: string, root: string | undefined, json: bool
     return reportError(err, entry);
   }
   say(formatTrace(trace) + "\n");
-  return judgeAndReport(trace, entry, json, false);
+  const { result, final } = await judgeSqli(trace, entry);
+  let code = emitFindings(final.findings, json);
+  say(summaryLine(final.findings));
+  for (const f of result.failures) console.error(`✗ Judging ${f.sink} failed: ${describeError(f.error, entry)}`);
+  if ((result.failures.length > 0 || final.error) && code === 0) code = EXIT_ERROR; // an unjudged sink, or a verification error, is not a clean result
+  return code;
 }
 
-async function scanProject(dir: string, json: boolean): Promise<number> {
-  loadDotEnv();
+// ---- one class, reported alone or merged ----------------------------------------------------------
+
+/** One vulnerability class's finished analysis and verification, reported on its own or merged into a combined scan. */
+interface ClassRun {
+  name: string;
+  files: number;
+  findings: Finding[];
+  /** Rows of the class's own summary, before and after its Findings / Confidence rows. */
+  before: string[];
+  after: string[];
+  /** The class's Stage 1/2 counts on one line, for the combined summary. */
+  brief: string;
+  /** Printed after the findings: unresolved calls, routes judged not vulnerable. */
+  notes: string[];
+  /** Judge failures, reported on stderr. */
+  failures: string[];
+  /** A judge failure or a verification error: the result is not clean. */
+  failed: boolean;
+}
+
+/** What a combined scan shares across classes: one parsed project and one headless browser. */
+interface SharedRun {
+  project?: Project;
+  browser?: XssBrowserSession;
+}
+
+function severityCounts(findings: Finding[]): string {
+  return SEVERITIES.map((s) => `${s} ${findings.filter((f) => f.severity === s).length}`).join(", ");
+}
+
+function confidenceRow(findings: Finding[]): string[] {
+  return findings.some((f) => f.confidence !== "suspected") ? [`  Confidence:     ${confidenceBreakdown(findings)}`] : [];
+}
+
+/** Reports one class on its own (a single --mode scan) and returns its exit code. */
+function reportClass(run: ClassRun | undefined, json: boolean): number {
+  if (!run) return EXIT_ERROR; // Stage 1 failed; already reported
+  const { findings } = run;
+  say(["Summary", ...run.before, `  Findings:       ${findings.length} — ${severityCounts(findings)}`, ...confidenceRow(findings), ...run.after, ""].join("\n"));
+  let code = emitFindings(findings, json);
+  for (const note of run.notes) say(note);
+  for (const failure of run.failures) console.error(failure);
+  if (run.failed && code === 0) code = EXIT_ERROR;
+  return code;
+}
+
+async function runSqli(dir: string, shared: SharedRun = {}): Promise<ClassRun | undefined> {
   say(`Scanning project ${dir} for SQL injection...\n`);
   let trace: TraceResult;
   try {
-    trace = traceProject(dir);
+    trace = traceProject(dir, new Tracer(path.resolve(dir), shared.project));
   } catch (err) {
-    return reportError(err, dir);
+    reportError(err, dir);
+    return undefined;
   }
   const sqlText = trace.paths.filter((p) => p.sqlText).length;
+  const bound = trace.paths.length - sqlText;
   say(
     [
       `Stage 1 — ${trace.files} file(s), ${trace.handlers} entry point(s) (${readingInput(trace)} read request input)`,
-      `  ${sqlText} candidate path(s) into SQL text; ${trace.paths.length - sqlText} reach SQL only as bound parameters`,
+      `  ${sqlText} candidate path(s) into SQL text; ${bound} reach SQL only as bound parameters`,
       `  Run \`flowcheck trace ${dir}\` for every entry point and hop.`,
       "",
     ].join("\n"),
   );
-  return judgeAndReport(trace, dir, json, true);
+  const { result, final } = await judgeSqli(trace, dir, shared.browser);
+  return {
+    name: "SQL injection",
+    files: trace.files,
+    findings: final.findings,
+    before: [
+      `  Files scanned:  ${trace.files}`,
+      `  Entry points:   ${trace.handlers} (${readingInput(trace)} read request input)`,
+      `  SQL sinks:      ${result.sinks} judged (${result.calls} model call(s)); ${bound} path(s) reach SQL only as bound parameters`,
+    ],
+    after: [`  Unresolved:     ${trace.unresolved.length} call(s)`],
+    brief: `${result.sinks} SQL sink(s) judged (${result.calls} model call(s)); ${bound} path(s) reach SQL only as bound parameters`,
+    notes: [formatUnresolved(trace)],
+    failures: result.failures.map((f) => `✗ Judging ${f.sink} failed: ${describeError(f.error, dir)}`),
+    failed: result.failures.length > 0 || final.error === true,
+  };
+}
+
+async function scanProject(dir: string, json: boolean): Promise<number> {
+  loadDotEnv();
+  return reportClass(await runSqli(dir), json);
 }
 
 function trace(target: string, root: string | undefined, showPrompt: boolean): number {
@@ -443,14 +522,14 @@ function traceAccess(dir: string, filter: string | undefined, showPrompt: boolea
   return 0;
 }
 
-async function scanAccess(dir: string, filter: string | undefined, json: boolean): Promise<number> {
-  loadDotEnv();
+async function runAccess(dir: string, filter: string | undefined, shared: SharedRun = {}): Promise<ClassRun | undefined> {
   say(`Scanning project ${dir} for broken access control / IDOR...\n`);
   let ctx: AccessContext;
   try {
-    ctx = assembleAccessContext(dir);
+    ctx = assembleAccessContext(dir, shared.project);
   } catch (err) {
-    return reportError(err, dir);
+    reportError(err, dir);
+    return undefined;
   }
   const toJudge = candidates(ctx, filter);
   say(
@@ -466,25 +545,28 @@ async function scanAccess(dir: string, filter: string | undefined, json: boolean
   );
   const result = toJudge.length > 0 ? await judgeAccess(ctx, filter) : { findings: [], failures: [], cleared: [], calls: 0 };
   const judged = [...result.findings].sort(bySeverity);
-  const final = await finalizeFindings(judged, dir);
-  const findings = final.findings;
-  const counts = SEVERITIES.map((s) => `${s} ${findings.filter((f) => f.severity === s).length}`).join(", ");
-  say(
-    [
-      "Summary",
+  const final = await finalizeFindings(judged, dir, shared.browser);
+  const guarded = ctx.routes.filter((r) => r.status === "guarded").length;
+  return {
+    name: "Access control",
+    files: ctx.files,
+    findings: final.findings,
+    before: [
       `  Files scanned:  ${ctx.files}`,
-      `  Routes:         ${ctx.routes.length} (${ctx.routes.filter((r) => r.status === "guarded").length} guarded)`,
+      `  Routes:         ${ctx.routes.length} (${guarded} guarded)`,
       `  Judged:         ${result.calls} route(s); ${result.cleared.length} judged not vulnerable`,
-      `  Findings:       ${findings.length} — ${counts}`,
-      ...(findings.some((f) => f.confidence !== "suspected") ? [`  Confidence:     ${confidenceBreakdown(findings)}`] : []),
-      "",
-    ].join("\n"),
-  );
-  let code = emitFindings(findings, json);
-  for (const r of result.cleared) say(`Judged not vulnerable: ${routeLabel(r)}`);
-  for (const f of result.failures) console.error(`✗ Judging ${f.route} failed: ${describeError(f.error, dir)}`);
-  if ((result.failures.length > 0 || final.error) && code === 0) code = EXIT_ERROR;
-  return code;
+    ],
+    after: [],
+    brief: `${ctx.routes.length} route(s), ${guarded} guarded; ${result.calls} judged, ${result.cleared.length} judged not vulnerable`,
+    notes: result.cleared.map((r) => `Judged not vulnerable: ${routeLabel(r)}`),
+    failures: result.failures.map((f) => `✗ Judging ${f.route} failed: ${describeError(f.error, dir)}`),
+    failed: result.failures.length > 0 || final.error === true,
+  };
+}
+
+async function scanAccess(dir: string, filter: string | undefined, json: boolean): Promise<number> {
+  loadDotEnv();
+  return reportClass(await runAccess(dir, filter), json);
 }
 
 // ---- XSS mode -------------------------------------------------------------------------------
@@ -541,14 +623,14 @@ function traceXss(dir: string, showPrompt: boolean): number {
   return 0;
 }
 
-async function scanXss(dir: string, json: boolean): Promise<number> {
-  loadDotEnv();
+async function runXss(dir: string, shared: SharedRun = {}): Promise<ClassRun | undefined> {
   say(`Scanning project ${dir} for cross-site scripting...\n`);
   let trace: XssTraceResult;
   try {
-    trace = traceXssProject(dir);
+    trace = traceXssProject(dir, shared.project);
   } catch (err) {
-    return reportError(err, dir);
+    reportError(err, dir);
+    return undefined;
   }
   const groups = groupXssBySink(trace.xss);
   const encoded = trace.xss.filter((p) => p.encoded);
@@ -566,26 +648,81 @@ async function scanXss(dir: string, json: boolean): Promise<number> {
   );
   const result = groups.length > 0 ? await judgeXss(trace) : { findings: [], failures: [], sinks: 0, calls: 0 };
   const judged = [...result.findings].sort(bySeverity);
-  const final = await finalizeFindings(judged, dir); // proves XSS findings in a headless browser when --target is set
-  const findings = final.findings;
-  const counts = SEVERITIES.map((s) => `${s} ${findings.filter((f) => f.severity === s).length}`).join(", ");
-  say(
-    [
-      "Summary",
+  const final = await finalizeFindings(judged, dir, shared.browser); // proves XSS findings in a headless browser when --target is set
+  return {
+    name: "XSS",
+    files: trace.files,
+    findings: final.findings,
+    before: [
       `  Files scanned:  ${trace.files}`,
       `  Entry points:   ${trace.handlers} (${readingInput(trace)} read request input)`,
       `  HTML outputs:   ${result.sinks} judged (${result.calls} model call(s)); ${encoded.length} path(s) reach output only encoded or escaped`,
-      `  Findings:       ${findings.length} — ${counts}`,
-      ...(findings.some((f) => f.confidence !== "suspected") ? [`  Confidence:     ${confidenceBreakdown(findings)}`] : []),
-      `  Unresolved:     ${trace.unresolved.length} call(s)`,
+    ],
+    after: [`  Unresolved:     ${trace.unresolved.length} call(s)`],
+    brief: `${result.sinks} HTML output(s) judged (${result.calls} model call(s)); ${encoded.length} path(s) reach output only encoded or escaped`,
+    notes: [formatUnresolved(trace)],
+    failures: result.failures.map((f) => `✗ Judging ${f.sink} failed: ${describeError(f.error, dir)}`),
+    failed: result.failures.length > 0 || final.error === true,
+  };
+}
+
+async function scanXss(dir: string, json: boolean): Promise<number> {
+  loadDotEnv();
+  return reportClass(await runXss(dir), json);
+}
+
+// ---- combined mode ------------------------------------------------------------------------------
+
+/**
+ * Scans a project for every class — SQL injection, access control, XSS — in one run. Each class runs its Stage 1,
+ * Stage 2 and verification exactly as its own --mode does, over one shared parsed project and one shared headless
+ * browser (closed once, even on error). Then one merged Finding[], one summary and one exit code. Findings are never
+ * merged across classes: a route with both an injection and an IDOR yields one finding of each.
+ */
+async function scanAll(dir: string, filter: string | undefined, json: boolean): Promise<number> {
+  loadDotEnv();
+  say(`Scanning project ${dir} for SQL injection, broken access control / IDOR and cross-site scripting...\n`);
+  const shared: SharedRun = { project: createProject(), browser: new XssBrowserSession() };
+  const names = ["SQL injection", "Access control", "XSS"];
+  let runs: (ClassRun | undefined)[];
+  try {
+    runs = [await runSqli(dir, shared), await runAccess(dir, filter, shared), await runXss(dir, shared)];
+  } finally {
+    await shared.browser!.close();
+  }
+  const done = runs.filter((r): r is ClassRun => r !== undefined);
+  const findings = done.flatMap((r) => r.findings).sort(bySeverity); // stable: class order within a severity
+  const perClass = runs.map((r, i) => {
+    const label = `  ${`${names[i]}:`.padEnd(16)}`;
+    if (!r) return `${label}not scanned (Stage 1 failed)`;
+    const bySev = SEVERITIES.map((s) => [s, r.findings.filter((f) => f.severity === s).length] as const).filter(([, n]) => n > 0);
+    const sev = bySev.length > 0 ? ` (${bySev.map(([s, n]) => `${s} ${n}`).join(", ")})` : "";
+    return `${label}${r.findings.length} finding(s)${sev} — ${r.brief}`;
+  });
+  say(
+    [
+      "Summary",
+      `  Files scanned:  ${Math.max(0, ...done.map((r) => r.files))}`,
+      ...perClass,
+      `  Findings:       ${findings.length} — ${severityCounts(findings)}`,
+      ...confidenceRow(findings),
       "",
     ].join("\n"),
   );
   let code = emitFindings(findings, json);
-  say(formatUnresolved(trace));
-  for (const f of result.failures) console.error(`✗ Judging ${f.sink} failed: ${describeError(f.error, dir)}`);
-  if ((result.failures.length > 0 || final.error) && code === 0) code = EXIT_ERROR;
+  for (const r of done) for (const note of r.notes) say(`${r.name} — ${note}`);
+  for (const r of done) for (const failure of r.failures) console.error(failure);
+  if (runs.some((r) => !r || r.failed) && code === 0) code = EXIT_ERROR;
   return code;
+}
+
+function traceAll(dir: string, filter: string | undefined, showPrompt: boolean): number {
+  const codes = [trace(dir, undefined, showPrompt)];
+  say("");
+  codes.push(traceAccess(dir, filter, showPrompt));
+  say("");
+  codes.push(traceXss(dir, showPrompt));
+  return Math.max(...codes);
 }
 
 /** Flags that take a value. */
@@ -692,11 +829,13 @@ async function main(argv: string[]): Promise<number> {
   const { positional, flags } = parseArgs(rest);
   const value = (name: string) => (typeof flags.get(name) === "string" ? (flags.get(name) as string) : undefined);
   const root = value("root");
-  const mode = value("mode") ?? "sqli";
+  // Without --mode a project directory gets every class; a single file (or --cross-file entry) can only be SQL.
+  const wholeProject = positional.length === 1 && isDirectory(positional[0]) && !flags.has("cross-file");
+  const mode = value("mode") ?? (wholeProject ? "all" : "sqli");
   const json = flags.has("json");
   if (json) say = (text) => console.error(text);
   const emptyValue = [...VALUE_FLAGS].some((f) => flags.get(f) === "");
-  if (positional.length === 1 && !emptyValue && (mode === "sqli" || mode === "access" || mode === "xss")) {
+  if (positional.length === 1 && !emptyValue && (mode === "sqli" || mode === "access" || mode === "xss" || mode === "all")) {
     const [target] = positional;
     if (command === "scan") {
       try {
@@ -705,6 +844,14 @@ async function main(argv: string[]): Promise<number> {
         console.error(`✗ ${err instanceof TargetError ? err.message : describeError(err, target)}`);
         return EXIT_ERROR;
       }
+    }
+    if (mode === "all") {
+      if (!isDirectory(target)) {
+        console.error("✗ --mode all scans a project directory; use --mode sqli (or no --mode) for a single file.");
+        return EXIT_ERROR;
+      }
+      if (command === "scan") return scanAll(target, value("route"), json);
+      if (command === "trace") return traceAll(target, value("route"), flags.has("show-prompt"));
     }
     if (mode === "access") {
       if (!isDirectory(target)) {

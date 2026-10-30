@@ -12,7 +12,7 @@
 // sinks count (`dangerouslySetInnerHTML`, `innerHTML`, …); a JSX text child is escaped by React and is listed as such.
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { Node, SyntaxKind, type CallExpression, type SourceFile, type VariableDeclaration } from "ts-morph";
+import { Node, SyntaxKind, type CallExpression, type Project, type SourceFile, type VariableDeclaration } from "ts-morph";
 import { discoverFiles } from "../crossfile/files.js";
 import {
   excerpt,
@@ -272,8 +272,8 @@ export class XssTracer extends Tracer {
   private walking?: { fn: Fn; req?: string };
   private readonly reaches = new Map<Fn, Reach>();
 
-  constructor(root: string, storedWrites?: Map<string, StoredWrite>) {
-    super(root);
+  constructor(root: string, storedWrites?: Map<string, StoredWrite>, project?: Project) {
+    super(root, project);
     this.storedWrites = storedWrites ?? new Map();
   }
 
@@ -973,11 +973,11 @@ function sortXss(paths: XssPath[]): XssPath[] {
  * finds which columns request input is written to; the second traces again with reads of those columns as sources,
  * then walks browser code with the server's JSON responses as sources.
  */
-export function traceXssProject(dir: string): XssTraceResult {
+export function traceXssProject(dir: string, project?: Project): XssTraceResult {
   const root = path.resolve(dir);
-  const writes = new XssTracer(root);
+  const writes = new XssTracer(root, undefined, project);
   traceProject(dir, writes);
-  const tracer = new XssTracer(root, writes.storedWrites);
+  const tracer = new XssTracer(root, writes.storedWrites, project);
   const trace = traceProject(dir, tracer);
   tracer.traceBrowser(discoverFiles(root).map((f) => tracer.load(f)));
   return { ...trace, xss: sortXss(tracer.xssPaths) };

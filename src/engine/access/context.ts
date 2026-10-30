@@ -3,7 +3,7 @@
 // evidence a reviewer needs: what the request identifies, what identity was available, how the data is scoped,
 // which checks exist on this route, and which sibling routes enforce the check.
 import path from "node:path";
-import { Node, SyntaxKind, type BinaryExpression, type CallExpression, type SourceFile } from "ts-morph";
+import { Node, SyntaxKind, type BinaryExpression, type Project, type CallExpression, type SourceFile } from "ts-morph";
 import { discoverFiles, discoverSqlFiles } from "../crossfile/files.js";
 import { excerpt, isFn, Tracer, type CandidatePath, type Fn, type FunctionRef, type Handler, type Hop } from "../crossfile/trace.js";
 import { columnForValue, describeStatement, evaluateSql, readSchema, type SchemaTable, type StatementVerb } from "./sql.js";
@@ -143,8 +143,8 @@ class AccessAnalyzer {
   private readonly mounts = new Map<SourceFile, Mount[]>();
   private schema: SchemaTable[] = [];
 
-  constructor(readonly root: string) {
-    this.tracer = new Tracer(root);
+  constructor(readonly root: string, project?: Project) {
+    this.tracer = new Tracer(root, project);
   }
 
   run(): AccessContext {
@@ -632,6 +632,6 @@ class AccessAnalyzer {
 }
 
 /** Stage 1 of access-control analysis over a project directory. */
-export function assembleAccessContext(dir: string): AccessContext {
-  return new AccessAnalyzer(path.resolve(dir)).run();
+export function assembleAccessContext(dir: string, project?: Project): AccessContext {
+  return new AccessAnalyzer(path.resolve(dir), project).run();
 }
