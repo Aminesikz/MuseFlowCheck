@@ -3,6 +3,7 @@
 // syntactically (no type checker) so every resolved edge — and every one that breaks — can be explained.
 import { existsSync, statSync } from "node:fs";
 import path from "node:path";
+import { evaluateSql } from "../access/sql.js";
 import { discoverFiles } from "./files.js";
 import {
   Node,
@@ -51,6 +52,8 @@ export interface CandidatePath {
   origin: string;
   /** The HTTP route this path's entry handler is registered on, e.g. "GET /api/barbers/search", when known. */
   route?: string;
+  /** The database package the SQL execution call belongs to (`pg`, `mysql2`, `better-sqlite3`, …), when it can be told from the code. */
+  driver?: string;
 }
 
 /** A tainted call into project code that the tracer could not follow — the place a trace breaks. */
@@ -136,6 +139,21 @@ export type Callee = Value | { kind: "sink" };
 const SOURCE_PROPS = new Set(["query", "params", "body"]);
 /** Methods that execute SQL when called on something that isn't a project function (pool.query, client.query, db.query, …). */
 const SINK_METHODS = new Set(["query", "execute"]);
+/**
+ * With every SQL driver in scope (SQL injection mode), more execute calls are sinks. Names that only ever run SQL are
+ * sinks as they are: `raw` and `…Raw` (knex.raw, whereRaw, orderByRaw), `unsafe` and `…Unsafe` (postgres.js
+ * sql.unsafe, Prisma $queryRawUnsafe / $executeRawUnsafe).
+ */
+const SQL_ONLY_METHOD = /^(?:raw|unsafe|\$?[A-Za-z]*(?:Raw|Unsafe))$/;
+/**
+ * Generic names that run SQL in some drivers and mean something else elsewhere (`regex.exec`, `map.get`,
+ * `Promise.all`, `router.get`): better-sqlite3 db.prepare(sql) and db.exec(sql); sqlite3 db.run / get / all / each;
+ * wrappers named query… / execute… (queryAsync, executeQuery). They are sinks only when their first argument is SQL
+ * text. Both lists are illustrative of the shape — a SQL string passed to a call that executes it — not exhaustive.
+ */
+const SQL_SHAPED_METHOD = /^(?:exec|prepare|run|get|all|each|batch|query[A-Z]\w*|execute[A-Z]\w*)$/;
+/** A statement keyword at the start of the SQL text (after any opening parenthesis). */
+const SQL_STATEMENT = /^[\s(]*(?:select|insert|update|delete|replace|merge|upsert|with|create|alter|drop|truncate|pragma|call|exec|execute|declare|begin|set|show|describe|explain|grant|revoke)\s/i;
 /** Router / app methods that register request handlers (Express, Koa router, and similar). */
 const ROUTE_METHODS = new Set(["get", "post", "put", "patch", "delete", "del", "all", "options", "head", "use"]);
 /** Parameter names conventionally bound to the request (Express `req`, Koa `ctx`). */
@@ -159,6 +177,20 @@ export function excerpt(node: Node, max = 140): string {
 }
 
 /** Strips wrappers that don't change what an expression refers to. */
+/** Packages of SQL drivers, query builders and ORMs, used to name the dialect of a sink — illustrative, not exhaustive. */
+const SQL_PACKAGES = /^(?:pg|pg-pool|pg-promise|postgres|slonik|@neondatabase\/serverless|@vercel\/postgres|mysql|mysql2|mariadb|better-sqlite3|sqlite3|sqlite|@libsql\/client|mssql|tedious|oracledb|knex|sequelize|typeorm|@prisma\/client|@mikro-orm\/\w+|kysely|drizzle-orm)$/;
+
+/** A module specifier's package: `mysql2/promise` → `mysql2`, `@scope/pkg/sub` → `@scope/pkg`. */
+export function packageName(spec: string): string {
+  const parts = spec.split("/");
+  return spec.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
+}
+
+/** Whether an argument is SQL text: its static text, as far as it can be read, starts with a statement keyword. */
+function isSqlText(arg: Node | undefined): boolean {
+  return arg !== undefined && SQL_STATEMENT.test(evaluateSql(unwrap(arg)));
+}
+
 export function unwrap(node: Node): Node {
   let n = node;
   while (
@@ -234,6 +266,11 @@ export function createProject(): Project {
   });
 }
 
+export interface TracerOptions {
+  /** Recognize the execute calls of every common SQL driver, not only `query`/`execute` (SQL injection mode). */
+  allSqlDrivers?: boolean;
+}
+
 export class Tracer {
   private readonly onStack = new Set<Fn>();
   /** Every function analyzed so far, from any entry point. */
@@ -256,6 +293,7 @@ export class Tracer {
   constructor(
     readonly root: string,
     private readonly project: Project = createProject(),
+    private readonly options: TracerOptions = {},
   ) {}
 
   load(file: string): SourceFile {
@@ -750,6 +788,7 @@ export class Tracer {
 
   protected recordSink(call: CallExpression, argTaints: Taint[][], ref: FunctionRef): void {
     const sinkHop = this.hop(call, "sink", ref);
+    const driver = this.options.allSqlDrivers ? this.sqlDriver(call) : undefined;
     const sqlText = argTaints[0]?.length > 0;
     const taints = sqlText ? argTaints[0] : argTaints.slice(1).flat();
     for (const t of taints) {
@@ -758,8 +797,38 @@ export class Tracer {
       const keys = [`${t.origin}->${sinkHop.file}:${sinkHop.line}`, hops.map((h) => `${h.kind}@${h.file}:${h.line}`).join(">")];
       if (keys.some((k) => this.pathKeys.has(k))) continue;
       keys.forEach((k) => this.pathKeys.add(k));
-      this.paths.push({ hops, sqlText, origin: t.origin, ...(this.currentRoute ? { route: this.currentRoute } : {}) });
+      this.paths.push({ hops, sqlText, origin: t.origin, ...(this.currentRoute ? { route: this.currentRoute } : {}), ...(driver ? { driver } : {}) });
     }
+  }
+
+  /**
+   * The database package behind a SQL execution call: the package its receiver resolves to (`new Pool()` from 'pg',
+   * also through the project module that exports it), else the single SQL package its file imports.
+   */
+  private sqlDriver(call: CallExpression): string | undefined {
+    const callee = unwrap(call.getExpression());
+    if (Node.isPropertyAccessExpression(callee) || Node.isElementAccessExpression(callee)) {
+      const receiver = this.resolveExpr(callee.getExpression());
+      const pkg = receiver.kind === "external" ? /^package '(.+)'$/.exec(receiver.what)?.[1] : undefined;
+      if (pkg) return packageName(pkg);
+    }
+    const imported = new Set(
+      call
+        .getSourceFile()
+        .getDescendants()
+        .flatMap((n) => {
+          if (Node.isImportDeclaration(n)) return [n.getModuleSpecifierValue()];
+          if (Node.isCallExpression(n) && n.getExpression().getText() === "require") {
+            const arg = n.getArguments()[0];
+            return arg && Node.isStringLiteral(arg) ? [arg.getLiteralValue()] : [];
+          }
+          return [];
+        })
+        .filter((spec) => !spec.startsWith(".") && !path.isAbsolute(spec))
+        .map(packageName)
+        .filter((pkg) => SQL_PACKAGES.test(pkg)),
+    );
+    return imported.size === 1 ? [...imported][0] : undefined;
   }
 
   // ---- call / value resolution --------------------------------------------------------------
@@ -779,6 +848,9 @@ export class Tracer {
       return this.member(target, name) ?? { kind: "unresolved", reason: this.missingReason(target, name) };
     }
     if (name && SINK_METHODS.has(name)) return { kind: "sink" };
+    if (name && this.options.allSqlDrivers && (SQL_ONLY_METHOD.test(name) || (SQL_SHAPED_METHOD.test(name) && isSqlText(call.getArguments()[0])))) {
+      return { kind: "sink" };
+    }
     if (target.kind === "function") {
       return { kind: "unresolved", reason: `indirect invocation '${excerpt(expr, 60)}' of project function ${this.fnName(target.fn)}` };
     }
@@ -1244,7 +1316,7 @@ function result(tracer: Tracer, entry: string, files: number, handlers: Handler[
 
 /** Traces request input from every handler in `entry` (or referenced by it) across files to SQL-executing calls. */
 export function traceEntry(entry: string, root = findProjectRoot(entry)): TraceResult {
-  const tracer = new Tracer(path.resolve(root));
+  const tracer = new Tracer(path.resolve(root), undefined, { allSqlDrivers: true });
   const sf = tracer.load(path.resolve(entry));
   const handlers = [...tracer.handlers(sf), ...tracer.referencedHandlers(sf)];
   analyzeAll(tracer, handlers);
@@ -1255,7 +1327,7 @@ export function traceEntry(entry: string, root = findProjectRoot(entry)): TraceR
  * Traces a whole project: loads every discovered source file under `dir`, finds the entry points across all of
  * them, and traces each with one shared tracer, so paths and unresolved edges are collected (and deduplicated) once.
  */
-export function traceProject(dir: string, tracer = new Tracer(path.resolve(dir))): TraceResult {
+export function traceProject(dir: string, tracer = new Tracer(path.resolve(dir), undefined, { allSqlDrivers: true })): TraceResult {
   const files = discoverFiles(tracer.root).map((f) => tracer.load(f));
   const registered = tracer.registeredHandlers(files);
   analyzeAll(tracer, registered);

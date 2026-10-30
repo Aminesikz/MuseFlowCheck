@@ -7,7 +7,7 @@ import { buildSqliPrompt, numberLines } from "../src/engine/prompt.js";
 const instructions = buildSqliPrompt("PLACEHOLDER", "").split("FILE: PLACEHOLDER")[0];
 
 /** Library/framework names the prompt is meant to mention; they're conventional, not fixture-specific. */
-const LIBRARY_NAMES = new Set(["express", "sequelize", "knex", "mysql", "Database", "Sequelize", "QueryTypes"]);
+const LIBRARY_NAMES = new Set(["express", "sequelize", "knex", "mysql", "sqlite3", "Database", "Sequelize", "QueryTypes"]);
 
 /** Distinctive identifiers (paths, string literals, variable names) from every file we scan in testing. */
 function identifiersFrom(dir: string): string[] {

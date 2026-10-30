@@ -390,7 +390,7 @@ async function runSqli(dir: string, shared: SharedRun = {}): Promise<ClassRun | 
   if (!shared.titled) say(c.bold(`Scanning project ${dir} for SQL injection...\n`));
   let trace: TraceResult;
   try {
-    trace = traceProject(dir, new Tracer(path.resolve(dir), shared.project));
+    trace = traceProject(dir, new Tracer(path.resolve(dir), shared.project, { allSqlDrivers: true }));
   } catch (err) {
     reportError(err, dir);
     return undefined;

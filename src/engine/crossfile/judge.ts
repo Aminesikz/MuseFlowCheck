@@ -3,7 +3,7 @@
 import { complete } from "../../llm/meta-client.js";
 import type { Finding } from "../../types/index.js";
 import { extractJsonArray, FindingParseError, validateJudgment } from "../parse.js";
-import { SAFE_PATTERNS, SEVERITY_GUIDE } from "../prompt.js";
+import { BINDING_GUIDE, bindingStyle, SAFE_PATTERNS, SEVERITY_GUIDE } from "../prompt.js";
 import type { CandidatePath, FunctionRef, Hop } from "./trace.js";
 
 /** Most paths shown to the model for one sink; the rest are counted in the prompt, keeping prompt size bounded. */
@@ -58,6 +58,15 @@ export function codeSlice(fn: FunctionRef): string {
   return `=== ${fn.file} — ${fn.name} (lines ${fn.startLine}–${fn.endLine}) ===\n${numbered.join("\n")}`;
 }
 
+/** The database library of the SQL call, as Stage 1 read it from the code, and how the patch must bind values. */
+function libraryNote(group: SinkGroup): string {
+  const driver = group.paths.find((p) => p.driver)?.driver;
+  const style = bindingStyle(driver);
+  if (driver && style) return `DATABASE LIBRARY (read from the code of the SQL call): ${driver}. ${style}. The suggestedPatch must use exactly this binding style.`;
+  if (driver) return `DATABASE LIBRARY (read from the code of the SQL call): ${driver}. The suggestedPatch must use ${driver}'s own parameter binding.\n${BINDING_GUIDE}`;
+  return `DATABASE LIBRARY: not identified from the code — infer it from the code shown.\n${BINDING_GUIDE}`;
+}
+
 export function buildJudgePrompt(group: SinkGroup): string {
   const paths = group.paths
     .map((p, i) => `Path ${i + 1}:\n${p.hops.map((h, n) => `  ${n + 1}. [${h.kind}] ${formatHop(h)}`).join("\n")}`)
@@ -79,6 +88,8 @@ ${functionsOn(group).map(codeSlice).join("\n\n")}
 ${SEVERITY_GUIDE}
 Middleware and route registration are not shown. If the handler reads an authenticated-user object (e.g. req.user, ctx.state.user), assume the route requires login; otherwise assume it may be reachable without authentication. State that assumption in the explanation. It only affects the "without authentication" condition of rule 1 — it never lowers severity when the data-scope condition of rule 1 matches.
 
+${libraryNote(group)}
+
 OUTPUT
 Return ONLY a JSON array — no prose, no markdown fences.
 - [] if no path is exploitable.
@@ -89,7 +100,7 @@ Return ONLY a JSON array — no prose, no markdown fences.
   "severity": "critical" | "high" | "medium" | "low",
   "path": number,            // the "Path N" number above that most clearly demonstrates the injection
   "explanation": string,     // plain language: why it is exploitable across these files, what an attacker could do; mention any other exploitable paths into the same call
-  "suggestedPatch": string   // corrected code for the function containing the SQL execution, using the same library's parameter binding, multi-line and formatted like the original
+  "suggestedPatch": string   // corrected code for the function containing the SQL execution, using the DATABASE LIBRARY's parameter binding above, multi-line and formatted like the original
 }
 Do not include file, line, or taintPath fields — the tool fills those in from the traced path.`;
 }
