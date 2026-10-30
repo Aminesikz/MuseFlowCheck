@@ -13,15 +13,44 @@ cp .env.example .env   # then paste your META_API_KEY into .env
 npm install
 npm run smoke          # check API access
 npm run build
-node dist/cli.js scan path/to/project          # whole project
+node dist/cli.js scan path/to/project          # whole project: SQL injection, access control and XSS in one pass
 node dist/cli.js scan path/to/project --json   # findings as a JSON Finding[] on stdout
 ```
 
-`flowcheck scan` exits `0` when there are no high/critical findings, `1` when there are, and `2` on errors (including a sink the model could not judge).
+`flowcheck scan <dir>` runs every vulnerability class by default and reports one merged result; `--mode sqli`, `--mode access` or `--mode xss` narrows it to one. It exits `0` when there are no high/critical findings, `1` when there are, and `2` on errors (including a sink the model could not judge).
 
-### Project scan
+### Configuration
 
-`flowcheck scan <dir>` runs in two stages:
+Settings you would otherwise repeat on every command — the verification target, its token, and the token's identity — can live in a `museflowcheck.config.json`:
+
+```bash
+cp museflowcheck.config.example.json museflowcheck.config.json   # then fill in target, token, identity
+node dist/cli.js scan ../MetaVulnSite/server                     # full combined scan, verified against the configured target
+```
+
+```json
+{
+  "target": "http://localhost:4000",
+  "token": "<a seeded low-privilege tenant token>",
+  "identity": "it belongs to shop 1"
+}
+```
+
+- **Where it is read from:** the scanned directory, then its project root (the nearest `package.json`), then the current directory. The first file found is used.
+- **Keys:** `target`, `token`, `identity`, `mode`, `probeRange`, `loginPath`, `loginBody`, `tokenField`, `browserPath`, `xssClient`, `xssTokenStore`, `startCmd`, `readyPath` — each means the same as its flag. An unknown key is an error, so a typo never silently drops a setting.
+- **Environment variables:** every key also has a `MUSEFLOWCHECK_<NAME>` variable — `MUSEFLOWCHECK_TARGET`, `MUSEFLOWCHECK_TOKEN`, `MUSEFLOWCHECK_IDENTITY`, `MUSEFLOWCHECK_PROBE_RANGE`, …
+- **Precedence:** a flag on the command line wins over the environment, which wins over the file. A `--login-path` given at a higher level replaces a token from a lower one.
+- **Secrets:** `museflowcheck.config.json` is gitignored because it holds a token; only the `.example` file is committed. The token is never printed: the scan names which settings came from the file or the environment, never their values, and any occurrence of the token in the human output is shown as `[token]`.
+
+### Output
+
+On a terminal, each finding is a card: a color-coded severity badge (`[CRITICAL]` red, `[HIGH]` yellow, `[MEDIUM]` blue, `[LOW]` dim), the type and CWE, and `✓ exploit confirmed` when verification proved it. Under it come the route and `source file:line → sink file:line`, the taint path hop by hop, **Why** it is exploitable, the **Proof** (what the exploit demonstrated, when confirmed), and the suggested **Fix** as a code block. A summary closes the report, with counts per class, per severity and per confidence.
+
+Color is used only on a terminal. It is off when output is piped, with `--json`, when `NO_COLOR` is set, or with `--no-color` (`FORCE_COLOR=1` turns it on anyway); without color every status is still a label or symbol. `--json` is the machine interface: stdout carries only the `Finding[]`, unchanged by any of the above, while progress and the summary go to stderr.
+
+### SQL injection (project scan)
+
+`flowcheck scan <dir> --mode sqli` runs in two stages:
 
 1. **Discover files and entry points.** Flowcheck loads every JS/TS source file under the directory. It honors `.gitignore` and skips `node_modules`, build output (`dist`, `build`, `coverage`, …) and tests (`test/`, `__tests__/`, `*.test.*`, `*.spec.*`). Entry points are:
    - functions registered on a router or app (`router.get('/x', fn)`, `app.use(mw)`, `router.post('/x', ctrl.save)`), including `bind(...)`, wrappers such as `asyncHandler(fn)`, and arrays of handlers;

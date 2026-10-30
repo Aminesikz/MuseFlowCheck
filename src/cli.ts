@@ -45,8 +45,10 @@ import {
 import { existsSync as fileExists } from "node:fs";
 import { startPatchedServer } from "./engine/verify/server.js";
 import { buildXssPrompt, groupXssBySink, judgeXss, traceXssProject, type XssPath, type XssTraceResult } from "./engine/xss/index.js";
+import { CONFIG_FILE, ConfigError, envVar, layeredValues, loadConfig, sourcedSettings } from "./config.js";
 import { complete } from "./llm/meta-client.js";
 import { describeApiError, loadDotEnv } from "./llm/errors.js";
+import { colorEnabled, findingCard, makeColors, paintSeverity, reportWidth, rule, severityCounts, type Colors } from "./report.js";
 import { CONFIDENCES, SEVERITIES, type Confidence, type Finding, type Verification } from "./types/index.js";
 
 const VERSION = "0.0.0";
@@ -80,6 +82,7 @@ Usage:
   --mode    all (default for a directory), sqli (default for a file), access, or xss
   --route   only judge (or show prompts for) routes whose "METHOD /path" contains <text>
   --json    print the findings as a JSON Finding[] on stdout (progress and summary go to stderr)
+  --no-color  plain text even on a terminal (color is also off when piped, with --json, or when NO_COLOR is set)
 
 Verification (optional; proves findings by executing them against a target you run):
   --target <url>        a LOCAL target to verify against (localhost / 127.0.0.1 / ::1 / *.localhost / *.test only);
@@ -99,6 +102,11 @@ XSS execution proof (optional; proves XSS findings by executing a payload in a h
   --xss-client <url>    LOCAL base URL of the client app, for findings whose sink renders in browser code (e.g. React)
   --xss-token-store <s> how the client app reads its token: "localStorage:<key>", "sessionStorage:<key>" or "window:<path>"
 
+Settings: any of target, token, identity, mode, probeRange, loginPath, loginBody, tokenField, browserPath, xssClient,
+xssTokenStore, startCmd, readyPath can live in museflowcheck.config.json (in the scanned project or the current
+directory) or in MUSEFLOWCHECK_<NAME> environment variables (e.g. MUSEFLOWCHECK_TOKEN). A command-line flag wins
+over the environment, which wins over the file. See museflowcheck.config.example.json.
+
 Exit codes: 0 no high/critical findings, 1 high/critical finding(s), 2 error`;
 
 const EXIT_GATE = 1;
@@ -106,6 +114,9 @@ const EXIT_ERROR = 2;
 
 /** Human-readable output: stdout normally, stderr when stdout is reserved for --json. */
 let say: (text: string) => void = (text) => console.log(text);
+/** Colors for human output (all no-ops when color is off), and the width cards and rules are laid out to. */
+let c: Colors = makeColors(false);
+let width = reportWidth(undefined);
 
 /** When a target is configured, findings are proved against it after analysis. */
 interface VerifyRuntime {
@@ -132,45 +143,11 @@ function findChrome(flag: string | undefined): string | undefined {
   return CHROME_CANDIDATES.find((p) => fileExists(p));
 }
 
-function indent(text: string, prefix = "    "): string {
-  return text
-    .split("\n")
-    .map((line) => prefix + line)
-    .join("\n");
-}
-
-function formatEvidence(label: string, e: NonNullable<Verification["baseline"]>): string {
-  return `    ${label}: ${e.method} ${e.path} → ${e.status}\n      response: ${e.responseExcerpt}`;
-}
-
-function formatVerification(v: Verification): string[] {
-  const lines = [`  Verification (${v.outcome}):`, indent(v.summary)];
-  if (v.baseline) lines.push(formatEvidence("baseline", v.baseline));
-  if (v.exploit) lines.push(formatEvidence("exploit ", v.exploit));
-  if (v.patchProof) lines.push(`  Patch proof (${v.patchProof.outcome}):`, indent(v.patchProof.summary));
-  return lines;
-}
-
-function formatFinding(f: Finding, n: number): string {
-  return [
-    `[${n}] ${f.type} — ${f.severity.toUpperCase()} — ${f.cwe} (${f.confidence})`,
-    `  Source: ${f.file}:${f.sourceLine}`,
-    `  Sink:   ${f.sinkFile ?? f.file}:${f.sinkLine}`,
-    `  Taint path:`,
-    ...f.taintPath.map((hop) => `    → ${hop}`),
-    `  Why it's exploitable:`,
-    indent(f.explanation),
-    `  Suggested patch:`,
-    indent(f.suggestedPatch),
-    ...(f.verification ? formatVerification(f.verification) : []),
-  ].join("\n");
-}
-
 /** Counts by confidence, for the summary line when verification ran (e.g. "2 confirmed, 1 unverified"). */
 function confidenceBreakdown(findings: Finding[]): string {
   return CONFIDENCES.map((c) => [c, findings.filter((f) => f.confidence === c).length] as const)
     .filter(([, n]) => n > 0)
-    .map(([c, n]) => `${n} ${c}`)
+    .map(([conf, n]) => (conf === "confirmed" ? c.green(`${n} ${conf}`) : `${n} ${conf}`))
     .join(", ");
 }
 
@@ -180,7 +157,7 @@ function confidenceBreakdown(findings: Finding[]): string {
  */
 async function finalizeFindings(findings: Finding[], label: string, shared?: XssBrowserSession): Promise<{ findings: Finding[]; error?: boolean }> {
   if (!verify || findings.length === 0) return { findings };
-  say(`\nVerification — proving ${findings.length} finding(s) against ${verify.target.base} ...\n`);
+  say(`\n${c.bold("Verification")} — proving ${findings.length} finding(s) against ${verify.target.base} ...\n`);
   const browser = shared ?? new XssBrowserSession(); // a combined run shares one browser; a single class owns its own
   try {
     await browser.attach(findings);
@@ -235,7 +212,7 @@ async function openXssBrowser(): Promise<ExecBrowser | undefined> {
     }
     const browser = await ExecBrowser.launch({ executablePath: browserPath }, auth);
     verify.deps.xss = { browser, clientBase };
-    say(`  XSS execution proof: headless browser ready (${browserPath}).\n`);
+    say(c.dim(`  XSS execution proof: headless browser ready (${browserPath}).\n`));
     return browser;
   } catch (err) {
     const why = err instanceof BrowserError ? err.message : (err as Error).message;
@@ -276,7 +253,8 @@ function formatTrace(trace: TraceResult): string {
 
 function formatUnresolved(trace: TraceResult): string {
   const lines = trace.unresolved.map((u) => `  ${u.file}:${u.line}  ${u.call} — ${u.reason}`);
-  return [`Unresolved calls (where a trace broke): ${trace.unresolved.length || "none"}`, ...lines].join("\n");
+  const head = `Unresolved calls (where a trace broke): ${trace.unresolved.length || "none"}`;
+  return [lines.length > 0 ? c.yellow(head) : c.dim(head), ...lines].join("\n");
 }
 
 function describeError(err: unknown, file: string): string {
@@ -301,14 +279,17 @@ function gatedCount(findings: Finding[]): number {
 /** Prints findings (or emits them as JSON) and returns the CI-gate exit code. */
 function emitFindings(findings: Finding[], json: boolean): number {
   if (json) console.log(JSON.stringify(findings, null, 2));
-  else findings.forEach((f, i) => say(formatFinding(f, i + 1) + "\n"));
+  else if (findings.length > 0) {
+    say(`\n${rule(c, width, `Findings (${findings.length})`)}\n`);
+    findings.forEach((f, i) => say(findingCard(c, f, i + 1, findings.length, width) + "\n"));
+  }
   return gatedCount(findings) > 0 ? EXIT_GATE : 0;
 }
 
 
 async function scan(file: string, json: boolean): Promise<number> {
   loadDotEnv();
-  say(`Scanning ${file} for SQL injection...\n`);
+  say(c.bold(`Scanning ${file} for SQL injection...\n`));
   let findings: Finding[];
   try {
     findings = await analyzeFile(file);
@@ -325,7 +306,8 @@ async function scan(file: string, json: boolean): Promise<number> {
 function summaryLine(findings: Finding[]): string {
   const verified = findings.some((f) => f.confidence !== "suspected");
   const conf = verified ? ` (${confidenceBreakdown(findings)})` : "";
-  return `Summary: ${findings.length} finding(s), ${gatedCount(findings)} high/critical${conf}.`;
+  const gated = `${gatedCount(findings)} high/critical`;
+  return `${c.bold("Summary:")} ${findings.length} finding(s), ${gatedCount(findings) > 0 ? c.bold(c.red(gated)) : gated}${conf}.`;
 }
 
 /** Stage 2 for a finished SQL trace, then verification; shared by single-entry and project scans. */
@@ -335,7 +317,7 @@ async function judgeSqli(trace: TraceResult, label: string, browser?: XssBrowser
   if (groups.length === 0) {
     say("Stage 1 found no candidate path into SQL text — nothing sent to the model (no single-file fallback).\n");
   } else {
-    say(`Stage 2 — asking the model to judge ${groups.length} SQL execution call(s)...\n`);
+    say(`${c.bold("Stage 2")} — asking the model to judge ${groups.length} SQL execution call(s)...\n`);
     result = await judgeTrace(trace);
   }
   const judged = [...result.findings].sort(bySeverity);
@@ -344,7 +326,7 @@ async function judgeSqli(trace: TraceResult, label: string, browser?: XssBrowser
 
 async function scanCrossFile(entry: string, root: string | undefined, json: boolean): Promise<number> {
   loadDotEnv();
-  say(`Cross-file scan of ${entry} for SQL injection...\n`);
+  say(c.bold(`Cross-file scan of ${entry} for SQL injection...\n`));
   let trace: TraceResult;
   try {
     trace = traceEntry(entry, root);
@@ -384,10 +366,8 @@ interface ClassRun {
 interface SharedRun {
   project?: Project;
   browser?: XssBrowserSession;
-}
-
-function severityCounts(findings: Finding[]): string {
-  return SEVERITIES.map((s) => `${s} ${findings.filter((f) => f.severity === s).length}`).join(", ");
+  /** Set by a combined run, which titles each class's section itself. */
+  titled?: boolean;
 }
 
 function confidenceRow(findings: Finding[]): string[] {
@@ -398,8 +378,8 @@ function confidenceRow(findings: Finding[]): string[] {
 function reportClass(run: ClassRun | undefined, json: boolean): number {
   if (!run) return EXIT_ERROR; // Stage 1 failed; already reported
   const { findings } = run;
-  say(["Summary", ...run.before, `  Findings:       ${findings.length} — ${severityCounts(findings)}`, ...confidenceRow(findings), ...run.after, ""].join("\n"));
   let code = emitFindings(findings, json);
+  say([rule(c, width, "Summary"), ...run.before, `  Findings:       ${findings.length} — ${severityCounts(c, findings)}`, ...confidenceRow(findings), ...run.after, ""].join("\n"));
   for (const note of run.notes) say(note);
   for (const failure of run.failures) console.error(failure);
   if (run.failed && code === 0) code = EXIT_ERROR;
@@ -407,7 +387,7 @@ function reportClass(run: ClassRun | undefined, json: boolean): number {
 }
 
 async function runSqli(dir: string, shared: SharedRun = {}): Promise<ClassRun | undefined> {
-  say(`Scanning project ${dir} for SQL injection...\n`);
+  if (!shared.titled) say(c.bold(`Scanning project ${dir} for SQL injection...\n`));
   let trace: TraceResult;
   try {
     trace = traceProject(dir, new Tracer(path.resolve(dir), shared.project));
@@ -419,9 +399,9 @@ async function runSqli(dir: string, shared: SharedRun = {}): Promise<ClassRun | 
   const bound = trace.paths.length - sqlText;
   say(
     [
-      `Stage 1 — ${trace.files} file(s), ${trace.handlers} entry point(s) (${readingInput(trace)} read request input)`,
+      `${c.bold("Stage 1")} — ${trace.files} file(s), ${trace.handlers} entry point(s) (${readingInput(trace)} read request input)`,
       `  ${sqlText} candidate path(s) into SQL text; ${bound} reach SQL only as bound parameters`,
-      `  Run \`flowcheck trace ${dir}\` for every entry point and hop.`,
+      c.dim(`  Run \`flowcheck trace ${dir}\` for every entry point and hop.`),
       "",
     ].join("\n"),
   );
@@ -523,7 +503,7 @@ function traceAccess(dir: string, filter: string | undefined, showPrompt: boolea
 }
 
 async function runAccess(dir: string, filter: string | undefined, shared: SharedRun = {}): Promise<ClassRun | undefined> {
-  say(`Scanning project ${dir} for broken access control / IDOR...\n`);
+  if (!shared.titled) say(c.bold(`Scanning project ${dir} for broken access control / IDOR...\n`));
   let ctx: AccessContext;
   try {
     ctx = assembleAccessContext(dir, shared.project);
@@ -534,12 +514,12 @@ async function runAccess(dir: string, filter: string | undefined, shared: Shared
   const toJudge = candidates(ctx, filter);
   say(
     [
-      `Stage 1 — ${ctx.files} file(s); ${accessCounts(ctx)}`,
-      ...ctx.routes.filter((r) => r.status === "guarded").map((r) => `  guarded (not sent): ${routeLabel(r)} — ${r.guards[0].kind} at ${r.guards[0].file}:${r.guards[0].line}`),
-      `  Run \`flowcheck trace ${dir} --mode access\` for the evidence on every route.`,
+      `${c.bold("Stage 1")} — ${ctx.files} file(s); ${accessCounts(ctx)}`,
+      ...ctx.routes.filter((r) => r.status === "guarded").map((r) => c.dim(`  guarded (not sent): ${routeLabel(r)} — ${r.guards[0].kind} at ${r.guards[0].file}:${r.guards[0].line}`)),
+      c.dim(`  Run \`flowcheck trace ${dir} --mode access\` for the evidence on every route.`),
       "",
       toJudge.length > 0
-        ? `Stage 2 — asking the model to judge ${toJudge.length} route(s)${filter ? ` matching "${filter}"` : ""}...\n`
+        ? `${c.bold("Stage 2")} — asking the model to judge ${toJudge.length} route(s)${filter ? ` matching "${filter}"` : ""}...\n`
         : "Stage 1 found no unchecked candidate route — nothing sent to the model.\n",
     ].join("\n"),
   );
@@ -558,7 +538,7 @@ async function runAccess(dir: string, filter: string | undefined, shared: Shared
     ],
     after: [],
     brief: `${ctx.routes.length} route(s), ${guarded} guarded; ${result.calls} judged, ${result.cleared.length} judged not vulnerable`,
-    notes: result.cleared.map((r) => `Judged not vulnerable: ${routeLabel(r)}`),
+    notes: result.cleared.map((r) => c.dim(`Judged not vulnerable: ${routeLabel(r)}`)),
     failures: result.failures.map((f) => `✗ Judging ${f.route} failed: ${describeError(f.error, dir)}`),
     failed: result.failures.length > 0 || final.error === true,
   };
@@ -624,7 +604,7 @@ function traceXss(dir: string, showPrompt: boolean): number {
 }
 
 async function runXss(dir: string, shared: SharedRun = {}): Promise<ClassRun | undefined> {
-  say(`Scanning project ${dir} for cross-site scripting...\n`);
+  if (!shared.titled) say(c.bold(`Scanning project ${dir} for cross-site scripting...\n`));
   let trace: XssTraceResult;
   try {
     trace = traceXssProject(dir, shared.project);
@@ -636,13 +616,13 @@ async function runXss(dir: string, shared: SharedRun = {}): Promise<ClassRun | u
   const encoded = trace.xss.filter((p) => p.encoded);
   say(
     [
-      `Stage 1 — ${trace.files} file(s), ${trace.handlers} entry point(s) (${readingInput(trace)} read request input)`,
+      `${c.bold("Stage 1")} — ${trace.files} file(s), ${trace.handlers} entry point(s) (${readingInput(trace)} read request input)`,
       `  ${trace.xss.length - encoded.length} candidate path(s) into HTML output without encoding (${trace.xss.filter((p) => !p.encoded && p.stored).length} stored); ${encoded.length} reach output only encoded or escaped`,
-      ...encoded.map((p) => `  ${p.context === "jsx-text" ? "escaped" : "encoded"} (not sent): ${formatHop(p.hops.at(-1)!)} — ${p.context === "jsx-text" ? "" : "by "}${p.encoder ?? "an encoding step"}`),
-      `  Run \`flowcheck trace ${dir} --mode xss\` for every entry point and hop.`,
+      ...encoded.map((p) => c.dim(`  ${p.context === "jsx-text" ? "escaped" : "encoded"} (not sent): ${formatHop(p.hops.at(-1)!)} — ${p.context === "jsx-text" ? "" : "by "}${p.encoder ?? "an encoding step"}`)),
+      c.dim(`  Run \`flowcheck trace ${dir} --mode xss\` for every entry point and hop.`),
       "",
       groups.length > 0
-        ? `Stage 2 — asking the model to judge ${groups.length} HTML output(s)...\n`
+        ? `${c.bold("Stage 2")} — asking the model to judge ${groups.length} HTML output(s)...\n`
         : "Stage 1 found no request input reaching HTML output without encoding — nothing sent to the model.\n",
     ].join("\n"),
   );
@@ -681,12 +661,18 @@ async function scanXss(dir: string, json: boolean): Promise<number> {
  */
 async function scanAll(dir: string, filter: string | undefined, json: boolean): Promise<number> {
   loadDotEnv();
-  say(`Scanning project ${dir} for SQL injection, broken access control / IDOR and cross-site scripting...\n`);
-  const shared: SharedRun = { project: createProject(), browser: new XssBrowserSession() };
+  say(c.bold(`Scanning project ${dir} for SQL injection, broken access control / IDOR and cross-site scripting...\n`));
+  const shared: SharedRun = { project: createProject(), browser: new XssBrowserSession(), titled: true };
   const names = ["SQL injection", "Access control", "XSS"];
-  let runs: (ClassRun | undefined)[];
+  const section = (i: number) => say(`${rule(c, width, `${i + 1}/3  ${names[i]}`)}\n`);
+  let runs: (ClassRun | undefined)[] = [];
   try {
-    runs = [await runSqli(dir, shared), await runAccess(dir, filter, shared), await runXss(dir, shared)];
+    section(0);
+    runs.push(await runSqli(dir, shared));
+    section(1);
+    runs.push(await runAccess(dir, filter, shared));
+    section(2);
+    runs.push(await runXss(dir, shared));
   } finally {
     await shared.browser!.close();
   }
@@ -696,20 +682,20 @@ async function scanAll(dir: string, filter: string | undefined, json: boolean): 
     const label = `  ${`${names[i]}:`.padEnd(16)}`;
     if (!r) return `${label}not scanned (Stage 1 failed)`;
     const bySev = SEVERITIES.map((s) => [s, r.findings.filter((f) => f.severity === s).length] as const).filter(([, n]) => n > 0);
-    const sev = bySev.length > 0 ? ` (${bySev.map(([s, n]) => `${s} ${n}`).join(", ")})` : "";
+    const sev = bySev.length > 0 ? ` (${bySev.map(([s, n]) => paintSeverity(c, s, `${s} ${n}`)).join(", ")})` : "";
     return `${label}${r.findings.length} finding(s)${sev} — ${r.brief}`;
   });
+  let code = emitFindings(findings, json);
   say(
     [
-      "Summary",
+      rule(c, width, "Summary"),
       `  Files scanned:  ${Math.max(0, ...done.map((r) => r.files))}`,
       ...perClass,
-      `  Findings:       ${findings.length} — ${severityCounts(findings)}`,
+      `  Findings:       ${findings.length} — ${severityCounts(c, findings)}`,
       ...confidenceRow(findings),
       "",
     ].join("\n"),
   );
-  let code = emitFindings(findings, json);
   for (const r of done) for (const note of r.notes) say(`${r.name} — ${note}`);
   for (const r of done) for (const failure of r.failures) console.error(failure);
   if (runs.some((r) => !r || r.failed) && code === 0) code = EXIT_ERROR;
@@ -827,13 +813,36 @@ async function main(argv: string[]): Promise<number> {
   }
 
   const { positional, flags } = parseArgs(rest);
-  const value = (name: string) => (typeof flags.get(name) === "string" ? (flags.get(name) as string) : undefined);
+  // Settings: a flag on the command line, else MUSEFLOWCHECK_* in the environment, else museflowcheck.config.json
+  // (looked for in the scanned directory, its project root, then the current directory).
+  let config: ReturnType<typeof loadConfig>;
+  try {
+    const scanned = positional[0] === undefined ? undefined : isDirectory(positional[0]) ? positional[0] : path.dirname(positional[0]);
+    config = loadConfig(scanned === undefined ? ["."] : [scanned, findProjectRoot(path.join(scanned, CONFIG_FILE)), "."]);
+  } catch (err) {
+    console.error(`✗ ${err instanceof ConfigError ? err.message : (err as Error).message}`);
+    return EXIT_ERROR;
+  }
+  const value = layeredValues(flags, process.env, config.values);
   const root = value("root");
   // Without --mode a project directory gets every class; a single file (or --cross-file entry) can only be SQL.
   const wholeProject = positional.length === 1 && isDirectory(positional[0]) && !flags.has("cross-file");
   const mode = value("mode") ?? (wholeProject ? "all" : "sqli");
   const json = flags.has("json");
-  if (json) say = (text) => console.error(text);
+  const out = json ? (text: string) => console.error(text) : (text: string) => console.log(text);
+  // The token never appears in human output, whichever source it came from (the --json data is left untouched).
+  const secret = value("token");
+  say = secret && secret.length >= 4 ? (text) => out(text.split(secret).join("[token]")) : out;
+  c = makeColors(colorEnabled({ json, noColorFlag: flags.has("no-color"), env: process.env, isTTY: process.stdout.isTTY === true }));
+  width = reportWidth(process.stdout.columns);
+  if (command === "scan") {
+    const from = sourcedSettings(flags, process.env, config.values);
+    const parts = [
+      ...(from.config.length > 0 ? [`${from.config.join(", ")} from ${path.relative(".", config.file!) || CONFIG_FILE}`] : []),
+      ...(from.env.length > 0 ? [`${from.env.map(envVar).join(", ")} from the environment`] : []),
+    ];
+    if (parts.length > 0) say(c.dim(`Settings: ${parts.join("; ")}\n`));
+  }
   const emptyValue = [...VALUE_FLAGS].some((f) => flags.get(f) === "");
   if (positional.length === 1 && !emptyValue && (mode === "sqli" || mode === "access" || mode === "xss" || mode === "all")) {
     const [target] = positional;

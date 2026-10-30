@@ -23,6 +23,7 @@
   "dependencies": {
     "ignore": "^7.0.14",
     "openai": "^7.44.0",
+    "picocolors": "^1.1.1",
     "ts-morph": "^28.0.0"
   },
   "devDependencies": {

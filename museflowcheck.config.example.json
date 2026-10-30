@@ -1,0 +1,12 @@
+{
+  "//": "Copy to museflowcheck.config.json (gitignored: it holds a token) in the scanned project or the directory you run from. Every key is optional; a command-line flag always wins, then MUSEFLOWCHECK_<NAME> environment variables, then this file.",
+
+  "target": "http://localhost:4000",
+  "token": "<a seeded low-privilege tenant token>",
+  "identity": "it belongs to shop 1",
+
+  "mode": "all",
+  "probeRange": 20,
+
+  "browserPath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+}

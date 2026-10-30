@@ -3,7 +3,7 @@
 // generic high finding back. The single-class modes are the reference the combined run must reproduce.
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cpSync, mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -67,8 +67,7 @@ test("scan <dir> without --mode runs all three classes: one merged Finding[], on
   assert.deepEqual(merged, parts.flat().sort(bySeverity));
   assert.equal(all.code, 1, "a high finding in any class gates the whole run");
 
-  assert.match(all.stderr, /^Summary$/m);
-  assert.equal(all.stderr.match(/^Summary$/gm)!.length, 1, "one summary for the run");
+  assert.equal(all.stderr.match(/^── Summary ─/gm)?.length, 1, "one summary for the run");
   assert.match(all.stderr, new RegExp(`^  SQL injection: {2}${parts[0].length} finding\\(s\\) \\(high ${parts[0].length}\\)`, "m"));
   assert.match(all.stderr, new RegExp(`^  Access control: ${parts[1].length} finding\\(s\\)`, "m"));
   assert.match(all.stderr, new RegExp(`^  XSS: {12}${parts[2].length} finding\\(s\\)`, "m"));
@@ -86,4 +85,32 @@ test("--mode all is the directory default; a single file still defaults to SQL; 
   assert.match(file.stderr, /^Scanning .*search\.js for SQL injection\.\.\./m);
   assert.equal(allOnFile.code, 2);
   assert.match(allOnFile.stderr, /--mode all scans a project directory/);
+});
+
+test("museflowcheck.config.json supplies settings, a flag overrides them, and the token is never printed", async () => {
+  const token = "supersecret-token-xyz";
+  const config = path.join(tmp, "museflowcheck.config.json"); // in the directory the CLI runs from
+  writeFileSync(config, JSON.stringify({ mode: "sqli", token }));
+  try {
+    const [fromConfig, flagged, human, reference, xss] = await Promise.all([
+      run("scan", project, "--json"),
+      run("scan", project, "--mode", "xss", "--json"),
+      run("scan", project),
+      run("scan", project, "--mode", "sqli", "--json"),
+      run("scan", project, "--mode", "xss", "--json", "--no-color"),
+    ]);
+    assert.equal(fromConfig.stdout, reference.stdout, "mode from the config file");
+    assert.equal(flagged.stdout, xss.stdout, "--mode on the command line wins over the file");
+    assert.match(fromConfig.stderr, /^Settings: mode, token from museflowcheck\.config\.json$/m);
+    for (const r of [fromConfig, flagged, human]) assert.ok(!(r.stdout + r.stderr).includes(token), "the token value is never printed");
+
+    // Piped human output: plain text, with each finding as a card.
+    assert.doesNotMatch(human.stdout, /\x1b\[/);
+    assert.match(human.stdout, /^── Findings \(\d+\) ─/m);
+    assert.match(human.stdout, /^1\/\d+ {2}\[HIGH\] {2}Fake finding · CWE-0 +suspected$/m);
+    assert.match(human.stdout, /^ {2}Fix — suggested patch\n {4}│ p$/m); // a patch naming no function: no file guessed
+    assert.equal(human.code, fromConfig.code);
+  } finally {
+    rmSync(config);
+  }
 });

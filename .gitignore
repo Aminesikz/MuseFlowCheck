@@ -26,6 +26,8 @@ id_ed25519*
 *.secret
 secrets.json
 *credentials*.json
+# Scan settings hold a target token; only the .example version is committed
+museflowcheck.config.json
 service-account*.json
 
 # OS / editor
