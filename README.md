@@ -168,6 +168,22 @@ Instead of `--token`, you can pass `--login-path /api/auth/login --login-body '{
 
 With `--verify-patch`, a confirmed finding's `suggestedPatch` is applied to a throwaway copy of the project (the original is never touched), the copy is started (`--start-cmd`, default `npm start`), and the exact PoC is re-run: the patch is `blocked` only if the exploit now fails **and** the benign request returns the same response as before the patch (same status, same body). If the exploit fails but the benign response changed, the patch is reported as `breaks-route`; if the exploit still works, `still-exploitable`. When the benign response was empty, a `blocked` result says so, since it then shows the route answers the same way rather than that real results are unchanged. Patches that aren't a clean single-function replacement are reported as `not-attempted` rather than guessed at.
 
+## Validation on third-party code
+
+Beyond the bundled fixture, Flowcheck was run (detection only, no `--target`) against [OWASP NodeGoat](https://github.com/OWASP/NodeGoat), a deliberately vulnerable Node/Express app neither written for nor tuned to this tool. NodeGoat's own tutorial was used only to know what should be found, not as input to detection.
+
+- **Coverage:** 27 files, 22 of 22 routes and every tainted call followed, 0 unresolved; the analysis is complete. A first run, before old-style constructor functions were supported, followed 4 of 22 routes — and correctly reported itself as incomplete (exit `3`) rather than clean.
+- **Found:** 12 reflected XSS (NodeGoat A3) in `POST /login`, `POST /signup`, `POST /profile` and `GET /allocations/:userId`: request input rendered into swig templates with auto-escaping disabled (`swig.setDefaults({ autoescape: false })`). Each finding names that setting as the root cause and proposes escaping at the template output. They are `suspected` (not live-verified: NodeGoat was not run).
+- **Not found:** NodeGoat's access-control bugs (A4 IDOR on `/allocations/:userId`, A7 missing admin check on `/benefits`) and its stored XSS (A3's stored profile fields, A9 via `marked`) — all go through MongoDB, which is out of scope (see below). Most of NodeGoat's other intentional bugs (server-side `eval`, NoSQL injection, CSRF, open redirect, SSRF, ReDoS, auth and configuration issues) are classes Flowcheck does not cover.
+
+## Known limitations / roadmap
+
+- **NoSQL / MongoDB is not supported yet.** Access-control and stored-XSS detection follow SQL data access: access mode ties a request value to a table and column through the SQL statement and the schema, and stored XSS follows a value written by a SQL write and read back by a SQL read. MongoDB `collection.find()` / `insert()` / `update()` calls are not recognized as data access. The tracer reaches those routes, but no data access is found on them — so on NodeGoat this blocks A4 (IDOR), A7 (missing authorization) and A9 (stored XSS via `marked`). Roadmap.
+- **Session-only middleware does not establish an identity.** Access mode looks for middleware that sets an identity (`req.user = …`, `ctx.state.user = …`). Middleware that only checks `req.session` (`if (req.session.userId) next()`), NodeGoat's pattern, resolves and is on the route's chain, but is not treated as establishing the caller's scope. Roadmap.
+- **A library call can be misread as a route.** Route discovery counts `.get` / `.post` / … calls on any object that is not project code, so an HTTP client call like `needle.get(url, callback)` is listed as a `GET` route (one phantom entry point on NodeGoat; it reads no request input, so nothing is judged on it). Telling a client library apart from an Express app or router needs more than a one-line check, so it is left as a known issue.
+- **Deleted or created records are not restored.** A write proof restores what it changed, but a `DELETE` (or a `POST` that creates a record) cannot be undone automatically: the finding then says `RE-SEED RECOMMENDED`. The same applies to a stored-XSS proof whose original value could not be restored.
+- **Taint through instance fields is not tracked.** A value stored on an object (`this.query = req.query.q`, or a tainted constructor argument kept in a field) and read later by another method is not followed; the constructor call is listed as unresolved, never dropped.
+
 ## License
 
 [MIT](LICENSE)
