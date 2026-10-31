@@ -55,6 +55,11 @@ export function buildPocPrompt(finding: Finding, identityHint?: string): string 
     ? `Both requests go to \`${finding.httpRoute}\` — use that exact method and path; do not invent a different URL.`
     : "Both requests go to the same route.";
 
+  // Verification must not mutate the target needlessly: for SQLi, prefer a proof that only reads.
+  const nonDestructive = isSqli
+    ? "\n- Prefer a NON-DESTRUCTIVE proof: if the injectable statement reads (SELECT), demonstrate the flaw with a boolean- or UNION-based read, never an injected INSERT/UPDATE/DELETE. Only when the vulnerable statement is itself a write (the route's own INSERT/UPDATE/DELETE) may the proof write; keep it minimal, as the tool will flag the target for re-seeding."
+    : "";
+
   return `You are a penetration tester proving one finding against a running LOCAL test instance of the application under review. You have a legitimate low-privilege auth token for one tenant; ${identityHint ?? "its scope is not stated"}.
 
 Produce a proof-of-concept: a benign BASELINE request and an EXPLOIT request to the same endpoint, and a success condition the tool will check by comparing the two responses. ${goal}
@@ -73,7 +78,7 @@ Rules:
 - The baseline must return some of the caller's own data — never a request built to match nothing (a nonsense search term, a status or id that does not exist). The tool re-runs the same baseline after a fix is applied to check the route still returns the same data, so an empty baseline proves nothing there. (Exception: with status-unblocked, the baseline is the rejected request.)
 - Put the attack payload in the query or body field the finding's source reads (${finding.taintPath[0] ?? "the entry hop"}).
 - Use the provided auth token (authenticated:true) unless proving an unauthenticated-access issue.
-- Do NOT request destructive operations beyond what the finding itself describes.
+- Do NOT request destructive operations beyond what the finding itself describes.${nonDestructive}
 
 OUTPUT
 Return ONLY a JSON array with exactly one object — no prose, no markdown fences:

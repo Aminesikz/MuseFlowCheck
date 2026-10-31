@@ -2,7 +2,7 @@
 // Purely additive — with no target this stage never runs and findings keep confidence "suspected".
 import type { Finding, Verification } from "../../types/index.js";
 import { FindingParseError } from "../parse.js";
-import { discoverCrossScopeId, fillParam, isMutating, routeParam } from "./discover.js";
+import { discoverCrossScopeId, fillParam, isMutating, routeParam, sqlSinkKind } from "./discover.js";
 import { evaluate, type RawResponse } from "./evaluate.js";
 import { evidence } from "./evidence.js";
 import { isAccessFinding, proveReadIdor, proveWriteIdor } from "./idor.js";
@@ -14,7 +14,7 @@ import { buildXssPocPrompt, isXssFinding, parseXssPlan, proveXss, type XssProofD
 export { assertLocalTarget, Target, TargetError, type AuthConfig, type FetchLike } from "./target.js";
 export { buildPocPrompt, parsePoc, type Poc } from "./poc.js";
 export { emptyResult, evaluate, findField, parse, sameResponse } from "./evaluate.js";
-export { discoverCrossScopeId, fillParam, isMutating, routeParam, type RouteParam } from "./discover.js";
+export { discoverCrossScopeId, fillParam, isMutating, routeParam, sqlSinkKind, type RouteParam } from "./discover.js";
 export { isAccessFinding, proveReadIdor, proveWriteIdor } from "./idor.js";
 export { type PatchProver, verifyPatch } from "./patch.js";
 export { BrowserError, DETECT_GLOBAL, ExecBrowser, type BrowserAuth, type BrowserOptions, type LoadResult } from "./browser.js";
@@ -105,6 +105,13 @@ export async function verifyFinding(finding: Finding, target: Target, deps: Veri
     }
   }
 
+  // The generic PoC sends requests the tool does not snapshot, so when the vulnerable statement writes (or, failing a
+  // clear verb, the exploit uses a mutating HTTP method) the target may be left changed. There is no clean handle to
+  // revert an injected INSERT, so — exactly as the IDOR and stored-XSS write-proofs do when they cannot restore — the
+  // outcome carries a loud RE-SEED warning rather than mutating silently. Appended to confirmed and unverified alike:
+  // an INSERT that did not satisfy the check still inserted.
+  const reseed = mutationWarning(finding, poc);
+
   let baseline: TargetResponse;
   let exploit: TargetResponse;
   try {
@@ -112,7 +119,7 @@ export async function verifyFinding(finding: Finding, target: Target, deps: Veri
     exploit = await send(target, poc.exploit);
   } catch (err) {
     if (err instanceof TargetError) throw err; // a bad target is a configuration error, not a per-finding outcome
-    return unverified(`the PoC could not be executed against the target: ${(err as Error).message}`);
+    return unverified(`the PoC could not be executed against the target: ${(err as Error).message}${reseed}`);
   }
 
   const result = evaluate(poc.check, baseline, exploit);
@@ -130,12 +137,12 @@ export async function verifyFinding(finding: Finding, target: Target, deps: Veri
         if (err instanceof TargetError) throw err; // otherwise fall through to the generic unverified result
       }
     }
-    return unverified(`execution did not confirm the finding: ${result.detail}. ${poc.rationale}`, { baseline: baseEv, exploit: exploitEv });
+    return unverified(`execution did not confirm the finding: ${result.detail}. ${poc.rationale}${reseed}`, { baseline: baseEv, exploit: exploitEv });
   }
 
   const verification: Verification = {
     outcome: "confirmed",
-    summary: `${poc.rationale} Confirmed: ${result.detail}.`,
+    summary: `${poc.rationale} Confirmed: ${result.detail}.${reseed}`,
     baseline: baseEv,
     exploit: exploitEv,
   };
@@ -147,6 +154,20 @@ export async function verifyFinding(finding: Finding, target: Target, deps: Veri
 
 function send(target: Target, req: PocRequest): Promise<TargetResponse> {
   return target.request(req.method, req.path, { query: req.query, body: req.body, authenticated: req.authenticated });
+}
+
+/**
+ * The RE-SEED warning for a generic PoC that may have changed the target: empty for a proven read (SELECT), otherwise
+ * a loud note naming what ran and the marker rows it may have left. The verb from the traced sink decides; when no
+ * verb is visible, a mutating HTTP method on the exploit is enough to warn rather than mutate silently.
+ */
+export function mutationWarning(finding: Finding, poc: { exploit: PocRequest; check: ReturnType<typeof parsePoc>["check"] }): string {
+  const kind = sqlSinkKind(finding);
+  if (kind === "read") return "";
+  if (kind !== "write" && !isMutating(poc.exploit.method)) return "";
+  const what = kind === "write" ? "a writing SQL statement (INSERT/UPDATE/DELETE)" : `a ${poc.exploit.method.toUpperCase()} request`;
+  const marker = poc.check.type === "marker" ? ` (e.g. rows carrying the marker "${poc.check.value}")` : "";
+  return ` RE-SEED RECOMMENDED: the proof sent requests to ${what}, so the target's data may have changed${marker} and was not reverted automatically.`;
 }
 
 /** Verifies findings one at a time (shared target state: a login token is exchanged once). */

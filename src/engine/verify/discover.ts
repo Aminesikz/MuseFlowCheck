@@ -5,6 +5,7 @@
 // genuinely foreign-owned id the way an attacker would: by requesting the ":id" endpoint across a small, BOUNDED range
 // as the authenticated caller and reading the owner/scope field off each response. It never reads the seed script, the
 // database, or any fixture internals, and it only ever talks to the configured local Target.
+import type { Finding } from "../../types/index.js";
 import { findField, parse } from "./evaluate.js";
 import type { Target, TargetResponse } from "./target.js";
 
@@ -18,6 +19,24 @@ export interface RouteParam {
 
 const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 export const isMutating = (method: string): boolean => MUTATING.has(method.toUpperCase());
+
+/** SQL statement keyword at the start of a hop (the first one on a traced path is the statement being built/run). */
+const SQL_VERB = /\b(SELECT|INSERT|UPDATE|DELETE|REPLACE|MERGE|UPSERT|TRUNCATE)\b/i;
+/** A read never mutates; everything else does. */
+const SQL_READ = /^SELECT$/i;
+
+/**
+ * Whether a SQLi finding's sink runs a writing SQL statement (INSERT/UPDATE/DELETE/…) or a read (SELECT), read from
+ * the first statement keyword on the traced path — the hop that builds the SQL. Undefined when no verb is visible, so
+ * callers can fall back to the HTTP method. Lets the verifier flag a proof that may have mutated the target.
+ */
+export function sqlSinkKind(finding: Finding): "write" | "read" | undefined {
+  for (const hop of finding.taintPath) {
+    const m = SQL_VERB.exec(hop);
+    if (m) return SQL_READ.test(m[1]) ? "read" : "write";
+  }
+  return undefined;
+}
 
 /** Parses "METHOD /a/:id/b" into its method, path template and the (last) path parameter, or undefined if none. */
 export function routeParam(httpRoute: string | undefined): RouteParam | undefined {

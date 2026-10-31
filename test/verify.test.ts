@@ -18,6 +18,7 @@ import {
   sameResponse,
   Target,
   TargetError,
+  sqlSinkKind,
   verifyFinding,
   verifyPatch,
 } from "../src/engine/verify/index.js";
@@ -127,6 +128,7 @@ let base: string;
 type Appt = { id: number; shop_id: number; status: string; customer_name?: string };
 let appts: Record<number, Appt> = {};
 const apptLog: string[] = [];
+const postLog: string[] = []; // titles the write route inserted, to show a SQLi proof really mutated the target
 function resetAppts(): void {
   appts = {
     1: { id: 1, shop_id: 1, status: "booked" },
@@ -176,6 +178,16 @@ before(async () => {
         const status = url.searchParams.get("status") ?? "";
         const injected = /'|union|or\s+1=1/i.test(status); // the "vulnerable" query dumps all shops
         return json(200, { appointments: injected ? [{ shop_id: 1 }, { shop_id: 1 }, { shop_id: 2 }, { shop_id: 2 }] : [{ shop_id: 1 }, { shop_id: 1 }] });
+      }
+      // A write route whose INSERT concatenates input (like sc_pro's register/write): every POST inserts a row,
+      // whatever the request. It records what it stored so a test can see the mutation really happened.
+      if (url.pathname === "/api/posts" && method === "POST") {
+        const title = String(body.title ?? "");
+        postLog.push(title);
+        // Returns the stored titles as server-generated markup (each behind a "row<i>:" prefix), so a marker that
+        // was stored comes back as the server's own data, not as a bare echo of the request body.
+        const listing = postLog.map((t, i) => `row${i}:${t}`).join("|");
+        return json(200, { ok: true, listing });
       }
       const revenue = /^\/api\/shops\/(\d+)\/revenue$/.exec(url.pathname); // IDOR: returns whatever shop is asked for
       if (revenue) return json(200, { revenue: { shopId: Number(revenue[1]), totalCents: 1000 * Number(revenue[1]) } });
@@ -260,6 +272,78 @@ test("verifyFinding marks a finding unverified when the model's PoC is unusable"
   const f = await verifyFinding(sqliFinding, target, { complete: async () => "not json at all" });
   assert.equal(f.confidence, "unverified");
   assert.match(f.verification!.summary, /could not generate a usable PoC/);
+});
+
+// ---- mutating SQLi proofs must never mutate silently (snapshot-and-restore discipline) ----------
+
+// A SQLi finding whose sink is a write: the traced path's build hop names the INSERT, so the verifier knows a proof
+// against it writes. The INSERT has no clean handle to revert (new rows), so the proof must flag RE-SEED, not restore.
+const sqliWriteFinding: Finding = {
+  type: "SQL Injection", cwe: "CWE-89", severity: "critical", file: "routes/post.js", sourceLine: 30, sinkFile: "routes/post.js", sinkLine: 36,
+  httpRoute: "POST /api/posts",
+  taintPath: [
+    "routes/post.js:30  const { title, content } = req.body;",
+    "routes/post.js:34  const sql = `INSERT INTO posts (title, content) VALUES ('${title}', '${content}')`;",
+    "routes/post.js:36  db.query(sql, (err) => {})",
+  ],
+  explanation: "title is concatenated into an INSERT", suggestedPatch: "x", confidence: "suspected",
+};
+
+test("sqlSinkKind reads the statement verb off the traced path: INSERT/UPDATE/DELETE write, SELECT reads", () => {
+  assert.equal(sqlSinkKind(sqliWriteFinding), "write");
+  assert.equal(sqlSinkKind({ ...sqliWriteFinding, taintPath: ["r.js:1 const sql = `UPDATE posts SET x=1`", "r.js:2 db.query(sql)"] }), "write");
+  assert.equal(sqlSinkKind({ ...sqliWriteFinding, taintPath: ["r.js:1 const sql = `SELECT * FROM posts WHERE id = ${id}`", "r.js:2 db.query(sql)"] }), "read");
+  assert.equal(sqlSinkKind({ ...sqliWriteFinding, taintPath: ["r.js:1 db.query(sql)"] }), undefined); // no verb visible
+});
+
+test("a mutating SQLi proof that CONFIRMS still flags RE-SEED and names the inserted marker", async () => {
+  const target = new Target({ url: base, auth: { kind: "token", token: "tenant-1" } });
+  const poc = {
+    baseline: { method: "POST", path: "/api/posts", body: { title: "hello" } },
+    exploit: { method: "POST", path: "/api/posts", body: { title: "ZZMARK42" } }, // a stored sentinel, returned behind the server's "row<i>:" prefix (not a bare echo)
+    check: { type: "marker", value: "ZZMARK42" },
+    rationale: "the injected INSERT stores a sentinel row that the listing then returns",
+  };
+  postLog.length = 0;
+  const f = await verifyFinding(sqliWriteFinding, target, { complete: completeWith(poc) });
+  assert.equal(f.confidence, "confirmed");
+  assert.match(f.verification!.summary, /Confirmed:/);
+  assert.match(f.verification!.summary, /RE-SEED RECOMMENDED/);
+  assert.match(f.verification!.summary, /ZZMARK42/); // names what it may have left
+  assert.ok(postLog.length > 0, "the proof really did write to the target");
+});
+
+test("a mutating SQLi proof that does NOT confirm is still not silent — RE-SEED is reported (the sc_pro register case)", async () => {
+  const target = new Target({ url: base, auth: { kind: "token", token: "tenant-1" } });
+  const poc = {
+    baseline: { method: "POST", path: "/api/posts", body: { title: "benign_user" } },
+    exploit: { method: "POST", path: "/api/posts", body: { title: "evil" } }, // inserts, but no marker echoed back → unverified
+    check: { type: "marker", value: "NEVER_APPEARS_99" },
+    rationale: "the injected INSERT adds a row",
+  };
+  postLog.length = 0;
+  const f = await verifyFinding(sqliWriteFinding, target, { complete: completeWith(poc) });
+  assert.equal(f.confidence, "unverified");
+  assert.match(f.verification!.summary, /execution did not confirm/);
+  assert.match(f.verification!.summary, /RE-SEED RECOMMENDED/);
+  assert.equal(postLog.length, 2, "both benign and exploit requests inserted rows");
+});
+
+test("a read-only SQLi proof (SELECT) is not falsely flagged for re-seeding", async () => {
+  const target = new Target({ url: base, auth: { kind: "token", token: "tenant-1" } });
+  const readFinding: Finding = {
+    ...sqliFinding,
+    taintPath: ["routes/appointments.js:11  const sql = `SELECT * FROM appointments WHERE status = '${status}'`;", "db/appointments.js:14 pool.query(sql)"],
+  };
+  const poc = {
+    baseline: { method: "GET", path: "/api/appointments", query: { status: "booked" } },
+    exploit: { method: "GET", path: "/api/appointments", query: { status: "' OR '1'='1" } },
+    check: { type: "more-rows", field: "appointments" },
+    rationale: "a true condition drops the filter",
+  };
+  const f = await verifyFinding(readFinding, target, { complete: completeWith(poc) });
+  assert.equal(f.confidence, "confirmed");
+  assert.doesNotMatch(f.verification!.summary, /RE-SEED/);
 });
 
 test("Target exchanges login credentials for a token once", async () => {
