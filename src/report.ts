@@ -2,6 +2,7 @@
 // and color for the summary. Presentation only — the --json data path never goes through here. Without color (not a
 // TTY, --json, NO_COLOR, --no-color) every status is still carried by a label or symbol, so piped text stays readable.
 import { createColors } from "picocolors";
+import type { Analysis } from "./engine/coverage.js";
 import { SEVERITIES, type Finding, type Severity } from "./types/index.js";
 
 export type Colors = ReturnType<typeof createColors>;
@@ -46,6 +47,49 @@ export function severityCounts(c: Colors, findings: Finding[]): string {
 export function rule(c: Colors, width: number, title?: string): string {
   if (!title) return c.dim("─".repeat(width));
   return `${c.dim("──")} ${c.bold(title)} ${c.dim("─".repeat(Math.max(3, width - title.length - 4)))}`;
+}
+
+/** How many reasons the incomplete-analysis warning lists before summarizing the rest. */
+const MAX_REASONS = 8;
+
+/** The Summary row for analysis coverage: what was followed, and whether that is enough to call the result clean. */
+export function coverageRow(c: Colors, a: Analysis): string {
+  const routes = a.entryPointsTotal > 0 ? `${a.entryPointsResolved} of ${a.entryPointsTotal} routes` : `${a.handlersTraced} handler(s)`;
+  const calls = `${a.callsFollowed} of ${a.callsFollowed + a.unresolved} tainted calls`;
+  const parsed = a.parseErrors.length > 0 ? `, ${a.filesParsed} of ${a.files} files parsed` : "";
+  const status = a.complete ? c.green("complete") : c.bold(c.red("INCOMPLETE"));
+  return `  Analysis:       ${status} — ${routes}, ${calls} followed${parsed}`;
+}
+
+/**
+ * The warning printed when a scan is incomplete: what could not be followed and why, framed so a "0 findings" line
+ * above it cannot be read as a pass. Empty for a complete scan.
+ */
+export function incompleteWarning(c: Colors, a: Analysis, width: number, outcome: string): string {
+  if (a.complete) return "";
+  const bar = c.bold(c.red("━".repeat(width)));
+  const out = [bar, c.bold(c.red("⚠ INCOMPLETE ANALYSIS — results are NOT a clean bill of health")), ""];
+  for (const p of a.problems) {
+    const lines = wrap(p, width, "    ");
+    out.push(`  • ${lines[0].slice(4)}`, ...lines.slice(1));
+  }
+  if (a.reasons.length > 0) {
+    out.push("", c.bold("  Not followed (unsupported code patterns):"));
+    for (const r of a.reasons.slice(0, MAX_REASONS)) {
+      out.push(`    ${String(r.count).padStart(3)}× ${r.reason}`);
+      if (r.names.length > 0) out.push(...wrap(r.names.join(", "), width, "         "));
+      out.push(c.dim(`         e.g. ${r.example}`));
+    }
+    const rest = a.reasons.slice(MAX_REASONS);
+    if (rest.length > 0) out.push(c.dim(`    …and ${rest.reduce((n, r) => n + r.count, 0)} more occurrence(s) of ${rest.length} other reason(s) (see --json "analysis.reasons")`));
+  }
+  for (const e of a.parseErrors.slice(0, MAX_REASONS)) out.push(c.dim(`    parse error: ${e.file}:${e.line}  ${e.message}`));
+  out.push(
+    "",
+    ...wrap(`Code the engine could not follow was not checked. A scan is incomplete when more than ${a.maxUnresolvedPercent}% of routes, tainted calls or files went unanalyzed (tune with --max-unresolved <percent>). ${outcome}`, width, "  "),
+    bar,
+  );
+  return out.join("\n");
 }
 
 /** Word-wraps prose to `width` columns, each line prefixed with `indent`; existing line breaks are kept. */

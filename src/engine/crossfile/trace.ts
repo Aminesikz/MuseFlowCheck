@@ -72,6 +72,45 @@ export interface ExternalCall {
   target: string;
 }
 
+/** A tainted call the tracer followed: into a project function, or a recognized sink. */
+export interface CallSite {
+  file: string;
+  line: number;
+  call: string;
+}
+
+/**
+ * A router/app registration (`app.get('/x', mw, handler)`) that names project code. `handler` is false when none of
+ * its arguments resolved to a function; `unresolved` holds the reason for each argument that could not be resolved
+ * (a handler or a middleware), so a registration can be resolved and still incompletely followed.
+ */
+export interface RouteRegistration {
+  file: string;
+  line: number;
+  call: string;
+  route: string;
+  handler: boolean;
+  unresolved: string[];
+}
+
+/** A source file the parser reported syntax errors in: its tree is partial, so code past the error may be missed. */
+export interface ParseError {
+  file: string;
+  line: number;
+  message: string;
+}
+
+/** How much of a project a tracer reached, for the incomplete-analysis check: what it followed and where it broke. */
+export interface Coverage {
+  files: number;
+  parseErrors: ParseError[];
+  /** Entry points traced (registered handlers and request-reading functions). */
+  entryPoints: number;
+  registrations: RouteRegistration[];
+  followed: CallSite[];
+  unresolved: UnresolvedCall[];
+}
+
 /** A function where untrusted HTTP input enters: a registered route handler or a request-reading function. */
 export interface EntryPoint {
   file: string;
@@ -97,6 +136,7 @@ export interface TraceResult {
   paths: CandidatePath[];
   unresolved: UnresolvedCall[];
   external: ExternalCall[];
+  coverage: Coverage;
 }
 
 export type Fn = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
@@ -285,6 +325,11 @@ export class Tracer {
   readonly paths: CandidatePath[] = [];
   readonly unresolved: UnresolvedCall[] = [];
   readonly external: ExternalCall[] = [];
+  /** Tainted calls followed into project code or a sink (coverage bookkeeping only; never read by the analysis). */
+  readonly followed: CallSite[] = [];
+  private readonly followedKeys = new Set<string>();
+  /** Route registrations naming project code, as found by registeredHandlers. */
+  readonly registrations: RouteRegistration[] = [];
   /** Where each router file is mounted (`app.use('/prefix', router)`), first mount only; built by registeredHandlers. */
   private readonly mounts = new Map<SourceFile, { prefix: string; parent: SourceFile }>();
   /** The HTTP route of the handler currently being analyzed, stamped onto the paths it produces. */
@@ -388,8 +433,11 @@ export class Tracer {
         const [first] = call.getArguments();
         const routePath = first && (Node.isStringLiteral(first) || Node.isNoSubstitutionTemplateLiteral(first)) ? first.getLiteralValue() : undefined;
         const route = this.composeRoute(callee.getName().toUpperCase(), sf, routePath);
+        const misses: string[] = [];
+        let resolved = false;
         for (const arg of call.getArguments()) {
-          for (const v of this.registeredFunctions(arg)) {
+          for (const v of this.registeredFunctions(arg, misses)) {
+            resolved = true;
             const req = this.requestParam(v.fn);
             if (!req || found.has(v.fn)) continue;
             const h = this.handler(v.fn, req, v.self);
@@ -399,6 +447,9 @@ export class Tracer {
             h.registration = call;
             found.set(v.fn, h);
           }
+        }
+        if (resolved || misses.length > 0) {
+          this.registrations.push({ file: this.rel(sf), line: call.getStartLineNumber(), call: excerpt(callee, 60), route, handler: resolved, unresolved: misses });
         }
       }
     }
@@ -421,17 +472,18 @@ export class Tracer {
     return [...found.values()];
   }
 
-  /** Project functions an argument of a route registration stands for. */
-  private registeredFunctions(arg: Node): Extract<Value, { kind: "function" }>[] {
+  /** Project functions an argument of a route registration stands for; the reason for each one that won't resolve goes to `misses`. */
+  private registeredFunctions(arg: Node, misses: string[] = []): Extract<Value, { kind: "function" }>[] {
     const e = unwrap(arg);
-    if (Node.isArrayLiteralExpression(e)) return e.getElements().flatMap((el) => this.registeredFunctions(el));
+    if (Node.isArrayLiteralExpression(e)) return e.getElements().flatMap((el) => this.registeredFunctions(el, misses));
     if (Node.isCallExpression(e)) {
       const callee = e.getExpression();
-      if (Node.isPropertyAccessExpression(callee) && callee.getName() === "bind") return this.registeredFunctions(callee.getExpression());
-      return e.getArguments().flatMap((a) => this.registeredFunctions(a)); // asyncHandler(fn), wrap(ctrl.list)
+      if (Node.isPropertyAccessExpression(callee) && callee.getName() === "bind") return this.registeredFunctions(callee.getExpression(), misses);
+      return e.getArguments().flatMap((a) => this.registeredFunctions(a, misses)); // asyncHandler(fn), wrap(ctrl.list)
     }
     if (!isFn(e) && !Node.isIdentifier(e) && !Node.isPropertyAccessExpression(e)) return [];
     const v = this.resolveExpr(e);
+    if (v.kind === "unresolved") misses.push(v.reason);
     return v.kind === "function" ? [v] : [];
   }
 
@@ -687,6 +739,7 @@ export class Tracer {
 
     const callee = this.resolveCallee(call);
     const at = { file: ref.file, line: call.getStartLineNumber(), call: excerpt(call.getExpression()) };
+    if (callee.kind === "function" || callee.kind === "sink") this.recordFollowed(at);
     switch (callee.kind) {
       case "function":
         return this.enterCallee(call, callee.fn, argTaints, env, ref, depth, req, callee.self);
@@ -715,6 +768,13 @@ export class Tracer {
         ? ctor.reason
         : "tainted constructor argument — taint stored in instance fields is not tracked";
     this.addEdge(this.unresolved, { ...at, reason });
+  }
+
+  private recordFollowed(at: CallSite): void {
+    const key = `${at.file}:${at.line}:${at.call}`;
+    if (this.followedKeys.has(key)) return;
+    this.followedKeys.add(key);
+    this.followed.push(at);
   }
 
   protected addEdge<T extends { file: string; line: number; call: string }>(list: T[], edge: T): void {
@@ -1301,16 +1361,42 @@ function analyzeAll(tracer: Tracer, handlers: Handler[]): void {
   tracer.setCurrentRoute(undefined);
 }
 
-function result(tracer: Tracer, entry: string, files: number, handlers: Handler[]): TraceResult {
+/** Files whose parse reported syntax errors (the first error of each). */
+export function parseErrors(root: string, files: SourceFile[]): ParseError[] {
+  const out: ParseError[] = [];
+  for (const sf of files) {
+    const diags = (sf.compilerNode as { parseDiagnostics?: { start?: number; messageText: unknown }[] }).parseDiagnostics ?? [];
+    const first = diags[0];
+    if (!first) continue;
+    const message = typeof first.messageText === "string" ? first.messageText : "syntax error";
+    out.push({ file: path.relative(root, sf.getFilePath()), line: sf.getLineAndColumnAtPos(first.start ?? 0).line, message });
+  }
+  return out;
+}
+
+/** A tracer's coverage over `files` after tracing `entryPoints` handlers. The arrays are live: later tracing still adds to them. */
+export function coverageOf(tracer: Tracer, files: SourceFile[], entryPoints: number): Coverage {
+  return {
+    files: files.length,
+    parseErrors: parseErrors(tracer.root, files),
+    entryPoints,
+    registrations: tracer.registrations,
+    followed: tracer.followed,
+    unresolved: tracer.unresolved,
+  };
+}
+
+function result(tracer: Tracer, entry: string, files: SourceFile[], handlers: Handler[]): TraceResult {
   return {
     root: tracer.root,
     entry,
-    files,
+    files: files.length,
     handlers: handlers.length,
     entryPoints: handlers.map((h) => h.entry),
     paths: sortPaths(tracer.paths),
     unresolved: tracer.unresolved,
     external: tracer.external,
+    coverage: coverageOf(tracer, files, handlers.length),
   };
 }
 
@@ -1320,7 +1406,7 @@ export function traceEntry(entry: string, root = findProjectRoot(entry)): TraceR
   const sf = tracer.load(path.resolve(entry));
   const handlers = [...tracer.handlers(sf), ...tracer.referencedHandlers(sf)];
   analyzeAll(tracer, handlers);
-  return result(tracer, path.relative(tracer.root, path.resolve(entry)), 1, handlers);
+  return result(tracer, path.relative(tracer.root, path.resolve(entry)), [sf], handlers);
 }
 
 /**
@@ -1333,5 +1419,5 @@ export function traceProject(dir: string, tracer = new Tracer(path.resolve(dir),
   analyzeAll(tracer, registered);
   const readers = tracer.requestReaders(files); // after tracing, so functions already reached aren't entry points
   analyzeAll(tracer, readers);
-  return result(tracer, ".", files.length, [...registered, ...readers]);
+  return result(tracer, ".", files, [...registered, ...readers]);
 }

@@ -6,15 +6,20 @@ import { traceEntry, traceProject, type TraceResult } from "./trace.js";
 export { buildJudgePrompt, formatHop, groupBySink, groupSignature } from "./judge.js";
 export { discoverFiles } from "./files.js";
 export {
+  coverageOf,
   createProject,
   findProjectRoot,
   traceEntry,
   traceProject,
   Tracer,
+  type CallSite,
   type CandidatePath,
+  type Coverage,
   type EntryPoint,
   type ExternalCall,
   type Hop,
+  type ParseError,
+  type RouteRegistration,
   type TraceResult,
   type UnresolvedCall,
 } from "./trace.js";

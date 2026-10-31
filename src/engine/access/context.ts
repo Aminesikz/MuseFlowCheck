@@ -5,7 +5,7 @@
 import path from "node:path";
 import { Node, SyntaxKind, type BinaryExpression, type Project, type CallExpression, type SourceFile } from "ts-morph";
 import { discoverFiles, discoverSqlFiles } from "../crossfile/files.js";
-import { excerpt, isFn, Tracer, type CandidatePath, type Fn, type FunctionRef, type Handler, type Hop } from "../crossfile/trace.js";
+import { coverageOf, excerpt, isFn, Tracer, type CandidatePath, type Coverage, type Fn, type FunctionRef, type Handler, type Hop } from "../crossfile/trace.js";
 import { columnForValue, describeStatement, evaluateSql, readSchema, type SchemaTable, type StatementVerb } from "./sql.js";
 
 const HTTP_METHODS = new Set(["get", "post", "put", "patch", "delete", "del", "all"]);
@@ -87,6 +87,7 @@ export interface AccessContext {
   schemaFiles: string[];
   schema: SchemaTable[];
   routes: AccessRoute[];
+  coverage: Coverage;
 }
 
 interface Mount {
@@ -161,7 +162,8 @@ class AccessAnalyzer {
     });
     const projectFields = this.identityFieldsRead(files);
     const routes = handlers.map((h) => this.route(h, projectFields));
-    return { root: this.root, files: files.length, schemaFiles: schemaFiles.map((f) => f.rel), schema: this.schema, routes };
+    const coverage = coverageOf(this.tracer, files, routes.length);
+    return { root: this.root, files: files.length, schemaFiles: schemaFiles.map((f) => f.rel), schema: this.schema, routes, coverage };
   }
 
   // ---- routing: mounts, middleware chains, full paths ------------------------------------------

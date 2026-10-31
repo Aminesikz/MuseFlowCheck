@@ -59,11 +59,11 @@ test("scan <dir> without --mode runs all three classes: one merged Finding[], on
     run("scan", project, "--mode", "access", "--json"),
     run("scan", project, "--mode", "xss", "--json"),
   ]);
-  const parts = [sqli, access, xss].map((r) => JSON.parse(r.stdout) as Finding[]);
+  const parts = [sqli, access, xss].map((r) => JSON.parse(r.stdout).findings as Finding[]);
   for (const p of parts) assert.ok(p.length > 0, "every class has a finding in this project");
 
   // Exactly the single-class findings, nothing merged or dropped across classes, ordered by severity (stable).
-  const merged = JSON.parse(all.stdout) as Finding[];
+  const merged = JSON.parse(all.stdout).findings as Finding[];
   assert.deepEqual(merged, parts.flat().sort(bySeverity));
   assert.equal(all.code, 1, "a high finding in any class gates the whole run");
 

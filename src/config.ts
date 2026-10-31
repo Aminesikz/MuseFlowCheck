@@ -11,6 +11,7 @@ const CONFIG_KEYS = {
   token: "token",
   identity: "identity",
   mode: "mode",
+  maxUnresolved: "max-unresolved",
   probeRange: "probe-range",
   loginPath: "login-path",
   loginBody: "login-body",

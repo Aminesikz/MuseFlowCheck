@@ -138,7 +138,7 @@ test("mounted sub-router: a handler's route and its tainted path include the rou
   assert.equal(p!.route, "GET /api/barbers/search");
 });
 
-test("cli: scan <dir> --json prints only the Finding[] on stdout, and exits 0 when nothing reaches SQL text", () => {
+test("cli: scan <dir> --json prints only { findings, analysis } on stdout, and exits 0 when nothing reaches SQL text", () => {
   const project = path.join(tmp, "safe");
   mkdirSync(path.join(project, "routes"), { recursive: true });
   writeFileSync(
@@ -151,7 +151,9 @@ test("cli: scan <dir> --json prints only the Finding[] on stdout, and exits 0 wh
   const env = { ...process.env, META_API_KEY: "offline-test", META_BASE_URL: "http://127.0.0.1:9", META_MODEL: "none" };
   const run = spawnSync(tsx, [cli, "scan", project, "--json"], { cwd: tmp, env, encoding: "utf8" });
   assert.equal(run.status, 0, run.stderr);
-  assert.deepEqual(JSON.parse(run.stdout), []);
+  const out = JSON.parse(run.stdout);
+  assert.deepEqual(out.findings, []);
+  assert.equal(out.analysis.complete, true, "every route and tainted call was followed: a genuine clean result");
   assert.match(run.stderr, /Files scanned: {2}1/);
   assert.match(run.stderr, /1 path\(s\) reach SQL only as bound parameters/);
 });

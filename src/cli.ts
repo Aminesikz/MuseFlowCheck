@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// CLI entrypoint: `flowcheck scan` / `flowcheck trace` — exit 0 clean, 1 high/critical finding, 2 usage/runtime error.
+// CLI entrypoint: `flowcheck scan` / `flowcheck trace` — exit 0 clean, 1 high/critical finding, 2 usage/runtime error,
+// 3 incomplete analysis (too much of the target could not be followed for "no findings" to mean clean).
 import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { analyzeFile, FindingParseError } from "./engine/index.js";
@@ -14,6 +15,7 @@ import {
   traceEntry,
   traceProject,
   Tracer,
+  type Coverage,
   type EntryPoint,
   type JudgeResult,
   type TraceResult,
@@ -45,10 +47,11 @@ import {
 import { existsSync as fileExists } from "node:fs";
 import { startPatchedServer } from "./engine/verify/server.js";
 import { buildXssPrompt, groupXssBySink, judgeXss, traceXssProject, type XssPath, type XssTraceResult } from "./engine/xss/index.js";
+import { assessCoverage, DEFAULT_MAX_UNRESOLVED, wholeFileAnalysis, type Analysis, type ClassCoverage } from "./engine/coverage.js";
 import { CONFIG_FILE, ConfigError, envVar, layeredValues, loadConfig, sourcedSettings } from "./config.js";
 import { complete } from "./llm/meta-client.js";
 import { describeApiError, loadDotEnv } from "./llm/errors.js";
-import { colorEnabled, findingCard, makeColors, paintSeverity, reportWidth, rule, severityCounts, type Colors } from "./report.js";
+import { colorEnabled, coverageRow, findingCard, incompleteWarning, makeColors, paintSeverity, reportWidth, rule, severityCounts, type Colors } from "./report.js";
 import { CONFIDENCES, SEVERITIES, type Confidence, type Finding, type Verification } from "./types/index.js";
 
 const VERSION = "0.0.0";
@@ -81,7 +84,11 @@ Usage:
 
   --mode    all (default for a directory), sqli (default for a file), access, or xss
   --route   only judge (or show prompts for) routes whose "METHOD /path" contains <text>
-  --json    print the findings as a JSON Finding[] on stdout (progress and summary go to stderr)
+  --json    print { "findings": Finding[], "analysis": {...} } on stdout (progress and summary go to stderr);
+            "analysis" says how much of the target was followed and whether the scan is complete
+  --max-unresolved <percent>
+            share of routes, tainted calls or files that may go unanalyzed before the scan counts as
+            incomplete (exit 3) instead of clean (default ${DEFAULT_MAX_UNRESOLVED}; 100 accepts any coverage)
   --no-color  plain text even on a terminal (color is also off when piped, with --json, or when NO_COLOR is set)
 
 Verification (optional; proves findings by executing them against a target you run):
@@ -102,15 +109,21 @@ XSS execution proof (optional; proves XSS findings by executing a payload in a h
   --xss-client <url>    LOCAL base URL of the client app, for findings whose sink renders in browser code (e.g. React)
   --xss-token-store <s> how the client app reads its token: "localStorage:<key>", "sessionStorage:<key>" or "window:<path>"
 
-Settings: any of target, token, identity, mode, probeRange, loginPath, loginBody, tokenField, browserPath, xssClient,
+Settings: any of target, token, identity, mode, maxUnresolved, probeRange, loginPath, loginBody, tokenField, browserPath, xssClient,
 xssTokenStore, startCmd, readyPath can live in museflowcheck.config.json (in the scanned project or the current
 directory) or in MUSEFLOWCHECK_<NAME> environment variables (e.g. MUSEFLOWCHECK_TOKEN). A command-line flag wins
 over the environment, which wins over the file. See museflowcheck.config.example.json.
 
-Exit codes: 0 no high/critical findings, 1 high/critical finding(s), 2 error`;
+Exit codes: 0 no high/critical findings and the analysis was complete, 1 high/critical finding(s), 2 error,
+3 incomplete analysis — the engine could not follow enough of the target (routes, calls or files beyond
+--max-unresolved) to call the result clean; the scan prints what it skipped and why`;
 
 const EXIT_GATE = 1;
 const EXIT_ERROR = 2;
+const EXIT_INCOMPLETE = 3;
+
+/** The --max-unresolved threshold, in percent. */
+let maxUnresolved = DEFAULT_MAX_UNRESOLVED;
 
 /** Human-readable output: stdout normally, stderr when stdout is reserved for --json. */
 let say: (text: string) => void = (text) => console.log(text);
@@ -276,14 +289,34 @@ function gatedCount(findings: Finding[]): number {
   return findings.filter((f) => f.severity === "critical" || f.severity === "high").length;
 }
 
-/** Prints findings (or emits them as JSON) and returns the CI-gate exit code. */
-function emitFindings(findings: Finding[], json: boolean): number {
-  if (json) console.log(JSON.stringify(findings, null, 2));
+/** Prints findings (or emits them with the analysis as JSON) and returns the CI-gate exit code. */
+function emitFindings(findings: Finding[], json: boolean, analysis: Analysis): number {
+  if (json) console.log(JSON.stringify({ findings, analysis }, null, 2));
   else if (findings.length > 0) {
     say(`\n${rule(c, width, `Findings (${findings.length})`)}\n`);
     findings.forEach((f, i) => say(findingCard(c, f, i + 1, findings.length, width) + "\n"));
   }
   return gatedCount(findings) > 0 ? EXIT_GATE : 0;
+}
+
+/**
+ * The exit code once findings, errors and coverage are known: high/critical findings gate (1) whatever else
+ * happened; otherwise an error (2), then an incomplete analysis (3); 0 only for a complete, clean scan.
+ */
+function finalCode(gate: number, failed: boolean, analysis: Analysis): number {
+  if (gate !== 0) return gate;
+  if (failed) return EXIT_ERROR;
+  return analysis.complete ? 0 : EXIT_INCOMPLETE;
+}
+
+/** Prints the incomplete-analysis warning (last, so it is what a CI log ends on) when the scan was incomplete. */
+function warnIfIncomplete(analysis: Analysis, code: number): void {
+  if (analysis.complete) return;
+  const outcome =
+    code === EXIT_INCOMPLETE
+      ? `Exit code ${EXIT_INCOMPLETE} (incomplete analysis), not 0.`
+      : `Exit code ${code} (${code === EXIT_GATE ? "high/critical findings" : "error"}), which takes precedence over incomplete analysis (${EXIT_INCOMPLETE}).`;
+  say(`\n${incompleteWarning(c, analysis, width, outcome)}\n`);
 }
 
 
@@ -297,7 +330,7 @@ async function scan(file: string, json: boolean): Promise<number> {
     return reportError(err, file);
   }
   const final = await finalizeFindings(findings, file);
-  const code = emitFindings(final.findings, json);
+  const code = emitFindings(final.findings, json, wholeFileAnalysis(maxUnresolved));
   say(summaryLine(final.findings));
   return final.error ? EXIT_ERROR : code;
 }
@@ -335,10 +368,14 @@ async function scanCrossFile(entry: string, root: string | undefined, json: bool
   }
   say(formatTrace(trace) + "\n");
   const { result, final } = await judgeSqli(trace, entry);
-  let code = emitFindings(final.findings, json);
+  const analysis = assessCoverage([{ name: "SQL injection", coverage: trace.coverage }], maxUnresolved);
+  const gate = emitFindings(final.findings, json, analysis);
   say(summaryLine(final.findings));
+  say(coverageRow(c, analysis));
   for (const f of result.failures) console.error(`✗ Judging ${f.sink} failed: ${describeError(f.error, entry)}`);
-  if ((result.failures.length > 0 || final.error) && code === 0) code = EXIT_ERROR; // an unjudged sink, or a verification error, is not a clean result
+  // an unjudged sink, or a verification error, is not a clean result; nor is one that could not follow the code
+  const code = finalCode(gate, result.failures.length > 0 || final.error === true, analysis);
+  warnIfIncomplete(analysis, code);
   return code;
 }
 
@@ -360,6 +397,8 @@ interface ClassRun {
   failures: string[];
   /** A judge failure or a verification error: the result is not clean. */
   failed: boolean;
+  /** What Stage 1 followed and where it broke, for the incomplete-analysis check. */
+  coverage: Coverage;
 }
 
 /** What a combined scan shares across classes: one parsed project and one headless browser. */
@@ -378,11 +417,23 @@ function confidenceRow(findings: Finding[]): string[] {
 function reportClass(run: ClassRun | undefined, json: boolean): number {
   if (!run) return EXIT_ERROR; // Stage 1 failed; already reported
   const { findings } = run;
-  let code = emitFindings(findings, json);
-  say([rule(c, width, "Summary"), ...run.before, `  Findings:       ${findings.length} — ${severityCounts(c, findings)}`, ...confidenceRow(findings), ...run.after, ""].join("\n"));
+  const analysis = assessCoverage([{ name: run.name, coverage: run.coverage }], maxUnresolved);
+  const gate = emitFindings(findings, json, analysis);
+  say(
+    [
+      rule(c, width, "Summary"),
+      ...run.before,
+      `  Findings:       ${findings.length} — ${severityCounts(c, findings)}`,
+      ...confidenceRow(findings),
+      ...run.after,
+      coverageRow(c, analysis),
+      "",
+    ].join("\n"),
+  );
   for (const note of run.notes) say(note);
   for (const failure of run.failures) console.error(failure);
-  if (run.failed && code === 0) code = EXIT_ERROR;
+  const code = finalCode(gate, run.failed, analysis);
+  warnIfIncomplete(analysis, code);
   return code;
 }
 
@@ -420,6 +471,7 @@ async function runSqli(dir: string, shared: SharedRun = {}): Promise<ClassRun | 
     notes: [formatUnresolved(trace)],
     failures: result.failures.map((f) => `✗ Judging ${f.sink} failed: ${describeError(f.error, dir)}`),
     failed: result.failures.length > 0 || final.error === true,
+    coverage: trace.coverage,
   };
 }
 
@@ -541,6 +593,7 @@ async function runAccess(dir: string, filter: string | undefined, shared: Shared
     notes: result.cleared.map((r) => c.dim(`Judged not vulnerable: ${routeLabel(r)}`)),
     failures: result.failures.map((f) => `✗ Judging ${f.route} failed: ${describeError(f.error, dir)}`),
     failed: result.failures.length > 0 || final.error === true,
+    coverage: ctx.coverage,
   };
 }
 
@@ -643,6 +696,7 @@ async function runXss(dir: string, shared: SharedRun = {}): Promise<ClassRun | u
     notes: [formatUnresolved(trace)],
     failures: result.failures.map((f) => `✗ Judging ${f.sink} failed: ${describeError(f.error, dir)}`),
     failed: result.failures.length > 0 || final.error === true,
+    coverage: trace.coverage,
   };
 }
 
@@ -685,7 +739,8 @@ async function scanAll(dir: string, filter: string | undefined, json: boolean): 
     const sev = bySev.length > 0 ? ` (${bySev.map(([s, n]) => paintSeverity(c, s, `${s} ${n}`)).join(", ")})` : "";
     return `${label}${r.findings.length} finding(s)${sev} — ${r.brief}`;
   });
-  let code = emitFindings(findings, json);
+  const analysis = assessCoverage(done.map((r): ClassCoverage => ({ name: r.name, coverage: r.coverage })), maxUnresolved);
+  const gate = emitFindings(findings, json, analysis);
   say(
     [
       rule(c, width, "Summary"),
@@ -693,12 +748,14 @@ async function scanAll(dir: string, filter: string | undefined, json: boolean): 
       ...perClass,
       `  Findings:       ${findings.length} — ${severityCounts(c, findings)}`,
       ...confidenceRow(findings),
+      coverageRow(c, analysis),
       "",
     ].join("\n"),
   );
   for (const r of done) for (const note of r.notes) say(`${r.name} — ${note}`);
   for (const r of done) for (const failure of r.failures) console.error(failure);
-  if (runs.some((r) => !r || r.failed) && code === 0) code = EXIT_ERROR;
+  const code = finalCode(gate, runs.some((r) => !r || r.failed), analysis);
+  warnIfIncomplete(analysis, code);
   return code;
 }
 
@@ -712,7 +769,7 @@ function traceAll(dir: string, filter: string | undefined, showPrompt: boolean):
 }
 
 /** Flags that take a value. */
-const VALUE_FLAGS = new Set(["root", "mode", "route", "target", "token", "login-path", "login-body", "token-field", "identity", "probe-range", "start-cmd", "ready-path", "browser-path", "xss-client", "xss-token-store"]);
+const VALUE_FLAGS = new Set(["root", "mode", "route", "max-unresolved", "target", "token", "login-path", "login-body", "token-field", "identity", "probe-range", "start-cmd", "ready-path", "browser-path", "xss-client", "xss-token-store"]);
 
 /** Builds the verification runtime from the flags, or undefined when no `--target` is given. Throws on bad config. */
 function buildVerifyRuntime(value: (name: string) => string | undefined, patch: boolean, dir: string): VerifyRuntime | undefined {
@@ -844,6 +901,14 @@ async function main(argv: string[]): Promise<number> {
     if (parts.length > 0) say(c.dim(`Settings: ${parts.join("; ")}\n`));
   }
   const emptyValue = [...VALUE_FLAGS].some((f) => flags.get(f) === "");
+  const maxRaw = value("max-unresolved");
+  if (maxRaw !== undefined) {
+    maxUnresolved = Number(maxRaw);
+    if (maxRaw.trim() === "" || !Number.isFinite(maxUnresolved) || maxUnresolved < 0 || maxUnresolved > 100) {
+      console.error(`✗ --max-unresolved must be a percentage between 0 and 100, got ${JSON.stringify(maxRaw)}`);
+      return EXIT_ERROR;
+    }
+  }
   if (positional.length === 1 && !emptyValue && (mode === "sqli" || mode === "access" || mode === "xss" || mode === "all")) {
     const [target] = positional;
     if (command === "scan") {

@@ -14,10 +14,20 @@ npm install
 npm run smoke          # check API access
 npm run build
 node dist/cli.js scan path/to/project          # whole project: SQL injection, access control and XSS in one pass
-node dist/cli.js scan path/to/project --json   # findings as a JSON Finding[] on stdout
+node dist/cli.js scan path/to/project --json   # { "findings": Finding[], "analysis": {...} } on stdout
 ```
 
-`flowcheck scan <dir>` runs every vulnerability class by default and reports one merged result; `--mode sqli`, `--mode access` or `--mode xss` narrows it to one. It exits `0` when there are no high/critical findings, `1` when there are, and `2` on errors (including a sink the model could not judge).
+`flowcheck scan <dir>` runs every vulnerability class by default and reports one merged result; `--mode sqli`, `--mode access` or `--mode xss` narrows it to one. It exits `0` when there are no high/critical findings and the analysis was complete, `1` when there are high/critical findings, `2` on errors (including a sink the model could not judge), and `3` when the analysis was incomplete (see below). A high/critical finding takes precedence over an error, and an error over an incomplete analysis.
+
+### Incomplete analysis
+
+"No findings" is only a clean result if the engine actually followed the code. A scan is **incomplete** when more than 20% of any of these went unanalyzed:
+
+- **routes:** registrations naming project code (`app.get('/x', mw, handler)`) whose handler or any middleware could not be resolved;
+- **tainted calls:** calls into project code the tracer could not follow, counted over all classes, and also within each class, so one class whose traces all broke is not hidden by the others;
+- **files:** source files with syntax errors.
+
+A project with no route or handler at all is also incomplete: nothing was analyzed. An incomplete scan exits `3` instead of `0` and ends with a warning that names what was not followed and why (each reason with a count, the functions or classes it was about, and an example location). The summary always carries an `Analysis:` row, `complete` or `INCOMPLETE`. Tune the threshold with `--max-unresolved <percent>` (or `maxUnresolved` in the config file); `100` accepts any coverage. This only changes the verdict — what is traced and judged is the same either way.
 
 ### Configuration
 
@@ -37,7 +47,7 @@ node dist/cli.js scan ../MetaVulnSite/server                     # full combined
 ```
 
 - **Where it is read from:** the scanned directory, then its project root (the nearest `package.json`), then the current directory. The first file found is used.
-- **Keys:** `target`, `token`, `identity`, `mode`, `probeRange`, `loginPath`, `loginBody`, `tokenField`, `browserPath`, `xssClient`, `xssTokenStore`, `startCmd`, `readyPath` — each means the same as its flag. An unknown key is an error, so a typo never silently drops a setting.
+- **Keys:** `target`, `token`, `identity`, `mode`, `maxUnresolved`, `probeRange`, `loginPath`, `loginBody`, `tokenField`, `browserPath`, `xssClient`, `xssTokenStore`, `startCmd`, `readyPath` — each means the same as its flag. An unknown key is an error, so a typo never silently drops a setting.
 - **Environment variables:** every key also has a `MUSEFLOWCHECK_<NAME>` variable — `MUSEFLOWCHECK_TARGET`, `MUSEFLOWCHECK_TOKEN`, `MUSEFLOWCHECK_IDENTITY`, `MUSEFLOWCHECK_PROBE_RANGE`, …
 - **Precedence:** a flag on the command line wins over the environment, which wins over the file. A `--login-path` given at a higher level replaces a token from a lower one.
 - **Secrets:** `museflowcheck.config.json` is gitignored because it holds a token; only the `.example` file is committed. The token is never printed: the scan names which settings came from the file or the environment, never their values, and any occurrence of the token in the human output is shown as `[token]`.
@@ -46,7 +56,7 @@ node dist/cli.js scan ../MetaVulnSite/server                     # full combined
 
 On a terminal, each finding is a card: a color-coded severity badge (`[CRITICAL]` red, `[HIGH]` yellow, `[MEDIUM]` blue, `[LOW]` dim), the type and CWE, and `✓ exploit confirmed` when verification proved it. Under it come the route and `source file:line → sink file:line`, the taint path hop by hop, **Why** it is exploitable, the **Proof** (what the exploit demonstrated, when confirmed), and the suggested **Fix** as a code block. A summary closes the report, with counts per class, per severity and per confidence.
 
-Color is used only on a terminal. It is off when output is piped, with `--json`, when `NO_COLOR` is set, or with `--no-color` (`FORCE_COLOR=1` turns it on anyway); without color every status is still a label or symbol. `--json` is the machine interface: stdout carries only the `Finding[]`, unchanged by any of the above, while progress and the summary go to stderr.
+Color is used only on a terminal. It is off when output is piped, with `--json`, when `NO_COLOR` is set, or with `--no-color` (`FORCE_COLOR=1` turns it on anyway); without color every status is still a label or symbol. `--json` is the machine interface: stdout carries only `{ "findings": Finding[], "analysis": {...} }`, unchanged by any of the above, while progress and the summary go to stderr. `analysis` reports coverage — `complete`, `entryPointsTotal`, `entryPointsResolved`, `callsFollowed`, `unresolved`, `files`, `filesParsed`, `parseErrors`, `reasons` and `problems` — so a consumer can tell an incomplete scan from a clean one instead of reading `findings: []` as safe.
 
 ### SQL injection (project scan)
 
