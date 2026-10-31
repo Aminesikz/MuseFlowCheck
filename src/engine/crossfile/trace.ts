@@ -20,6 +20,7 @@ import {
   type MethodDeclaration,
   type NewExpression,
   type ObjectLiteralExpression,
+  type PropertyAccessExpression,
   type SourceFile,
   type VariableDeclaration,
 } from "ts-morph";
@@ -156,6 +157,7 @@ export type Value =
   | { kind: "object"; obj: ObjectLiteralExpression }
   | { kind: "class"; cls: Cls }
   | { kind: "instance"; cls: Cls; args?: Thunk[] } // args: constructor arguments from the `new` site, when known
+  | { kind: "constructed"; ctor: Fn } // `new F()` on a plain constructor function: members are `this.x = …` / `F.prototype.x = …`
   | { kind: "external"; what: string }
   | { kind: "unresolved"; reason: string };
 /**
@@ -172,7 +174,7 @@ export type Handler = {
   /** The router/app call that registered it, for handlers found through a route registration. */
   registration?: CallExpression;
 };
-type ProjectValue = Extract<Value, { kind: "module" | "object" | "class" | "instance" }>;
+type ProjectValue = Extract<Value, { kind: "module" | "object" | "class" | "instance" | "constructed" }>;
 export type Callee = Value | { kind: "sink" };
 
 /** Request properties that carry attacker-controlled input. */
@@ -208,7 +210,7 @@ export function isFn(node: Node | undefined): node is Fn {
 }
 
 function isProjectValue(v: Value): v is ProjectValue {
-  return v.kind === "module" || v.kind === "object" || v.kind === "class" || v.kind === "instance";
+  return v.kind === "module" || v.kind === "object" || v.kind === "class" || v.kind === "instance" || v.kind === "constructed";
 }
 
 export function excerpt(node: Node, max = 140): string {
@@ -927,7 +929,10 @@ export class Tracer {
     if (Node.isNewExpression(e)) {
       const ctor = this.resolveExpr(e.getExpression());
       if (ctor.kind === "class") return { kind: "instance", cls: ctor.cls, args: (e.getArguments() ?? []).map((a) => () => this.resolveExpr(a)) };
-      if (ctor.kind === "function") return { kind: "unresolved", reason: `'new' on constructor function ${this.fnName(ctor.fn)}` };
+      if (ctor.kind === "function") {
+        if (this.isConstructorFunction(ctor.fn)) return { kind: "constructed", ctor: ctor.fn };
+        return { kind: "unresolved", reason: `'new' on constructor function ${this.fnName(ctor.fn)}` };
+      }
       return ctor;
     }
     if (Node.isCallExpression(e)) return this.resolveCallResult(e);
@@ -990,7 +995,96 @@ export class Tracer {
       return { kind: "instance", cls: parent };
     }
     if (Node.isObjectLiteralExpression(parent)) return { kind: "object", obj: parent };
+    const ctor = this.thisConstructor(owner);
+    if (ctor) {
+      // As for classes, prefer the receiver the method was called on.
+      const self = this.selfStack.at(-1);
+      return self?.kind === "constructed" && self.ctor === ctor ? self : { kind: "constructed", ctor };
+    }
     return { kind: "unresolved", reason: "'this' outside a class or object method" };
+  }
+
+  // ---- constructor functions (`function F(db) { this.m = … }` used with `new F(db)`) --------------
+
+  /** The function a `this` expression is bound by: the nearest enclosing function that is not an arrow. */
+  private thisOwner(node: Node): Node | undefined {
+    return node.getFirstAncestor(
+      (a) => Node.isFunctionDeclaration(a) || Node.isFunctionExpression(a) || Node.isMethodDeclaration(a) || Node.isConstructorDeclaration(a) || Node.isPropertyDeclaration(a),
+    );
+  }
+
+  /** `this.<name> = …` assignments made by `fn` itself (also from arrow functions inside it, which share its `this`). */
+  private thisAssignments(fn: Fn): { name: string; bin: BinaryExpression }[] {
+    const out: { name: string; bin: BinaryExpression }[] = [];
+    for (const bin of fn.getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
+      const left = bin.getLeft();
+      if (bin.getOperatorToken().getKind() !== SyntaxKind.EqualsToken || !Node.isPropertyAccessExpression(left)) continue;
+      if (Node.isThisExpression(left.getExpression()) && this.thisOwner(left) === fn) out.push({ name: left.getName(), bin });
+    }
+    return out;
+  }
+
+  /** The name a plain function is known by in its file: its declaration name, or the variable it is assigned to. */
+  private declaredName(fn: Fn): string | undefined {
+    if (Node.isFunctionDeclaration(fn)) return fn.getName();
+    const parent = fn.getParent();
+    if (Node.isFunctionExpression(fn) && Node.isVariableDeclaration(parent)) return parent.getName();
+    return undefined;
+  }
+
+  /** `F.prototype.<name> = …` and `F.prototype = { … }` assignments in the function's file. */
+  private prototypeAssignments(fn: Fn): BinaryExpression[] {
+    const name = this.declaredName(fn);
+    if (!name) return [];
+    return fn
+      .getSourceFile()
+      .getDescendantsOfKind(SyntaxKind.BinaryExpression)
+      .filter((bin) => bin.getOperatorToken().getKind() === SyntaxKind.EqualsToken && new RegExp(`^${name}\\.prototype(?:\\.[\\w$]+)?$`).test(bin.getLeft().getText().replace(/\s+/g, "")));
+  }
+
+  /** A plain (non-arrow) function that sets members on `this` or its prototype: what `new` on it builds is followable. */
+  private isConstructorFunction(fn: Fn): boolean {
+    if (!Node.isFunctionDeclaration(fn) && !Node.isFunctionExpression(fn)) return false;
+    return this.thisAssignments(fn).length > 0 || this.prototypeAssignments(fn).length > 0;
+  }
+
+  /**
+   * The constructor function whose instance `this` is inside `owner`: the constructor itself, a function assigned as
+   * one of its members (`this.m = function () {…}`), or a prototype method (`F.prototype.m = function () {…}`).
+   */
+  private thisConstructor(owner: Node | undefined): Fn | undefined {
+    if (!Node.isFunctionDeclaration(owner) && !Node.isFunctionExpression(owner)) return undefined;
+    if (this.isConstructorFunction(owner)) return owner;
+    const bin = owner.getParent();
+    if (!Node.isBinaryExpression(bin) || bin.getRight() !== owner || !Node.isPropertyAccessExpression(bin.getLeft())) return undefined;
+    const left = bin.getLeft() as PropertyAccessExpression;
+    const receiver = left.getExpression();
+    if (Node.isThisExpression(receiver)) {
+      const ctor = this.thisOwner(receiver);
+      return isFn(ctor) && this.isConstructorFunction(ctor) ? ctor : undefined;
+    }
+    if (Node.isPropertyAccessExpression(receiver) && receiver.getName() === "prototype") {
+      const v = this.resolveExpr(receiver.getExpression());
+      return v.kind === "function" && this.isConstructorFunction(v.fn) ? v.fn : undefined;
+    }
+    return undefined;
+  }
+
+  /** A member of a constructor function's instance; methods are bound to that instance. */
+  private constructedMember(v: Extract<Value, { kind: "constructed" }>, name: string): Value | undefined {
+    const bound = (value: Value): Value => (value.kind === "function" ? { ...value, self: v } : value);
+    const own = this.thisAssignments(v.ctor).find((a) => a.name === name);
+    if (own) return bound(this.resolveExpr(own.bin.getRight()));
+    for (const bin of this.prototypeAssignments(v.ctor)) {
+      const left = bin.getLeft().getText().replace(/\s+/g, "");
+      if (left.endsWith(`.prototype.${name}`)) return bound(this.resolveExpr(bin.getRight()));
+      const right = unwrap(bin.getRight());
+      if (left.endsWith(".prototype") && Node.isObjectLiteralExpression(right)) {
+        const m = this.propertyOf(right, name);
+        if (m) return bound(m);
+      }
+    }
+    return undefined;
   }
 
   private resolveName(from: Node, name: string): Value {
@@ -1109,6 +1203,8 @@ export class Tracer {
         return this.classMember(v.cls, name, true, v);
       case "instance":
         return this.classMember(v.cls, name, false, v, v.args);
+      case "constructed":
+        return this.constructedMember(v, name);
     }
   }
 
@@ -1118,6 +1214,8 @@ export class Tracer {
         return `${this.rel(v.sf)} has no export '${name}'`;
       case "object":
         return `object at ${this.rel(v.obj.getSourceFile())}:${v.obj.getStartLineNumber()} has no property '${name}'`;
+      case "constructed":
+        return `constructor function ${this.fnName(v.ctor)} assigns no member '${name}' (this.${name} = … or prototype.${name} = …)`;
       default:
         return `class ${v.cls.getName() ?? "<anonymous>"} has no ${v.kind === "class" ? "static " : ""}member '${name}'`;
     }

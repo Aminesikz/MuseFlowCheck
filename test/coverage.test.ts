@@ -31,14 +31,14 @@ function scan(...args: string[]) {
   return { code: run.status, stdout: run.stdout, stderr: run.stderr };
 }
 
-// Handlers and the data layer are constructor functions (`function X(db) { this.m = … }` used with `new`), which the
-// tracer does not follow: two of three routes, their middleware and every database call are out of its reach — and
-// the unreached data layer builds SQL from request input.
+// Handlers and the data layer are loaded through computed module paths, which the tracer cannot follow: two of three
+// routes, their middleware and every database call are out of its reach — and the unreached data layer builds SQL
+// from request input.
 const opaque = project("opaque", {
   "routes/index.js": [
-    'const NotesHandler = require("./notes");',
-    "module.exports = (app, db) => {",
-    "  const notes = new NotesHandler(db);",
+    'const load = (name) => require("./" + name);',
+    "module.exports = (app) => {",
+    '  const notes = load("notes");',
     "  const requireLogin = notes.requireLogin;",
     '  app.get("/notes", requireLogin, notes.list);',
     '  app.post("/notes", requireLogin, notes.add);',
@@ -47,22 +47,16 @@ const opaque = project("opaque", {
     "",
   ].join("\n"),
   "routes/notes.js": [
-    'const NotesDAO = require("../data/notes-dao");',
-    "function NotesHandler(db) {",
-    "  const dao = new NotesDAO(db);",
-    '  this.requireLogin = (req, res, next) => (req.session.userId ? next() : res.redirect("/login"));',
-    '  this.list = (req, res) => dao.byOwner(req.query.owner, (err, rows) => res.render("notes", { rows }));',
-    '  this.add = (req, res) => dao.insert(req.body.text, () => res.redirect("/notes"));',
-    "}",
-    "module.exports = NotesHandler;",
+    "const dao = require(process.env.NOTES_DAO);",
+    'exports.requireLogin = (req, res, next) => (req.session.userId ? next() : res.redirect("/login"));',
+    'exports.list = (req, res) => dao.byOwner(req.query.owner, (err, rows) => res.json(rows));',
+    'exports.add = (req, res) => dao.insert(req.body.text, () => res.redirect("/notes"));',
     "",
   ].join("\n"),
   "data/notes-dao.js": [
-    "function NotesDAO(db) {",
-    "  this.byOwner = (owner, cb) => db.query(\"SELECT * FROM notes WHERE owner = '\" + owner + \"'\", cb);",
-    '  this.insert = (text, cb) => db.query("INSERT INTO notes (text) VALUES ($1)", [text], cb);',
-    "}",
-    "module.exports = NotesDAO;",
+    "const db = require('pg');",
+    "exports.byOwner = (owner, cb) => db.query(\"SELECT * FROM notes WHERE owner = '\" + owner + \"'\", cb);",
+    'exports.insert = (text, cb) => db.query("INSERT INTO notes (text) VALUES ($1)", [text], cb);',
     "",
   ].join("\n"),
 });
@@ -76,15 +70,15 @@ test("a scan that could not follow most routes and calls exits 3 with a warning,
   assert.equal(out.analysis.entryPointsTotal, 3);
   assert.equal(out.analysis.entryPointsResolved, 1, "only the inline /health handler resolved");
   assert.equal(out.analysis.unresolved, 2, "both database calls");
-  assert.equal(out.analysis.reasons[0].reason, "'new' on constructor function");
-  assert.deepEqual(out.analysis.reasons[0].names.sort(), ["NotesDAO", "NotesHandler"]);
+  assert.match(out.analysis.reasons.map((r: { reason: string }) => r.reason).join("\n"), /dynamic require\("\.\/" \+ name\)/);
+  assert.match(out.analysis.reasons.map((r: { reason: string }) => r.reason).join("\n"), /dynamic require\(process\.env\.NOTES_DAO\)/);
   assert.match(out.analysis.problems.join("\n"), /could not follow 2 of 3 routes/);
 
   const human = scan(opaque, "--no-color");
   assert.equal(human.code, 3);
   assert.match(human.stdout, /^ {2}Analysis: {7}INCOMPLETE — 1 of 3 routes, 0 of 2 tainted calls followed$/m);
   assert.match(human.stdout, /⚠ INCOMPLETE ANALYSIS — results are NOT a clean bill of health/);
-  assert.match(human.stdout, /'new' on constructor function\n\s+NotesHandler, NotesDAO|'new' on constructor function\n\s+NotesDAO, NotesHandler/);
+  assert.match(human.stdout, /Not followed \(unsupported code patterns\):\n\s+\d+× dynamic require/);
   assert.match(human.stdout, /Exit code 3\s+\(incomplete analysis\),\s+not 0\./); // the paragraph is word-wrapped
   // The warning is the last thing printed, after the summary and the per-class notes.
   assert.ok(human.stdout.lastIndexOf("INCOMPLETE ANALYSIS") > human.stdout.lastIndexOf("── Summary"));

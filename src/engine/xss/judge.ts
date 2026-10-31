@@ -114,6 +114,7 @@ The level follows from this rule and the reach above — do not re-derive impact
 const OUTPUT_KIND: Record<XssPath["context"], string> = {
   markup: "interpolated or concatenated into a string whose literal text is HTML markup, which the server sends as a page",
   response: "written to the HTTP response as-is",
+  template: "passed to res.render and written into the page by a server-side template (the template line is the last hop; Stage 1 read the engine's escaping for it, noted in brackets)",
   "dom-html": "inserted into the page as HTML in the browser (React dangerouslySetInnerHTML, or innerHTML / insertAdjacentHTML / document.write), where the string is parsed as markup",
   "jsx-text": "rendered as a JSX text child",
 };

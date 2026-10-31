@@ -69,6 +69,12 @@ export function discoverSqlFiles(root: string): string[] {
   return walkFiles(root, (name) => name.endsWith(".sql"));
 }
 
+/** Server-side template files under `root` (same skip rules): what `res.render(view, data)` can render. */
+export const TEMPLATE_FILE = /\.(?:html?|ejs|hbs|handlebars|mustache|pug|jade|njk|nunjucks|swig|twig|liquid)$/;
+export function discoverTemplateFiles(root: string): string[] {
+  return walkFiles(root, (name) => TEMPLATE_FILE.test(name));
+}
+
 function walkFiles(root: string, accept: (name: string) => boolean): string[] {
   const files: string[] = [];
   const walk = (dir: string, matchers: Matcher[]) => {

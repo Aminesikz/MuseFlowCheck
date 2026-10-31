@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { Node, SyntaxKind, type CallExpression, type Project, type SourceFile, type VariableDeclaration } from "ts-morph";
 import { discoverFiles } from "../crossfile/files.js";
+import { readViewSetup, Templates, type Template, type TemplateOutput, type ViewSetup } from "./template.js";
 import {
   excerpt,
   isFn,
@@ -61,8 +62,8 @@ export interface Reach {
   code: string;
 }
 
-/** Where an output is: markup built as a string, the response body, the DOM as HTML, or a JSX text child. */
-export type XssContext = "markup" | "response" | "dom-html" | "jsx-text";
+/** Where an output is: markup built as a string, the response body, a server template, the DOM as HTML, or a JSX text child. */
+export type XssContext = "markup" | "response" | "template" | "dom-html" | "jsx-text";
 
 export interface XssPath {
   /** Ordered source → … → output. For stored XSS: the write, then the read back, then the rendering. */
@@ -271,10 +272,14 @@ export class XssTracer extends Tracer {
   /** The request handler being walked (server side), whose code decides who receives what it renders. */
   private walking?: { fn: Fn; req?: string };
   private readonly reaches = new Map<Fn, Reach>();
+  /** View templates for `res.render`, with the engine setup read once from the project's code. */
+  private readonly templates: Templates;
+  private viewSetup?: ViewSetup;
 
   constructor(root: string, storedWrites?: Map<string, StoredWrite>, project?: Project) {
     super(root, project);
     this.storedWrites = storedWrites ?? new Map();
+    this.templates = new Templates(root, () => (this.viewSetup ??= readViewSetup(discoverFiles(root).map((f) => this.load(f)), root, (sf) => this.relPath(sf))));
   }
 
   /** Enter callees and callbacks without tainted arguments too, once there is stored data they could read. */
@@ -419,6 +424,7 @@ export class XssTracer extends Tracer {
     const method = this.responseCall(call);
     const [body] = call.getArguments();
     if (!method || !body) return;
+    if (method === "render") return this.onRender(call, env, scope);
     const json = method === "json" || Node.isObjectLiteralExpression(unwrap(body)) || Node.isArrayLiteralExpression(unwrap(body));
     for (const t of this.taintsOf(body, env, scope)) {
       if (json && t.stored && !this.exposures.has(t.stored)) {
@@ -428,6 +434,70 @@ export class XssTracer extends Tracer {
         this.record(t, body, "response", scope.ref!);
       }
     }
+  }
+
+  /**
+   * `res.render(view, data)`: each value of `data` lands wherever the view's template outputs it. A tainted value is a
+   * candidate where the template writes it unescaped (auto-escaping off, or a raw construct) and listed as encoded
+   * where it is escaped. A template that cannot be found or read is an unresolved edge, never assumed safe.
+   */
+  private onRender(call: CallExpression, env: Env, scope: Scope): void {
+    const [viewArg, data] = call.getArguments();
+    if (!data || this.taintsOf(data, env, scope).length === 0) return;
+    // Labeled with the view: the same call is also listed as leaving the project (`res` is a parameter), under its own key.
+    const at = { file: scope.ref!.file, line: call.getStartLineNumber(), call: `${excerpt(call.getExpression())}(${excerpt(viewArg, 60)})` };
+    const v = unwrap(viewArg);
+    const view = Node.isStringLiteral(v) || Node.isNoSubstitutionTemplateLiteral(v) ? v.getLiteralValue() : undefined;
+    if (view === undefined) return this.addEdge(this.unresolved, { ...at, reason: `view name ${excerpt(viewArg, 60)} is computed at runtime` });
+    const template = this.templates.get(view);
+    if (typeof template === "string") return this.addEdge(this.unresolved, { ...at, reason: template });
+
+    const object = this.objectLiteralOf(data);
+    const keyTaints = (key: string) => (object ? this.objectKeyTaints(object, key, env, scope) : member(this.taintsOf(data, env, scope), key));
+    const renderHop = this.hop(call, "call", scope.ref!, `${excerpt(call)}  [renders ${template.file} with ${template.engine}]`);
+    for (const out of template.outputs) {
+      for (const t of merge(...out.names.map(keyTaints))) {
+        if (stateOf(t) === "html") continue; // built into markup earlier: judged where it was built
+        const sink = this.templateHop(template, out);
+        this.recordPath({ ...t, hops: [...t.hops, renderHop] }, sink, "template", call.getSourceFile(), out.raw ? undefined : `${out.how} (${template.file}:${out.line})`);
+      }
+    }
+  }
+
+  /** The object literal a render's data argument is: written inline, or held by a local constant. */
+  private objectLiteralOf(node: Node): Node | undefined {
+    const e = unwrap(node);
+    if (Node.isObjectLiteralExpression(e)) return e;
+    if (!Node.isIdentifier(e)) return undefined;
+    const decl = this.lookup(e, e.getText());
+    const init = Node.isVariableDeclaration(decl) ? decl.getInitializer() : undefined;
+    return init && Node.isObjectLiteralExpression(unwrap(init)) ? unwrap(init) : undefined;
+  }
+
+  /** The taint of one key of an object literal: its own property, else what a spread of a tainted value carries for it. */
+  private objectKeyTaints(obj: Node, key: string, env: Env, scope: Scope): XssTaint[] {
+    if (!Node.isObjectLiteralExpression(obj)) return [];
+    const props = obj.getProperties();
+    const spreads: XssTaint[][] = [];
+    for (let i = props.length - 1; i >= 0; i--) {
+      const p = props[i];
+      if (Node.isPropertyAssignment(p) && p.getName().replace(/^["']|["']$/g, "") === key) return merge(this.taintsOf(p.getInitializerOrThrow(), env, scope), ...spreads);
+      if (Node.isShorthandPropertyAssignment(p) && p.getName() === key) return merge(this.taintsOf(p.getNameNode(), env, scope), ...spreads);
+      if (Node.isSpreadAssignment(p)) {
+        const inner = this.objectLiteralOf(p.getExpression()); // `...errors` where errors is a local object literal: key by key
+        spreads.push(inner ? this.objectKeyTaints(inner, key, env, scope) : member(this.taintsOf(p.getExpression(), env, scope), key));
+      }
+    }
+    return merge(...spreads);
+  }
+
+  /** The template line as the path's last hop, with the lines around it as the code the judge reads. */
+  private templateHop(template: Template, out: TemplateOutput): Hop {
+    const start = Math.max(1, out.line - 3);
+    const end = Math.min(template.lines.length, out.line + 3);
+    const fn: FunctionRef = { file: template.file, name: `template (${template.engine})`, startLine: start, endLine: end, code: template.lines.slice(start - 1, end).join("\n") };
+    const code = template.lines[out.line - 1].trim();
+    return { file: template.file, line: out.line, code: `${code.length > 120 ? `${code.slice(0, 119)}…` : code}  [${out.raw ? "unescaped: " : ""}${out.how}]`, kind: "sink", fn };
   }
 
   /** A SQL write whose parameter for a column is raw request input: that column now holds attacker-controlled text. */
@@ -492,11 +562,16 @@ export class XssTracer extends Tracer {
   }
 
   private record(t: XssTaint, value: Node, context: XssContext, ref: FunctionRef, encoder?: string): void {
-    if (t.field) return; // a record whose stored property was not selected: the record itself is not that text
     const sf = value.getSourceFile();
     const line = value.getStartLineNumber();
     const code = sf.getFullText().split(/\r?\n/)[line - 1].trim();
     const sink: Hop = { file: this.relPath(sf), line, code: code.length > 140 ? `${code.slice(0, 139)}…` : code, kind: "sink", fn: ref };
+    this.recordPath(t, sink, context, sf, encoder);
+  }
+
+  /** Records a path ending at `sink`; `sf` is the code file whose imports a patch can reuse. */
+  private recordPath(t: XssTaint, sink: Hop, context: XssContext, sf: SourceFile, encoder?: string): void {
+    if (t.field) return; // a record whose stored property was not selected: the record itself is not that text
     const encoded = encoder !== undefined || stateOf(t) === "encoded";
     const key = `${t.origin}->${sink.file}:${sink.line}:${encoded}`;
     if (this.xssKeys.has(key)) return;

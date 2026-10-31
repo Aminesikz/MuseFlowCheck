@@ -611,6 +611,7 @@ function formatXssPath(p: XssPath): string[] {
 const XSS_OUTPUT: Record<XssPath["context"], string> = {
   markup: "placed into markup",
   response: "written to the response",
+  template: "written into a template",
   "dom-html": "inserted as HTML in the browser",
   "jsx-text": "rendered as JSX text",
 };
