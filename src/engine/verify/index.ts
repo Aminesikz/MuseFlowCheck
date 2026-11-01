@@ -124,6 +124,16 @@ export async function verifyFinding(finding: Finding, target: Target, deps: Veri
   // an INSERT that did not satisfy the check still inserted.
   const reseed = mutationWarning(finding, poc);
 
+  // A cross-scope READ is proved the same way as a write: by the ownership field Stage 1 identified, never the
+  // record's own id. For an access finding whose check is a field difference, compare that field — and when none is
+  // known and the model named only the record's own id, refuse to confirm (a differing primary key is not a crossing).
+  if (isAccessFinding(finding) && poc.check.type === "field-differs" && !idorField) {
+    return unverified(
+      `no ownership/scope field was identified for ${finding.httpRoute}, so a cross-scope read cannot be proved — a differing ${rp ? rp.param : "primary key"} is the record's own id, not proof that the record belongs to another scope.`,
+    );
+  }
+  const check = isAccessFinding(finding) && poc.check.type === "field-differs" && idorField ? { ...poc.check, field: idorField } : poc.check;
+
   let baseline: TargetResponse;
   let exploit: TargetResponse;
   try {
@@ -134,7 +144,7 @@ export async function verifyFinding(finding: Finding, target: Target, deps: Veri
     return unverified(`the PoC could not be executed against the target: ${(err as Error).message}${reseed}`);
   }
 
-  const result = evaluate(poc.check, baseline, exploit);
+  const result = evaluate(check, baseline, exploit);
   const baseEv = evidence(baseline);
   const exploitEv = evidence(exploit);
   if (!result.success) {

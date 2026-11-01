@@ -777,3 +777,50 @@ test("findOwnerField matches an ownership column across snake_case and camelCase
   assert.equal(findOwnerField({ data: { owner_id: 7 } }, "owner_id"), 7);
   assert.equal(findOwnerField({ id: 5 }, "shop_id"), undefined);
 });
+
+// ---- read-IDOR proves on the ownership field, never the primary key -----------------------------
+
+test("IDOR read: confirms on the ownership field (shop_id) even when the PoC named the primary key", async () => {
+  resetAppts();
+  const target = new Target({ url: base, auth: idorToken });
+  const finding: Finding = { ...idorFinding, cwe: "CWE-639", httpRoute: "GET /api/appointments/:id", ownershipField: "shop_id" };
+  const poc = {
+    baseline: { method: "GET", path: "/api/appointments/1" }, // own, shop_id 1
+    exploit: { method: "GET", path: "/api/appointments/3" }, // shop_id 2 — a different shop
+    check: { type: "field-differs", field: "id" }, // model named the record's own key; must be ignored
+    rationale: "reading another shop's appointment",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
+  assert.equal(f.confidence, "confirmed");
+  assert.match(f.verification!.summary, /shop_id=2.*vs the baseline's 1/, "evidence cites the ownership field, not the id");
+});
+
+test("IDOR read: a different primary key within the SAME scope does NOT falsely confirm", async () => {
+  // Only shop 1 exists: ids differ but every shop_id is the caller's own, so no cross-scope read can be proved.
+  appts = { 1: { id: 1, shop_id: 1, status: "booked" }, 2: { id: 2, shop_id: 1, status: "completed" } };
+  const target = new Target({ url: base, auth: idorToken });
+  const finding: Finding = { ...idorFinding, cwe: "CWE-639", httpRoute: "GET /api/appointments/:id", ownershipField: "shop_id" };
+  const poc = {
+    baseline: { method: "GET", path: "/api/appointments/1" },
+    exploit: { method: "GET", path: "/api/appointments/2" }, // different id, SAME shop_id
+    check: { type: "field-differs", field: "shop_id" },
+    rationale: "x",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
+  assert.equal(f.confidence, "unverified", "same shop_id on both — not a cross-scope read");
+});
+
+test("IDOR read: with no ownership field known, a differing primary key alone does not confirm", async () => {
+  resetAppts();
+  const target = new Target({ url: base, auth: idorToken });
+  const finding: Finding = { ...idorFinding, cwe: "CWE-639", httpRoute: "GET /api/appointments/:id" }; // no ownershipField
+  const poc = {
+    baseline: { method: "GET", path: "/api/appointments/1" },
+    exploit: { method: "GET", path: "/api/appointments/3" },
+    check: { type: "field-differs", field: "id" }, // the route's path parameter — the record's own id
+    rationale: "x",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
+  assert.equal(f.confidence, "unverified");
+  assert.match(f.verification!.summary, /not proof that the record belongs to another scope/);
+});

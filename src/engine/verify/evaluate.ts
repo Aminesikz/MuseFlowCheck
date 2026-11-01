@@ -178,8 +178,8 @@ export function evaluate(check: Check, baseline: RawResponse, exploit: RawRespon
       };
     }
     case "field-differs": {
-      const b = findField(parse(baseline.body), check.field);
-      const e = findField(parse(exploit.body), check.field);
+      const b = findOwnerField(parse(baseline.body), check.field);
+      const e = findOwnerField(parse(exploit.body), check.field);
       const differ = e !== undefined && b !== undefined && JSON.stringify(e) !== JSON.stringify(b);
       return {
         success: ok(exploit.status) && differ,

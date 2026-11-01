@@ -42,7 +42,9 @@ export function accessReach(ctx: AccessContext, route: AccessRoute): { level: Ac
       }
       const scope = scopes.get(table);
       if (scope) {
-        return { level: "cross-scope", evidence: `${table} is itself a scope record (identified by ${route.identity!.expression}.${scope.field}), and the request value ${a.location}.${a.field} ${verb} ${table} rows with no check against the caller's own` };
+        // The row IS the scope record, identified by the caller's scope field (e.g. shopId) — the field a proof
+        // compares between the caller's scope and the returned record.
+        return { level: "cross-scope", ownerField: scope.field, evidence: `${table} is itself a scope record (identified by ${route.identity!.expression}.${scope.field}), and the request value ${a.location}.${a.field} ${verb} ${table} rows with no check against the caller's own` };
       }
     }
   }
