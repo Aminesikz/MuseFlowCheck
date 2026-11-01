@@ -6,7 +6,7 @@
 // as the authenticated caller and reading the owner/scope field off each response. It never reads the seed script, the
 // database, or any fixture internals, and it only ever talks to the configured local Target.
 import type { Finding } from "../../types/index.js";
-import { findField, parse } from "./evaluate.js";
+import { findField, findOwnerField, parse } from "./evaluate.js";
 import type { Target, TargetResponse } from "./target.js";
 
 export interface RouteParam {
@@ -94,7 +94,7 @@ export async function discoverCrossScopeId(
     if (!ok(res.status)) continue;
     const parsed = parse(res.body);
     seen.push(parsed);
-    const owner = findField(parsed, ownerField);
+    const owner = findOwnerField(parsed, ownerField);
     if (owner !== undefined && JSON.stringify(owner) !== own) return { id, owner, response: res, seen };
   }
   return undefined;

@@ -41,6 +41,21 @@ function findArray(value: unknown, field?: string): unknown[] | undefined {
   return undefined;
 }
 
+/**
+ * Looks up an ownership field in a response body, tolerant of case convention: the schema column is snake_case
+ * (`shop_id`) while a JSON body may camelCase it (`shopId`). Tries the name as given, then its camelCase and
+ * snake_case forms, returning the first that is present.
+ */
+export function findOwnerField(value: unknown, field: string): unknown {
+  const camel = field.replace(/_([a-z0-9])/g, (_m, c) => c.toUpperCase());
+  const snake = field.replace(/([A-Z])/g, (c) => `_${c.toLowerCase()}`);
+  for (const name of new Set([field, camel, snake])) {
+    const v = findField(value, name);
+    if (v !== undefined) return v;
+  }
+  return undefined;
+}
+
 /** First occurrence of `field` anywhere in a JSON value (breadth-first), or undefined. */
 export function findField(value: unknown, field: string): unknown {
   const queue: unknown[] = [value];

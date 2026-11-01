@@ -27,7 +27,7 @@ export type AccessReach = "cross-scope" | "unestablished";
  * is itself a scope record, with no check on the path; otherwise "unestablished" (no schema, or ownership only
  * inferred from a statement). Taken over all the route's unchecked accesses, so the path the judge cites cannot move it.
  */
-export function accessReach(ctx: AccessContext, route: AccessRoute): { level: AccessReach; evidence?: string } {
+export function accessReach(ctx: AccessContext, route: AccessRoute): { level: AccessReach; evidence?: string; ownerField?: string } {
   const owners = ownerColumns(route.identity);
   const scopes = scopeTables(ctx.schema, owners);
   for (const a of route.accesses) {
@@ -36,7 +36,9 @@ export function accessReach(ctx: AccessContext, route: AccessRoute): { level: Ac
       const schema = ctx.schema.find((t) => t.name === table);
       const owner = schema?.columns.find((c) => owners.has(c.name));
       if (owner) {
-        return { level: "cross-scope", evidence: `${table}.${owner.name} (${schema!.file}:${owner.line}) ties each ${table} row to an owner, and the request value ${a.location}.${a.field} ${verb} ${table} rows with no check against the caller's own ${route.identity!.expression}.${owners.get(owner.name)}` };
+        // `owner.name` is the column that ties a row to its owner (e.g. shop_id) — the field a proof must compare,
+        // never the row's own primary key.
+        return { level: "cross-scope", ownerField: owner.name, evidence: `${table}.${owner.name} (${schema!.file}:${owner.line}) ties each ${table} row to an owner, and the request value ${a.location}.${a.field} ${verb} ${table} rows with no check against the caller's own ${route.identity!.expression}.${owners.get(owner.name)}` };
       }
       const scope = scopes.get(table);
       if (scope) {
@@ -235,6 +237,7 @@ export function parseAccessJudgment(raw: string, route: AccessRoute, ctx: Access
       sinkLine: sink.line,
       taintPath: access.path.hops.map(formatHop),
       httpRoute: routeLabel(route), // metadata for the verifier (e.g. "GET /api/x/:id"); not used by analysis
+      ...(accessReach(ctx, route).ownerField ? { ownershipField: accessReach(ctx, route).ownerField } : {}), // the scope column the proof must compare
       confidence: "suspected",
     };
   } catch (err) {

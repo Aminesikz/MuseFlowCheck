@@ -39,6 +39,12 @@ export interface Finding {
   httpRoute?: string;
   /** Stored flows: the HTTP route that wrote the value, e.g. "PUT /api/barbers/:id/bio", when traced from a registered handler. */
   writeRoute?: string;
+  /**
+   * Access-control findings: the schema's ownership/scope column that ties the accessed rows to an owner (e.g.
+   * `shop_id`, `user_id`), identified by Stage 1. The verifier compares THIS field to prove a cross-scope access —
+   * never the record's own primary key, which says nothing about who owns it.
+   */
+  ownershipField?: string;
   confidence: Confidence;
   /** Attached by the self-verification pass when a local target is configured; drives `confidence`. */
   verification?: Verification;

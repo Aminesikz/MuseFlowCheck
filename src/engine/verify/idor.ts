@@ -7,7 +7,7 @@
 // cross-scope, then restore it. All requests go only to the configured local Target. The own-scope "baseline" write is
 // a no-op (the resource's own current values), so the caller's own data is never actually changed.
 import type { Finding, Verification } from "../../types/index.js";
-import { findField, parse } from "./evaluate.js";
+import { findField, findOwnerField, parse } from "./evaluate.js";
 import { evidence } from "./evidence.js";
 import { discoverCrossScopeId, fillParam, isMutating, type RouteParam } from "./discover.js";
 import type { Poc } from "./poc.js";
@@ -96,7 +96,7 @@ export async function proveReadIdor(
   baseline: TargetResponse,
   range: number,
 ): Promise<IdorProof> {
-  const ownScope = findField(parse(baseline.body), ownerField);
+  const ownScope = findOwnerField(parse(baseline.body), ownerField);
   if (ownScope === undefined) {
     return { kind: "unverified", reason: `could not read the caller's own ${ownerField} from the baseline response to anchor id discovery` };
   }
@@ -105,7 +105,7 @@ export async function proveReadIdor(
     return { kind: "unverified", reason: `no resource owned by another scope was found probing GET ${rp.template} for ids 1..${range}; cannot prove cross-scope access` };
   }
   const exploitRes = await send(target, { method: rp.method, path: fillParam(rp, disc.id), authenticated: poc.exploit.authenticated ?? true });
-  const foreign = findField(parse(exploitRes.body), ownerField);
+  const foreign = findOwnerField(parse(exploitRes.body), ownerField);
   if (!(ok(exploitRes.status) && differs(foreign, ownScope))) {
     return {
       kind: "unverified",
@@ -170,7 +170,7 @@ async function restore(target: Target, path: string, before: TargetResponse, key
  */
 export async function proveWriteIdor(poc: Poc, rp: RouteParam, ownerField: string, target: Target, range: number): Promise<IdorProof> {
   const ownRead = await send(target, { method: "GET", path: poc.baseline.path, authenticated: poc.baseline.authenticated ?? true });
-  const ownScope = findField(parse(ownRead.body), ownerField);
+  const ownScope = findOwnerField(parse(ownRead.body), ownerField);
   if (ownScope === undefined) {
     return { kind: "unverified", reason: `could not read the caller's own ${ownerField} from GET ${poc.baseline.path} to anchor id discovery` };
   }
@@ -217,7 +217,7 @@ export async function proveWriteIdor(poc: Poc, rp: RouteParam, ownerField: strin
       }
     }
   }
-  const afterOwner = findField(parse(after.body), ownerField);
+  const afterOwner = findOwnerField(parse(after.body), ownerField);
 
   const confirmed = ok(mutate.status) && differs(afterOwner, ownScope) && effect.tookEffect;
   // Restore whenever a write took effect, confirmed or not, so the fixture is never left mutated.

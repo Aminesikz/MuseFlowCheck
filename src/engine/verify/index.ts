@@ -13,7 +13,7 @@ import { buildXssPocPrompt, isXssFinding, parseXssPlan, proveXss, type XssProofD
 
 export { assertLocalTarget, Target, TargetError, type AuthConfig, type FetchLike } from "./target.js";
 export { buildPocPrompt, parsePoc, type Poc } from "./poc.js";
-export { emptyResult, evaluate, findField, parse, sameResponse } from "./evaluate.js";
+export { emptyResult, evaluate, findField, findOwnerField, parse, sameResponse } from "./evaluate.js";
 export { discoverCrossScopeId, fillParam, isMutating, routeParam, sqlSinkKind, type RouteParam } from "./discover.js";
 export { isAccessFinding, proveReadIdor, proveWriteIdor } from "./idor.js";
 export { type PatchProver, verifyPatch } from "./patch.js";
@@ -91,11 +91,23 @@ export async function verifyFinding(finding: Finding, target: Target, deps: Veri
 
   // ":id"-style IDOR: the owner/scope field the model's check compares, and the route's path parameter.
   const rp = routeParam(finding.httpRoute);
-  const idorField = poc.check.type === "field-differs" ? poc.check.field : undefined;
+  // Which field proves a cross-scope access: the ownership column Stage 1 identified (e.g. shop_id) first — never the
+  // record's own primary key. Only when the detector found none do we fall back to the field the model's PoC named,
+  // and a fallback that is just the route's path parameter (the record's own id) is rejected, not trusted.
+  const modelField = poc.check.type === "field-differs" ? poc.check.field : undefined;
+  const fallback = modelField && rp && modelField === rp.param ? undefined : modelField;
+  const idorField = finding.ownershipField ?? fallback;
 
-  // A cross-scope WRITE is proved up front, before the generic (state-changing) exploit request is ever sent, so the
-  // proof controls every mutation and can restore what it changes.
-  if (deps.probe && isAccessFinding(finding) && rp && idorField && isMutating(rp.method)) {
+  // A cross-scope WRITE is proved by the dedicated write proof, which controls and restores every mutation. All access
+  // writes go through it — never the generic (state-changing) path — so a mutating route can only confirm on the real
+  // ownership field. Without one (no scope column, and the model named only the record's own id) it stays unverified
+  // rather than mutating the target to "prove" a boundary crossing it cannot actually show.
+  if (deps.probe && isAccessFinding(finding) && rp && isMutating(rp.method)) {
+    if (!idorField) {
+      return unverified(
+        `no ownership/scope field was identified for ${finding.httpRoute}, so a cross-scope write cannot be proved — the record's own id is not an ownership field. Not confirming, and not sending a mutating request, to avoid a false positive.`,
+      );
+    }
     try {
       const proof = await proveWriteIdor(poc, rp, idorField, target, deps.probe.range);
       return proof.kind === "confirmed" ? { ...finding, confidence: "confirmed", verification: proof.verification } : unverified(proof.reason);

@@ -12,6 +12,7 @@ import {
   buildPocPrompt,
   emptyResult,
   evaluate,
+  findOwnerField,
   fillParam,
   parsePoc,
   routeParam,
@@ -710,4 +711,69 @@ test("cookie auth: a pre-supplied Cookie header is sent as-is, and the bearer fl
   } finally {
     srv.close();
   }
+});
+
+// ---- write-IDOR proves on the real ownership field, never the record's own id -------------------
+
+test("IDOR write: uses the detector's ownership field (shop_id), ignoring a PoC that named the primary key", async () => {
+  resetAppts();
+  const target = new Target({ url: base, auth: idorToken });
+  // The detector identified shop_id as the scope column; the model's PoC wrongly named `id` (the record's own key).
+  const finding: Finding = { ...idorFinding, cwe: "CWE-862", httpRoute: "PATCH /api/appointments/:id", ownershipField: "shop_id" };
+  const poc = {
+    baseline: { method: "PATCH", path: "/api/appointments/1", body: { status: "completed" } },
+    exploit: { method: "PATCH", path: "/api/appointments/2", body: { status: "cancelled" } }, // id 2 is the caller's OWN shop
+    check: { type: "field-differs", field: "id" }, // must be ignored in favour of shop_id
+    rationale: "patching another shop's appointment succeeds",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
+  assert.equal(f.confidence, "confirmed");
+  assert.match(f.verification!.summary, /own shop_id=1/);
+  assert.match(f.verification!.summary, /found id 3 owned by shop_id=2/, "crossed the shop boundary — evidence cites shop_id");
+  assert.doesNotMatch(f.verification!.summary, /owned by id=/, "never reasons about the record's own id");
+  assert.equal(appts[2].status, "completed", "the same-shop id 2 the model guessed was never mutated");
+  assert.equal(appts[3].status, "booked", "the foreign record was restored");
+});
+
+test("IDOR write: a same-shop record whose id merely differs does NOT falsely confirm (no cross-scope id exists)", async () => {
+  // Only shop 1 exists here: ids differ but every shop_id is the caller's own, so there is no cross-scope write to prove.
+  appts = { 1: { id: 1, shop_id: 1, status: "booked" }, 2: { id: 2, shop_id: 1, status: "completed" } };
+  apptLog.length = 0;
+  const before = JSON.stringify(appts);
+  const target = new Target({ url: base, auth: idorToken });
+  const finding: Finding = { ...idorFinding, cwe: "CWE-862", httpRoute: "PATCH /api/appointments/:id", ownershipField: "shop_id" };
+  const poc = {
+    baseline: { method: "PATCH", path: "/api/appointments/1", body: { status: "completed" } },
+    exploit: { method: "PATCH", path: "/api/appointments/2", body: { status: "cancelled" } },
+    check: { type: "field-differs", field: "shop_id" },
+    rationale: "x",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
+  assert.equal(f.confidence, "unverified");
+  assert.match(f.verification!.summary, /no resource owned by another scope/);
+  assert.equal(JSON.stringify(appts), before, "no foreign record existed, so nothing was mutated");
+});
+
+test("IDOR write: with no ownership field known, it refuses to confirm or mutate on the record's own id", async () => {
+  resetAppts();
+  const before = JSON.stringify(appts);
+  const target = new Target({ url: base, auth: idorToken });
+  const finding: Finding = { ...idorFinding, cwe: "CWE-862", httpRoute: "PATCH /api/appointments/:id" }; // no ownershipField
+  const poc = {
+    baseline: { method: "PATCH", path: "/api/appointments/1", body: { status: "completed" } },
+    exploit: { method: "PATCH", path: "/api/appointments/2", body: { status: "cancelled" } },
+    check: { type: "field-differs", field: "id" }, // the route's own path parameter — the record's primary key
+    rationale: "x",
+  };
+  const f = await verifyFinding(finding, target, { complete: completeWith(poc), probe: { range: 20 } });
+  assert.equal(f.confidence, "unverified");
+  assert.match(f.verification!.summary, /the record's own id is not an ownership field/);
+  assert.equal(JSON.stringify(appts), before, "no mutating request was sent");
+});
+
+test("findOwnerField matches an ownership column across snake_case and camelCase response keys", () => {
+  assert.equal(findOwnerField({ shopId: 2 }, "shop_id"), 2);
+  assert.equal(findOwnerField({ shop_id: 2 }, "shopId"), 2);
+  assert.equal(findOwnerField({ data: { owner_id: 7 } }, "owner_id"), 7);
+  assert.equal(findOwnerField({ id: 5 }, "shop_id"), undefined);
 });
