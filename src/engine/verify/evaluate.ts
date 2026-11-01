@@ -180,5 +180,40 @@ export function evaluate(check: Check, baseline: RawResponse, exploit: RawRespon
         detail: `baseline status ${baseline.status}, exploit status ${exploit.status}${success ? " with a non-empty body — access was not blocked" : ""}`,
       };
     }
+    case "body-diff": {
+      const ind = JSON.stringify(check.indicator);
+      // Honesty guards against a trivial "difference": the indicator must be a stable server phrase, present in the
+      // exploit, absent from the baseline, and not merely the exploit's own request reflected back.
+      if (!looksStable(check.indicator)) {
+        return { success: false, detail: `the success indicator ${ind} looks volatile (a token, id, number or timestamp), not a stable server success phrase — refusing to confirm on it` };
+      }
+      if (baseline.body.trim() === "") {
+        return { success: false, detail: `the baseline returned no body, so there is nothing to compare the exploit's body against` };
+      }
+      const exBody = decoded(exploit.body);
+      const baseBody = decoded(baseline.body);
+      if (!exBody.includes(check.indicator)) return { success: false, detail: `success indicator ${ind} did not appear in the exploit response` };
+      if (baseBody.includes(check.indicator)) return { success: false, detail: `success indicator ${ind} appeared in BOTH responses — not a difference the exploit produced` };
+      const request = decoded(`${exploit.path ?? ""}\n${exploit.sent ?? ""}`);
+      if (request.includes(check.indicator)) {
+        return { success: false, detail: `success indicator ${ind} is the exploit's own request reflected back, not a server-generated success signal` };
+      }
+      return { success: true, detail: `the exploit response contains ${ind}, a server success phrase the benign baseline's response does not — an exploit-specific body difference` };
+    }
   }
+}
+
+/**
+ * Whether a body-diff indicator is a stable success phrase rather than volatile noise. It must contain a letter (a
+ * timestamp, id or number does not), and must not be a single long alphanumeric blob (a CSRF token, hash or opaque
+ * id). Conservative on purpose: a borderline indicator is rejected, because a false confirmation is worse than an
+ * unconfirmed real bug.
+ */
+function looksStable(indicator: string): boolean {
+  const t = indicator.trim();
+  const letters = (t.match(/\p{L}/gu) ?? []).length;
+  if (letters < 2) return false; // too few letters to be a word (a 2-character CJK success word still counts)
+  if (letters / t.length < 0.4) return false; // mostly digits/punctuation: a timestamp or delimited token
+  if (/^[A-Za-z0-9_\-+/=.]{16,}$/.test(t)) return false; // one long alphanumeric blob: a CSRF token, hash, or opaque id
+  return true;
 }

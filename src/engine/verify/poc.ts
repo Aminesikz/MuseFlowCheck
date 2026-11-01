@@ -19,12 +19,15 @@ export interface PocRequest {
  * - more-rows:       the exploit returns strictly more JSON array elements than the baseline (filter bypass / dump).
  * - field-differs:   both responses succeed but carry a different owner/scope value in `field` (cross-tenant access).
  * - status-unblocked: the baseline is rejected (401/403/404) while the exploit succeeds (2xx) with a non-empty body.
+ * - body-diff:        both answer 200, but the exploit body carries a server success phrase the baseline body does not
+ *                     (e.g. an auth bypass: "login success" vs "wrong password"); the phrase must not be request-echoed.
  */
 export type Check =
   | { type: "marker"; value: string }
   | { type: "more-rows"; field?: string }
   | { type: "field-differs"; field: string }
-  | { type: "status-unblocked" };
+  | { type: "status-unblocked" }
+  | { type: "body-diff"; indicator: string };
 
 export interface Poc {
   baseline: PocRequest;
@@ -37,7 +40,8 @@ const CHECK_GUIDE = `"check" — how the tool will DECIDE success by comparing t
 - {"type":"marker","value":"<sentinel>"}: your exploit injects <sentinel> (e.g. a UNION SELECT of a constant). Confirmed when <sentinel> appears in the exploit response but not the baseline's.
 - {"type":"more-rows","field":"<optional json field holding the array>"}: confirmed when the exploit returns strictly more array items than the baseline (e.g. a WHERE bypass dumps rows the baseline does not). Make the baseline a request that legitimately returns some of the caller's own rows, and the exploit one that also returns rows outside the caller's scope.
 - {"type":"field-differs","field":"<field name>"}: both requests succeed, but the exploit's response carries a different owner/scope value in <field> than the baseline's (reading another scope's record). Use for direct-object-reference reads/writes.
-- {"type":"status-unblocked"}: the baseline is rejected (401/403/404) and the exploit succeeds (2xx) with a body.`;
+- {"type":"status-unblocked"}: the baseline is rejected (401/403/404) and the exploit succeeds (2xx) with a body.
+- {"type":"body-diff","indicator":"<server success phrase>"}: both requests return the same status (e.g. 200), but the exploit body contains <indicator> — a phrase the SERVER emits only when the attack worked (a welcome/success message, an account field, a row the baseline lacks) — and the benign baseline body does not. Use for an auth bypass that keeps status 200 ("login success" vs "wrong password"). The indicator must be text the server generates on success: a stable phrase with letters, NEVER a timestamp, CSRF token, id, or any string you place in the request (that would be a reflection, not proof).`;
 
 function requestShape(role: string): string {
   return `  "${role}": {"method":"GET|POST|PUT|PATCH|DELETE","path":"/api/...","query":{"k":"v"},"body":{},"authenticated":true}`;
@@ -47,7 +51,7 @@ function requestShape(role: string): string {
 export function buildPocPrompt(finding: Finding, identityHint?: string): string {
   const isSqli = /sql/i.test(finding.type) || finding.cwe === "CWE-89";
   const goal = isSqli
-    ? "Craft an input that makes the query return data a benign request does not — e.g. a boolean/UNION injection that bypasses a filter or echoes an injected marker."
+    ? "Craft an input that makes the query return data a benign request does not — e.g. a boolean/UNION injection that bypasses a filter or echoes an injected marker. For an authentication bypass where the status stays 200, use body-diff: the exploit body shows the server's success message (e.g. a welcome) that the wrong-credentials baseline does not."
     : "Request a record that belongs to a DIFFERENT scope than the caller's, to show the route returns it without an ownership check.";
 
   const routeLine = finding.httpRoute ? `\n- HTTP route (the vulnerable endpoint — use this exact method and path): ${finding.httpRoute}` : "";
@@ -113,6 +117,9 @@ function toCheck(value: unknown): Check {
       return { type: "field-differs", field: c.field };
     case "status-unblocked":
       return { type: "status-unblocked" };
+    case "body-diff":
+      if (typeof c.indicator !== "string" || c.indicator.trim() === "") throw new Error("check.body-diff needs a non-empty indicator string");
+      return { type: "body-diff", indicator: c.indicator };
     default:
       throw new Error(`unknown check type ${JSON.stringify(c?.type)}`);
   }

@@ -630,3 +630,84 @@ test("patch proof: an inline-handler patch (no named function) reports 'not-atte
   assert.equal(result?.outcome, "not-attempted");
   assert.equal(started, false);
 });
+
+// ---- Fix B: honest body-diff oracle -------------------------------------------------------------
+
+test("body-diff confirms when the exploit body shows a server success phrase the baseline body lacks", () => {
+  const baseline = { status: 200, body: "<script>alert('wrong password'); location.href='/login';</script>", path: "/auth/login", sent: '{"username":"a","password":"b"}' };
+  const exploit = { status: 200, body: "<script>alert('login success! welcome'); location.href='/';</script>", path: "/auth/login", sent: '{"username":"\\u0027 OR \\u00271\\u0027=\\u00271 -- ","password":"x"}' };
+  const r = evaluate({ type: "body-diff", indicator: "login success" }, baseline, exploit);
+  assert.equal(r.success, true);
+  assert.match(r.detail, /server success phrase/);
+});
+
+test("body-diff does NOT confirm on a trivial difference: phrase in both, an echo of the request, a volatile token, or an empty baseline", () => {
+  const base = { status: 200, body: "hello world", path: "/x", sent: "" };
+  // present in both responses — not a difference the exploit produced
+  assert.equal(evaluate({ type: "body-diff", indicator: "world" }, base, { status: 200, body: "world again", path: "/x", sent: "" }).success, false);
+  // the "success phrase" is just the exploit's own input reflected back
+  const echo = { status: 200, body: "you searched for ZZPWNED", path: "/x?q=ZZPWNED", sent: "" };
+  assert.equal(evaluate({ type: "body-diff", indicator: "ZZPWNED" }, base, echo).success, false);
+  // volatile indicators (a CSRF token / hash / timestamp) are refused outright
+  assert.equal(evaluate({ type: "body-diff", indicator: "a1b2c3d4e5f6a1b2c3d4" }, base, { status: 200, body: "token a1b2c3d4e5f6a1b2c3d4", path: "/x", sent: "" }).success, false);
+  assert.equal(evaluate({ type: "body-diff", indicator: "2026-11-01T09:15:42Z" }, base, { status: 200, body: "at 2026-11-01T09:15:42Z", path: "/x", sent: "" }).success, false);
+  // nothing to compare against
+  assert.equal(evaluate({ type: "body-diff", indicator: "welcome" }, { status: 200, body: "", path: "/x", sent: "" }, { status: 200, body: "welcome", path: "/x", sent: "" }).success, false);
+});
+
+// ---- Fix A: session-cookie authentication -------------------------------------------------------
+
+test("session auth: the verifier logs in, captures the Set-Cookie, and sends it on later requests", async () => {
+  const seen: { path: string; cookie: string | undefined }[] = [];
+  const srv = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (url.pathname === "/auth/login" && req.method === "POST") {
+      res.writeHead(302, { "set-cookie": "connect.sid=s3cr3t; Path=/; HttpOnly", location: "/" });
+      return res.end();
+    }
+    seen.push({ path: url.pathname, cookie: req.headers.cookie });
+    const authed = (req.headers.cookie ?? "").includes("connect.sid=s3cr3t");
+    if (!authed) { res.writeHead(302, { location: "/auth/login" }); return res.end(); }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ posts: [{ id: 1 }, { id: 2 }] }));
+  });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+  try {
+    const target = new Target({ url, auth: { kind: "session", path: "/auth/login", body: { username: "admin", password: "x" } } });
+    const res = await target.request("GET", "/post");
+    assert.equal(res.status, 200, "the protected route was reached with the session cookie, not redirected to login");
+    assert.deepEqual(JSON.parse(res.body).posts.length, 2);
+    assert.equal(seen[0]?.cookie, "connect.sid=s3cr3t", "the captured cookie was sent on the protected request");
+  } finally {
+    srv.close();
+  }
+});
+
+test("session auth: a login that sets no cookie is a clear configuration error, not a silent miss", async () => {
+  const srv = createServer((_req, res) => { res.writeHead(200); res.end("no cookie here"); });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+  try {
+    const target = new Target({ url, auth: { kind: "session", path: "/auth/login", body: {} } });
+    await assert.rejects(() => target.request("GET", "/post"), /set no cookie/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("cookie auth: a pre-supplied Cookie header is sent as-is, and the bearer flow is left untouched", async () => {
+  let got: string | undefined;
+  const srv = createServer((req, res) => { got = req.headers.cookie; res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); });
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+  try {
+    await new Target({ url, auth: { kind: "cookie", cookie: "sid=abc; theme=dark" } }).request("GET", "/x");
+    assert.equal(got, "sid=abc; theme=dark");
+    got = undefined;
+    await new Target({ url, auth: { kind: "token", token: "t1" } }).request("GET", "/x");
+    assert.equal(got, undefined, "a bearer target never sends a cookie");
+  } finally {
+    srv.close();
+  }
+});

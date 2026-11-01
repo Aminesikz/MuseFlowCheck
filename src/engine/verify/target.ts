@@ -37,11 +37,20 @@ export function assertLocalTarget(url: string): string {
   return parsed.origin + parsed.pathname.replace(/\/$/, "");
 }
 
-/** How the PoC requests authenticate: a bearer token, or credentials the tool posts to a local login route for one. */
+/**
+ * How the PoC requests authenticate:
+ * - token:   a bearer token sent as `Authorization: Bearer …` (the default).
+ * - login:   credentials posted to a local login route that returns a bearer token in a JSON field.
+ * - session: credentials posted to a login route that replies with a `Set-Cookie` (express-session &c.); the cookie
+ *            is captured and sent on every later request.
+ * - cookie:  a pre-supplied raw `Cookie` header value, used as-is.
+ */
 export type AuthConfig =
   | { kind: "none" }
   | { kind: "token"; token: string }
-  | { kind: "login"; path: string; body: Record<string, unknown>; tokenField: string };
+  | { kind: "login"; path: string; body: Record<string, unknown>; tokenField: string }
+  | { kind: "session"; path: string; body: Record<string, unknown> }
+  | { kind: "cookie"; cookie: string };
 
 export interface TargetOptions {
   url: string;
@@ -55,12 +64,20 @@ export class Target {
   private readonly fetchImpl: FetchLike;
   private readonly auth: AuthConfig;
   private bearer?: string;
+  /** Captured cookies (name → value), sent on later requests for session/cookie auth. */
+  private readonly jar = new Map<string, string>();
+  private sessionReady = false;
 
   constructor(opts: TargetOptions) {
     this.base = assertLocalTarget(opts.url);
     this.auth = opts.auth ?? { kind: "none" };
     this.fetchImpl = opts.fetch ?? ((url, init) => fetch(url, init));
     if (this.auth.kind === "token") this.bearer = this.auth.token;
+  }
+
+  /** True when this target authenticates with a session cookie (login flow or a pre-supplied cookie). */
+  private get usesCookies(): boolean {
+    return this.auth.kind === "session" || this.auth.kind === "cookie";
   }
 
   /** The resolved bearer token (exchanging login credentials on first use), for callers that drive a browser. */
@@ -86,12 +103,60 @@ export class Target {
     return token;
   }
 
-  /** Sends one request to the target. `authenticated` adds the bearer token (default true). */
+  /**
+   * Establishes a session once: for `cookie` auth seeds the jar from the supplied header; for `session` auth posts the
+   * login credentials and captures the `Set-Cookie` the server replies with (a 2xx or a 302 both count — a redirect
+   * after login is normal). Throws when the login set no cookie. A no-op for bearer/token/none.
+   */
+  private async ensureSession(): Promise<void> {
+    if (this.sessionReady || !this.usesCookies) return;
+    this.sessionReady = true;
+    if (this.auth.kind === "cookie") {
+      this.loadCookieHeader(this.auth.cookie);
+      return;
+    }
+    if (this.auth.kind === "session") {
+      const res = await this.send("POST", this.auth.path, { body: this.auth.body });
+      if (this.jar.size === 0) {
+        throw new TargetError(`session login to ${this.auth.path} set no cookie (status ${res.status}) — check the credentials and login path`);
+      }
+    }
+  }
+
+  /** Parses a raw `Cookie` header ("a=1; b=2") into the jar. */
+  private loadCookieHeader(raw: string): void {
+    for (const pair of raw.split(";")) {
+      const eq = pair.indexOf("=");
+      if (eq > 0) this.jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+    }
+  }
+
+  /** Records the `Set-Cookie` cookies of a response into the jar (name=value, dropping attributes). */
+  private captureCookies(res: Response): void {
+    const getSetCookie = (res.headers as { getSetCookie?: () => string[] }).getSetCookie;
+    const cookies = getSetCookie ? getSetCookie.call(res.headers) : (res.headers.get("set-cookie") ? [res.headers.get("set-cookie")!] : []);
+    for (const c of cookies) {
+      const first = c.split(";")[0];
+      const eq = first.indexOf("=");
+      if (eq > 0) this.jar.set(first.slice(0, eq).trim(), first.slice(eq + 1).trim());
+    }
+  }
+
+  private cookieHeader(): string | undefined {
+    if (this.jar.size === 0) return undefined;
+    return [...this.jar].map(([k, v]) => `${k}=${v}`).join("; ");
+  }
+
+  /** Sends one request to the target. `authenticated` adds the configured credential (default true). */
   async request(method: string, path: string, init: { query?: Record<string, string>; body?: unknown; authenticated?: boolean } = {}) {
     const headers: Record<string, string> = {};
     if (init.authenticated !== false) {
-      const token = await this.token();
-      if (token) headers.Authorization = `Bearer ${token}`;
+      if (this.usesCookies) {
+        await this.ensureSession();
+      } else {
+        const token = await this.token();
+        if (token) headers.Authorization = `Bearer ${token}`;
+      }
     }
     return this.send(method, path, { query: init.query, body: init.body, headers });
   }
@@ -101,6 +166,8 @@ export class Target {
     for (const [k, v] of Object.entries(init.query ?? {})) url.searchParams.set(k, v);
     assertLocalTarget(url.toString()); // defense in depth: a crafted path cannot redirect us off-host
     const headers = { ...init.headers };
+    const cookie = this.usesCookies ? this.cookieHeader() : undefined; // only cookie-auth targets carry a jar; bearer flow is unchanged
+    if (cookie) headers.Cookie = cookie;
     let body: string | undefined;
     // GET/HEAD cannot carry a body (fetch throws); ignore one if the PoC supplied it, and put it in the query instead.
     const canHaveBody = method !== "GET" && method !== "HEAD";
@@ -113,6 +180,7 @@ export class Target {
       }
     }
     const res = await this.fetchImpl(url.toString(), { method, headers, body, redirect: "manual" });
+    if (this.usesCookies) this.captureCookies(res); // keep the jar current (login sets it; some apps rotate it)
     const text = await res.text();
     return { status: res.status, body: text, method, path: url.pathname + url.search, sent: body };
   }

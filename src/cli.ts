@@ -95,9 +95,12 @@ Verification (optional; proves findings by executing them against a target you r
   --target <url>        a LOCAL target to verify against (localhost / 127.0.0.1 / ::1 / *.localhost / *.test only);
                         without it, findings stay "suspected" and nothing is executed
   --token <bearer>      bearer token the PoC requests use (a seeded low-privilege tenant token)
-  --login-path <path>   instead of --token, POST credentials here and read a token from the response
+  --auth <mode>         how PoC requests authenticate: bearer (default), session (login sets a cookie), or cookie
+  --login-path <path>   instead of --token, POST credentials here — read a bearer token (bearer), or capture the
+                        Set-Cookie (--auth session), from the response
   --login-body <json>   JSON credentials body for --login-path (e.g. '{"email":"a@b.test","password":"x"}')
-  --token-field <name>  field holding the token in the login response (default "token")
+  --token-field <name>  field holding the token in the login response (default "token"; bearer login only)
+  --cookie <header>     a pre-supplied Cookie header sent on every request ("sid=abc; other=1"); implies --auth cookie
   --identity <text>     describes the token's own scope for the PoC prompt (e.g. "it belongs to shop 1")
   --probe-range <n>     for :id-style IDOR, probe ids 1..n to discover a cross-scope target (default 20)
   --verify-patch        also apply each confirmed finding's patch to a throwaway copy and re-run the PoC
@@ -109,7 +112,7 @@ XSS execution proof (optional; proves XSS findings by executing a payload in a h
   --xss-client <url>    LOCAL base URL of the client app, for findings whose sink renders in browser code (e.g. React)
   --xss-token-store <s> how the client app reads its token: "localStorage:<key>", "sessionStorage:<key>" or "window:<path>"
 
-Settings: any of target, token, identity, mode, maxUnresolved, probeRange, loginPath, loginBody, tokenField, browserPath, xssClient,
+Settings: any of target, token, auth, cookie, identity, mode, maxUnresolved, probeRange, loginPath, loginBody, tokenField, browserPath, xssClient,
 xssTokenStore, startCmd, readyPath can live in museflowcheck.config.json (in the scanned project or the current
 directory) or in MUSEFLOWCHECK_<NAME> environment variables (e.g. MUSEFLOWCHECK_TOKEN). A command-line flag wins
 over the environment, which wins over the file. See museflowcheck.config.example.json.
@@ -770,7 +773,7 @@ function traceAll(dir: string, filter: string | undefined, showPrompt: boolean):
 }
 
 /** Flags that take a value. */
-const VALUE_FLAGS = new Set(["root", "mode", "route", "max-unresolved", "target", "token", "login-path", "login-body", "token-field", "identity", "probe-range", "start-cmd", "ready-path", "browser-path", "xss-client", "xss-token-store"]);
+const VALUE_FLAGS = new Set(["root", "mode", "route", "max-unresolved", "target", "token", "auth", "cookie", "login-path", "login-body", "token-field", "identity", "probe-range", "start-cmd", "ready-path", "browser-path", "xss-client", "xss-token-store"]);
 
 /** Builds the verification runtime from the flags, or undefined when no `--target` is given. Throws on bad config. */
 function buildVerifyRuntime(value: (name: string) => string | undefined, patch: boolean, dir: string): VerifyRuntime | undefined {
@@ -780,16 +783,28 @@ function buildVerifyRuntime(value: (name: string) => string | undefined, patch: 
   let auth: AuthConfig = { kind: "none" };
   const token = value("token");
   const loginPath = value("login-path");
-  if (token !== undefined) {
-    auth = { kind: "token", token };
-  } else if (loginPath !== undefined) {
-    let body: Record<string, unknown> = {};
+  const cookie = value("cookie");
+  const authType = value("auth");
+  if (authType !== undefined && !["bearer", "session", "cookie"].includes(authType)) {
+    throw new TargetError(`--auth must be "bearer", "session" or "cookie", got ${JSON.stringify(authType)}`);
+  }
+  const loginBody = (): Record<string, unknown> => {
     try {
-      body = JSON.parse(value("login-body") ?? "{}");
+      return JSON.parse(value("login-body") ?? "{}");
     } catch {
       throw new TargetError("--login-body must be valid JSON");
     }
-    auth = { kind: "login", path: loginPath, body, tokenField: value("token-field") ?? "token" };
+  };
+  if (token !== undefined) {
+    auth = { kind: "token", token };
+  } else if (cookie !== undefined || authType === "cookie") {
+    if (cookie === undefined) throw new TargetError('--auth cookie needs a --cookie "<name=value; …>" header');
+    auth = { kind: "cookie", cookie };
+  } else if (authType === "session") {
+    if (loginPath === undefined) throw new TargetError("--auth session needs a --login-path to post credentials to");
+    auth = { kind: "session", path: loginPath, body: loginBody() };
+  } else if (loginPath !== undefined) {
+    auth = { kind: "login", path: loginPath, body: loginBody(), tokenField: value("token-field") ?? "token" };
   }
 
   const target = new Target({ url, auth }); // throws TargetError for a non-local host

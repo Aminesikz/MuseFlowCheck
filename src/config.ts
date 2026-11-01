@@ -9,6 +9,8 @@ export const CONFIG_FILE = "museflowcheck.config.json";
 const CONFIG_KEYS = {
   target: "target",
   token: "token",
+  auth: "auth",
+  cookie: "cookie",
   identity: "identity",
   mode: "mode",
   maxUnresolved: "max-unresolved",
