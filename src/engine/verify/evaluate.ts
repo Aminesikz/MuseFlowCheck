@@ -213,7 +213,7 @@ export function evaluate(check: Check, baseline: RawResponse, exploit: RawRespon
       if (request.includes(check.indicator)) {
         return { success: false, detail: `success indicator ${ind} is the exploit's own request reflected back, not a server-generated success signal` };
       }
-      return { success: true, detail: `the exploit response contains ${ind}, a server success phrase the benign baseline's response does not — an exploit-specific body difference` };
+      return { success: true, detail: `the exploit response contains ${ind}, a distinguishing response text the benign baseline's response does not — an exploit-specific body difference` };
     }
   }
 }

@@ -190,7 +190,7 @@ Return ONLY a JSON array — no prose, no markdown fences.
   "severity": "critical" | "high" | "medium" | "low",
   "path": number,            // the "Path N" number above that most clearly demonstrates the flaw
   "explanation": string,     // plain language: why it is exploitable across these files and what an attacker could do (include an example payload; any example URL uses the full HTTP route above), AND confirm, hop by hop, that no encoding or sanitization is applied on the way to this output${group.stored ? `; say that the input is stored (persisted)` : ""}; state the viewer reach
-  "suggestedPatch": string   // corrected code for the function containing the output, HTML-encoding the value where it enters the markup — reuse an encoding helper the project already imports, if there is one — multi-line and formatted like the original
+  "suggestedPatch": string   // corrected code for the function containing the output, HTML-encoding the value where it enters the markup — use ONLY identifiers the output's file already imports or defines (reuse an encoding helper listed under IMPORTS above; do not call a module the file does not import), multi-line and formatted like the original
 }
 Do not include file, line, or taintPath fields — the tool fills those in from the traced path.`;
 }

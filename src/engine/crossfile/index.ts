@@ -3,7 +3,7 @@ import type { Finding } from "../../types/index.js";
 import { formatHop, groupBySink, groupSignature, judgeGroup, type SinkGroup } from "./judge.js";
 import { traceEntry, traceProject, type TraceResult } from "./trace.js";
 
-export { buildJudgePrompt, formatHop, groupBySink, groupSignature } from "./judge.js";
+export { buildJudgePrompt, formatHop, groupBySink, groupSignature, importLinesOf, patchScopeBlock } from "./judge.js";
 export { discoverFiles } from "./files.js";
 export {
   coverageOf,
@@ -53,7 +53,7 @@ export async function judgeTrace(trace: TraceResult, cache: JudgeCache = new Map
     const key = groupSignature(group);
     if (!cache.has(key)) {
       calls++;
-      cache.set(key, judgeGroup(group));
+      cache.set(key, judgeGroup(group, trace.root));
     }
     return cache.get(key)!;
   };

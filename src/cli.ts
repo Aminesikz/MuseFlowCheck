@@ -493,7 +493,7 @@ function trace(target: string, root: string | undefined, showPrompt: boolean): n
   say(formatTrace(result));
   if (showPrompt) {
     for (const group of groupBySink(result.paths)) {
-      say(`\n--- Stage 2 prompt for ${formatHop(group.sink)} ---\n${buildJudgePrompt(group)}\n--- end prompt ---`);
+      say(`\n--- Stage 2 prompt for ${formatHop(group.sink)} ---\n${buildJudgePrompt(group, result.root)}\n--- end prompt ---`);
     }
   }
   return 0;

@@ -3,7 +3,7 @@
 // Keep this prompt codebase-agnostic: describe ownership and checks by behavior, never by any test app's names.
 import { complete } from "../../llm/meta-client.js";
 import type { Finding, Severity } from "../../types/index.js";
-import { codeSlice, formatHop } from "../crossfile/judge.js";
+import { codeSlice, formatHop, importLinesOf, patchScopeBlock } from "../crossfile/judge.js";
 import type { FunctionRef } from "../crossfile/trace.js";
 import { extractJsonArray, FindingParseError, validateJudgment } from "../parse.js";
 import { ownerColumns, scopeTables, type Access, type AccessContext, type AccessKind, type AccessRoute } from "./context.js";
@@ -196,6 +196,8 @@ ${siblings.map(siblingLine).join("\n") || "- none found"}
 CODE — the route's functions, the identity middleware, and the sibling checks, with real file line numbers prefixed as "N | "
 ${codeFor(ctx, route, siblings).map(codeSlice).join("\n\n")}
 
+${patchScopeBlock(route.handler.file, importLinesOf(ctx.root, route.handler.file))}
+
 ${severityRule(ctx, route)}
 
 OUTPUT
@@ -208,7 +210,7 @@ Return ONLY a JSON array — no prose, no markdown fences.
   "severity": "critical" | "high" | "medium" | "low",
   "path": number,            // the "Path N" number above that most clearly shows the unchecked access
   "explanation": string,     // must cite (A) which identity field was available and not used, (B) how the record is scoped in the data model, (C) which sibling route enforces the check (or that none does) — then what an attacker could do
-  "suggestedPatch": string   // corrected code for the handler (or the function that loads the record) adding the scope check, in the same style
+  "suggestedPatch": string   // corrected code for the handler adding the scope check, using ONLY identifiers in PATCH SCOPE above (reuse a function the handler already imports — e.g. the one that loads the record, which returns it with its owner field — and do not call a module the handler does not import), in the same style
 }
 This route ${kind === "write" ? "modifies" : "reads"} the record, so type is "${type}" and cwe is "${cwe}".
 Do not include file, line, or taintPath fields — the tool fills those in from the traced path.`;

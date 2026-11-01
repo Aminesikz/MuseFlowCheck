@@ -639,7 +639,7 @@ test("body-diff confirms when the exploit body shows a server success phrase the
   const exploit = { status: 200, body: "<script>alert('login success! welcome'); location.href='/';</script>", path: "/auth/login", sent: '{"username":"\\u0027 OR \\u00271\\u0027=\\u00271 -- ","password":"x"}' };
   const r = evaluate({ type: "body-diff", indicator: "login success" }, baseline, exploit);
   assert.equal(r.success, true);
-  assert.match(r.detail, /server success phrase/);
+  assert.match(r.detail, /distinguishing response text/);
 });
 
 test("body-diff does NOT confirm on a trivial difference: phrase in both, an echo of the request, a volatile token, or an empty baseline", () => {

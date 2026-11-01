@@ -1,10 +1,38 @@
 // Stage 2 of cross-file analysis: Muse Spark judges whether traced candidate paths are exploitable SQL injection.
 // Locations and taintPath come from the deterministic tracer; the model only decides and explains.
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { complete } from "../../llm/meta-client.js";
 import type { Finding } from "../../types/index.js";
 import { extractJsonArray, FindingParseError, validateJudgment } from "../parse.js";
 import { BINDING_GUIDE, bindingStyle, SAFE_PATTERNS, SEVERITY_GUIDE } from "../prompt.js";
 import type { CandidatePath, FunctionRef, Hop } from "./trace.js";
+
+/**
+ * The top-level `import` / `require` statements of a file, so a patch prompt can tell the model which identifiers the
+ * target file already has in scope. `file` is relative to `root`. Returns [] when the file cannot be read.
+ */
+export function importLinesOf(root: string, file: string): string[] {
+  let text: string;
+  try {
+    text = readFileSync(path.join(root, file), "utf8");
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (/^import\s/.test(line) || /^(?:export\s+)?(?:const|let|var)\s+.+=\s*require\(/.test(line)) out.push(line);
+  }
+  return out;
+}
+
+/** The prompt block constraining a suggestedPatch to the identifiers its target file already has. */
+export function patchScopeBlock(targetFile: string, imports: string[]): string {
+  return `PATCH SCOPE — your suggestedPatch edits ${targetFile}. Use ONLY identifiers that file already imports or defines; do NOT call a module it does not import. Its top-level imports are:
+${imports.length > 0 ? imports.map((i) => `  ${i}`).join("\n") : "  (none)"}
+Prefer a symbol already imported there (reuse the service/helper that is present) over adding a dependency. If a new import is genuinely required, add that import line as part of the patch.`;
+}
 
 /** Most paths shown to the model for one sink; the rest are counted in the prompt, keeping prompt size bounded. */
 export const MAX_PATHS_PER_SINK = 8;
@@ -67,10 +95,13 @@ function libraryNote(group: SinkGroup): string {
   return `DATABASE LIBRARY: not identified from the code — infer it from the code shown.\n${BINDING_GUIDE}`;
 }
 
-export function buildJudgePrompt(group: SinkGroup): string {
+export function buildJudgePrompt(group: SinkGroup, root?: string): string {
   const paths = group.paths
     .map((p, i) => `Path ${i + 1}:\n${p.hops.map((h, n) => `  ${n + 1}. [${h.kind}] ${formatHop(h)}`).join("\n")}`)
     .join("\n\n");
+  // The patch replaces the function that runs the SQL; constrain it to that file's imports.
+  const sinkFile = group.sink.file;
+  const scope = root !== undefined ? `\n${patchScopeBlock(sinkFile, importLinesOf(root, sinkFile))}\n` : "";
 
   return `You are a senior security code reviewer. A deterministic cross-file tracer followed HTTP request input through the function calls below until it became part of the SQL text passed to a call that executes SQL. The tracer follows values across files, but it does NOT understand validation or sanitization — it over-approximates. Decide whether this is genuinely exploitable SQL injection (CWE-89).
 
@@ -89,7 +120,7 @@ ${SEVERITY_GUIDE}
 Middleware and route registration are not shown. If the handler reads an authenticated-user object (e.g. req.user, ctx.state.user), assume the route requires login; otherwise assume it may be reachable without authentication. State that assumption in the explanation. It only affects the "without authentication" condition of rule 1 — it never lowers severity when the data-scope condition of rule 1 matches.
 
 ${libraryNote(group)}
-
+${scope}
 OUTPUT
 Return ONLY a JSON array — no prose, no markdown fences.
 - [] if no path is exploitable.
@@ -100,7 +131,7 @@ Return ONLY a JSON array — no prose, no markdown fences.
   "severity": "critical" | "high" | "medium" | "low",
   "path": number,            // the "Path N" number above that most clearly demonstrates the injection
   "explanation": string,     // plain language: why it is exploitable across these files, what an attacker could do; mention any other exploitable paths into the same call
-  "suggestedPatch": string   // corrected code for the function containing the SQL execution, using the DATABASE LIBRARY's parameter binding above, multi-line and formatted like the original
+  "suggestedPatch": string   // corrected code for the function containing the SQL execution, using the DATABASE LIBRARY's parameter binding above and only identifiers in PATCH SCOPE, multi-line and formatted like the original
 }
 Do not include file, line, or taintPath fields — the tool fills those in from the traced path.`;
 }
@@ -132,6 +163,6 @@ export function parseJudgment(raw: string, group: SinkGroup): Finding | null {
 }
 
 /** Sends one sink group to the model and returns its finding, if any. */
-export async function judgeGroup(group: SinkGroup): Promise<Finding | null> {
-  return parseJudgment(await complete(buildJudgePrompt(group)), group);
+export async function judgeGroup(group: SinkGroup, root?: string): Promise<Finding | null> {
+  return parseJudgment(await complete(buildJudgePrompt(group, root)), group);
 }
