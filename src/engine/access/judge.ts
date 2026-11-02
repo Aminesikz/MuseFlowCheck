@@ -6,6 +6,7 @@ import type { Finding, Severity } from "../../types/index.js";
 import { codeSlice, formatHop, importLinesOf, patchScopeBlock } from "../crossfile/judge.js";
 import type { FunctionRef } from "../crossfile/trace.js";
 import { extractJsonArray, FindingParseError, validateJudgment } from "../parse.js";
+import { inputsOf, parseVectors, vectorsBlock, vectorsField, type Input, type VectorPath, type VectorWording } from "../vectors.js";
 import { ownerColumns, scopeTables, type Access, type AccessContext, type AccessKind, type AccessRoute } from "./context.js";
 
 /** Type and CWE follow from what the route does with the record: a read is IDOR, a write is missing authorization. */
@@ -160,7 +161,42 @@ function codeFor(ctx: AccessContext, route: AccessRoute, siblings: AccessRoute[]
   return [...refs.values()];
 }
 
+/** The route's accesses as vectors (one per access, in Path order): an input is a request identifier, `location.field`. */
+export function accessVectorPaths(route: AccessRoute): VectorPath[] {
+  return route.accesses.map((a) => ({ key: `${a.location}.${a.field}`, input: `${a.location}.${a.field}`, hops: a.path.hops, taintPath: a.path.hops.map(formatHop), route: routeLabel(route) }));
+}
+
+/** The tables each request identifier of the route reaches. */
+function tablesByInput(route: AccessRoute): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  for (const a of route.accesses) {
+    const key = `${a.location}.${a.field}`;
+    if (!out.has(key)) out.set(key, new Set());
+    for (const t of a.tables) out.get(key)!.add(t);
+  }
+  return out;
+}
+
+const shareTable = (a: Set<string> | undefined, b: Set<string> | undefined) => !!a && !!b && [...a].some((t) => b.has(t));
+
+/**
+ * The identifiers that are vectors of one unchecked access: those reaching a table another identifier of the route
+ * also reaches. Identifiers into different tables are separate flaws and are never offered as vectors of each other.
+ */
+export function accessInputs(route: AccessRoute): Input[] {
+  const tables = tablesByInput(route);
+  const all = inputsOf(accessVectorPaths(route));
+  return all.filter((i) => all.some((o) => o !== i && shareTable(tables.get(i.path.key), tables.get(o.path.key))));
+}
+
+const ACCESS_VECTORS: VectorWording = {
+  sink: "access",
+  fix: "check the record's owner against the caller's identity",
+  open: "selecting records with no such check",
+};
+
 export function buildAccessPrompt(ctx: AccessContext, route: AccessRoute): string {
+  const inputs = accessInputs(route);
   const kind = routeKind(route);
   const { type, cwe } = ACCESS_CLASSES[kind];
   const siblings = secureSiblings(ctx, route);
@@ -178,7 +214,7 @@ If A, B or C is missing or doubtful, return []. Do not report other vulnerabilit
 ROUTE: ${routeLabel(route)} — handler ${route.handler.file}:${route.handler.startLine}, registered at ${route.registeredAt}
 
 ACCESS — request-supplied identifier → data access (traced; interpolated values in statements appear as {{name}}):
-${route.accesses.map((a, i) => accessBlock(a, i + 1)).join("\n\n")}
+${route.accesses.map((a, i) => accessBlock(a, i + 1)).join("\n\n")}${vectorsBlock(inputs, ACCESS_VECTORS)}
 
 A. IDENTITY
 - ${identity.evidence}.
@@ -207,7 +243,7 @@ Return ONLY a JSON array — no prose, no markdown fences.
 {
   "type": "${type}",
   "cwe": "${cwe}",
-  "severity": "critical" | "high" | "medium" | "low",
+  "severity": "critical" | "high" | "medium" | "low",${vectorsField(inputs)}
   "path": number,            // the "Path N" number above that most clearly shows the unchecked access
   "explanation": string,     // must cite (A) which identity field was available and not used, (B) how the record is scoped in the data model, (C) which sibling route enforces the check (or that none does) — then what an attacker could do
   "suggestedPatch": string   // corrected code for the handler adding the scope check, using ONLY identifiers in PATCH SCOPE above (reuse a function the handler already imports — e.g. the one that loads the record, which returns it with its owner field — and do not call a module the handler does not import), in the same style
@@ -227,7 +263,12 @@ export function parseAccessJudgment(raw: string, route: AccessRoute, ctx: Access
   try {
     const judgment = validateJudgment(items[0], 0);
     const n = Number((items[0] as Record<string, unknown>).path);
-    const access = (Number.isInteger(n) && route.accesses[n - 1]) || route.accesses[0];
+    const index = Number.isInteger(n) && route.accesses[n - 1] ? n - 1 : 0;
+    const access = route.accesses[index];
+    const vectorPaths = accessVectorPaths(route);
+    const tables = tablesByInput(route);
+    const chosen = vectorPaths[index];
+    const vectors = parseVectors(items[0] as Record<string, unknown>, vectorPaths, accessInputs(route), chosen, (p) => shareTable(tables.get(p.key), tables.get(chosen.key)));
     const severity = judgment.severity === "critical" || judgment.severity === "high" ? accessSeverity(ctx, route) : judgment.severity;
     const source = access.path.hops[0];
     const sink = access.path.hops.at(-1)!;
@@ -242,6 +283,7 @@ export function parseAccessJudgment(raw: string, route: AccessRoute, ctx: Access
       taintPath: access.path.hops.map(formatHop),
       httpRoute: routeLabel(route), // metadata for the verifier (e.g. "GET /api/x/:id"); not used by analysis
       ...(accessReach(ctx, route).ownerField ? { ownershipField: accessReach(ctx, route).ownerField } : {}), // the scope column the proof must compare
+      ...(vectors ? { vectors } : {}),
       confidence: "suspected",
     };
   } catch (err) {

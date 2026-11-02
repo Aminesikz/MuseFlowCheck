@@ -45,9 +45,30 @@ export interface Finding {
    * never the record's own primary key, which says nothing about who owns it.
    */
   ownershipField?: string;
+  /**
+   * Every exploitable request input into this sink, when Stage 1 traced more than one (e.g. two query parameters
+   * concatenated into the same SQL string): one vulnerability with several vectors, so the patch must close all of
+   * them, while one confirmed exploit confirms the finding. The first is the input `taintPath` shows. Absent when a
+   * single input reaches the sink.
+   */
+  vectors?: Vector[];
   confidence: Confidence;
   /** Attached by the self-verification pass when a local target is configured; drives `confidence`. */
   verification?: Verification;
+}
+
+/** One request input into a finding's sink, with the path Stage 1 traced for it. */
+export interface Vector {
+  /** The input as the code reads it (e.g. `status`, `req.query.q`, `params.id`); for stored XSS, the `table.column`. */
+  input: string;
+  /** Where the input enters (relative to the trace root), 1-based. */
+  file: string;
+  line: number;
+  httpRoute?: string;
+  /** Stored flows: the HTTP route that wrote the value. */
+  writeRoute?: string;
+  /** Ordered hops from this input to the sink, in the same form as `Finding.taintPath`. */
+  taintPath: string[];
 }
 
 /** One HTTP request sent during verification, recorded as evidence. */
