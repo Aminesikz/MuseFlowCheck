@@ -129,11 +129,16 @@ function fakeGitHub(files: ReturnType<typeof pullFiles>, rec: Recorded): http.Se
   });
 }
 
-/** A stand-in for the Meta Model API's Responses endpoint. */
+/**
+ * A stand-in for the Meta Model API's Responses endpoint. When the prompt lists several inputs into one sink, the
+ * canned finding names every candidate path as a vector.
+ */
 function fakeModel(mode: string): http.Server {
   return http.createServer((req, res) => {
-    req.resume();
+    let prompt = "";
+    req.on("data", (d) => (prompt += d));
     req.on("end", () => {
+      const paths = [...prompt.matchAll(/\\nPath (\d+):/g)].map((m) => Number(m[1]));
       const text =
         mode === "garbage"
           ? "I cannot answer that in JSON."
@@ -143,6 +148,7 @@ function fakeModel(mode: string): http.Server {
                 cwe: "CWE-89",
                 severity: "high",
                 path: 1,
+                ...(prompt.includes("SEVERAL INPUTS") ? { vectors: paths } : {}),
                 explanation: "(canned offline reply) Request input is concatenated into the SQL text without parameterization.",
                 suggestedPatch: "// (canned offline reply) pass the value as a bound parameter instead of concatenating it",
               },

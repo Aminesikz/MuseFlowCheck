@@ -142,6 +142,22 @@ test("findingComment: severity badge, type and CWE, locations, taint path, why, 
   assert.match(findingComment(finding(), ".", { path: "db/client.js" }), /outside the diff/);
 });
 
+test("findingComment: a multi-vector finding lists every input and says the fix must close all of them", () => {
+  const status = ["routes/search.js:4  const { q, status } = req.query", "db/client.js:9  sql += status", "db/client.js:12  pool.query(sql)"];
+  const f = finding({
+    vectors: [
+      { input: "q", file: "routes/search.js", line: 4, httpRoute: "GET /search", taintPath: finding().taintPath },
+      { input: "status", file: "routes/search.js", line: 4, httpRoute: "GET /search", taintPath: status },
+    ],
+  });
+  const body = findingComment(f, "server");
+  assert.match(body, /\*\*Inputs \(2\)\*\* — one vulnerability, several inputs into the same sink; the fix must close every one\n- `q` — `server\/routes\/search\.js:4` → `server\/services\/find\.js:8` \(taint path above\)\n- `status` — `server\/routes\/search\.js:4` → `server\/db\/client\.js:9`\n/);
+  assert.match(body, /\*\*Suggested fix\*\* — it must close all 2 inputs\n/);
+  // A single-input finding's comment is unchanged, and the fingerprint does not depend on the new field.
+  assert.doesNotMatch(findingComment(finding(), "server"), /Inputs|must close all/);
+  assert.equal(fingerprint(f), fingerprint(finding()));
+});
+
 test("summaryComment: counts by class and severity; an incomplete scan is called out, never as a pass", () => {
   const findings = [finding(), finding({ severity: "medium", httpRoute: "GET /export", sinkLine: 20, taintPath: ["routes/export.js:3  req.query.col", "db/client.js:20  pool.query(sql)"] }), finding({ type: "IDOR", cwe: "CWE-639", severity: "high" })];
   const r = result(findings);
@@ -241,7 +257,9 @@ test("action: a high finding on the PR's diff is commented inline on its line, t
   assert.match(c.body, /🟠 \*\*HIGH\*\* · \*\*SQL Injection\*\* · CWE-89/);
   assert.match(c.body, /`GET \/reports\/:kind` · `controllers\/reports\.js:7` → `db\.js:6` · _suspected — detection only, not executed_/);
   assert.match(c.body, /\*\*Taint path\*\*\n```\n1\. controllers\/reports\.js:7 /);
-  assert.match(c.body, /\*\*Suggested fix\*\*\n```js\n/);
+  // db.js:6 is reached from two routes, so the finding carries both inputs and the fix must close both.
+  assert.match(c.body, /- `req\.params` — `controllers\/reports\.js:7` \(`GET \/reports\/:kind`, taint path above\)\n- `name` — `routes\/search\.js:4` → `services\/finder\.js:5` \(`GET \/search`\)/);
+  assert.match(c.body, /\*\*Suggested fix\*\* — it must close all 2 inputs\n```js\n/);
 
   assert.equal(second.code, 1);
   assert.match(second.log, /Inline comments: 0 posted, 1 already on the PR\./);
@@ -337,6 +355,23 @@ test("action: fail-on critical lets a high finding through — still commented, 
   assert.deepEqual(r.runs[0].outputs, { status: "pass", findings: "1", gated: "0", complete: "true" });
   assert.equal(r.reviewComments.length, 1);
   assert.match(r.issueComments[0].body, /## ✅ MuseFlowCheck — passed\n\n\*\*No findings at or above critical; analysis complete \(1 below the threshold\)\.\*\*/);
+});
+
+const vectors = runAction([fixture("vectors-project"), "--changed", "routes/notes.js,db/notes.js,routes/pages.js"]);
+
+test("action: findings with several inputs into one sink comment every input; the new JSON field breaks nothing", async () => {
+  const r = await vectors;
+  assert.deepEqual(r.rejected, [], "every comment is one GitHub accepts");
+  assert.equal(r.runs[0].code, 1, r.runs[0].log);
+  assert.equal(r.runs[0].outputs.complete, "true");
+  const inputs = r.reviewComments.map((c) => /\*\*Inputs \(\d\)\*\*[^\n]*\n((?:- [^\n]*\n)+)/.exec(c.body)?.[1].trim()).filter(Boolean);
+  assert.deepEqual(inputs.sort(), [
+    "- `params.id` — `routes/notes.js:21` (taint path above)\n- `query.otherId` — `routes/notes.js:22`",
+    "- `req.query.first` — `routes/pages.js:7` (taint path above)\n- `req.query.last` — `routes/pages.js:7`",
+    "- `teamId` — `routes/notes.js:7` → `db/notes.js:5` (taint path above)\n- `status` — `routes/notes.js:7` → `db/notes.js:7`",
+  ]);
+  // Single-input findings (GET /notes/search, GET /pages/bye, GET /notes/:id, …) carry no inputs list.
+  assert.equal(r.reviewComments.filter((c) => !c.body.includes("**Inputs")).length, r.reviewComments.length - 3);
 });
 
 test("action: with no API key (e.g. a pull request from a fork) the runner fails before scanning", () => {

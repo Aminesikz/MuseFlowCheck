@@ -4,7 +4,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type { Analysis } from "../engine/coverage.js";
-import { describeTarget, fixGroups, patchFile, sharedFixNote, type FixGroup } from "../report.js";
+import { describeTarget, fixGroups, patchFile, sharedFixNote, vectorRows, type FixGroup } from "../report.js";
 import { SEVERITIES, type Finding, type Severity } from "../types/index.js";
 
 /** The engine's `--json` output. */
@@ -191,6 +191,16 @@ export function findingComment(f: Finding, scanDir: string, anchor?: Anchor, gro
   ];
   if (anchor && anchor.line === undefined) lines.push("", `_This file changed in the PR, but the flow's lines are outside the diff._`);
   lines.push("", "**Taint path**", fence(f.taintPath.map((h, i) => `${i + 1}. ${repoPathInHop(h, scanDir)}`).join("\n")));
+  const vectors = vectorRows(f);
+  if (vectors.length > 0) {
+    const at = (fileLine: string) => fileLine.replace(/^(.*):(\d+)$/, (_, file: string, line: string) => `${repoPath(scanDir, file)}:${line}`);
+    const routes = new Set(vectors.map((v) => v.route)).size > 1;
+    lines.push("", `**Inputs (${vectors.length})** — one vulnerability, several inputs into the same sink; the fix must close every one`);
+    for (const v of vectors) {
+      const notes = [routes && v.route ? `\`${v.route}\`` : "", v.shown ? "taint path above" : ""].filter(Boolean).join(", ");
+      lines.push(`- \`${v.input}\` — \`${at(v.enters)}\`${v.joins ? ` → \`${at(v.joins)}\`` : ""}${notes ? ` (${notes})` : ""}`);
+    }
+  }
   lines.push("", "**Why**", f.explanation.trim());
   const v = f.verification;
   if (v) {
@@ -201,7 +211,8 @@ export function findingComment(f: Finding, scanDir: string, anchor?: Anchor, gro
   if (together) lines.push("", "> [!WARNING]", together);
   const target = patchFile(f);
   const ext = path.extname(target ?? f.sinkFile ?? f.file).slice(1);
-  lines.push("", `**Suggested fix**${target ? ` for \`${repoPath(scanDir, target)}\`` : ""}`, fence(f.suggestedPatch, ext === "ts" || ext === "tsx" ? "ts" : "js"));
+  const covers = vectors.length > 0 ? ` — it must close all ${vectors.length} inputs` : "";
+  lines.push("", `**Suggested fix**${target ? ` for \`${repoPath(scanDir, target)}\`` : ""}${covers}`, fence(f.suggestedPatch, ext === "ts" || ext === "tsx" ? "ts" : "js"));
   return lines.join("\n");
 }
 
