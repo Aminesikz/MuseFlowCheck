@@ -1,6 +1,6 @@
 # Flowcheck
 
-Flowcheck is an AI agent for shift-left secure-code review of JavaScript/TypeScript. It uses LLM-driven, cross-file taint analysis to trace untrusted input from sources to dangerous sinks across a codebase, then runs a self-verification pass on each finding to cut false positives before reporting. It will ship as a CLI and a GitHub Action, built on Meta's Model API (Muse Spark).
+Flowcheck is an AI agent for shift-left secure-code review of JavaScript/TypeScript. It uses LLM-driven, cross-file taint analysis to trace untrusted input from sources to dangerous sinks across a codebase, then runs a self-verification pass on each finding to cut false positives before reporting. It ships as a CLI and a [GitHub Action](#github-action), built on Meta's Model API (Muse Spark).
 
 Intentionally built for the Meta Global AI Developer Hackathon.
 
@@ -140,6 +140,101 @@ Calls are resolved syntactically across CommonJS and ES modules:
 - Destructured parameters, mapped by key when the argument is an object literal.
 
 A tainted call that can't be followed is listed, never dropped. The trace output shows it either as **unresolved** (project code the tracer couldn't follow, such as a dynamic `require`, a missing export, or taint passed into a constructor and stored in a field) or as **leaving the project** (a package, a global, or a caller-supplied parameter).
+
+## GitHub Action
+
+The Action runs the combined scan on every pull request, posts each finding as a review comment on the diff, and fails the check on high/critical findings **or an incomplete analysis**. It wraps the CLI: `scan <path> --json`, whose `{ findings, analysis }` and exit code it maps onto GitHub. It does no detection of its own.
+
+### Setup
+
+1. Add the model key as a repository secret named `META_API_KEY` (Settings → Secrets and variables → Actions).
+2. Copy [`examples/museflowcheck.yml`](examples/museflowcheck.yml) to `.github/workflows/museflowcheck.yml`:
+
+```yaml
+name: MuseFlowCheck
+on:
+  pull_request:
+permissions:
+  contents: read
+  pull-requests: write # inline review comments and the summary comment
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Aminesikz/MuseFlowCheck@main
+        with:
+          api-key: ${{ secrets.META_API_KEY }}
+```
+
+The Action checks out the PR's head commit, builds MuseFlowCheck, and scans the whole repository: cross-file taint needs the whole project, so a PR that only edits a helper still gets the flows through it.
+
+### What it posts
+
+- **Inline review comments**, one per finding that touches the PR's changed files. A comment goes on the sink line if the diff includes it, else the source line, else any taint-path hop in the diff (so a PR that edits a function in the middle of a flow gets the finding). If the file changed but none of those lines is in the diff, the comment goes on the file. Each comment has a severity badge, the type and CWE, the route with source → sink, the taint path, why the flow is exploitable, and the suggested fix.
+- **Findings elsewhere in the repository** are not commented inline: GitHub only accepts review comments on the diff, and existing findings would flood the PR. They are still counted, listed in the summary, and gate the check.
+- **One summary comment**, with the verdict, findings by class and severity, and analysis coverage. A later run updates it in place. The same report goes to the job summary.
+- **Re-runs do not repost.** Each comment carries a hidden fingerprint: the finding's class and its taint path without line numbers. A finding already on the PR is skipped, even when a push only moved its code. A changed flow is a new finding and gets a new comment.
+
+Without a pull request (a `push` or a manual run), or when the token cannot write comments (a PR from a fork gets a read-only token), findings are reported as annotations on the commit instead.
+
+### Check status
+
+| Engine result | `status` output | Check |
+|---|---|---|
+| Analysis complete, nothing at or above `fail-on` (exit `0`) | `pass` | ✅ green |
+| A finding at or above `fail-on` (exit `1`) | `findings` | ❌ failed — merge blocked |
+| Analysis incomplete (exit `3`), no gating finding | `incomplete` | ❌ failed — **INCOMPLETE ANALYSIS — not a clean bill of health** |
+| Engine error (exit `2`), unreadable output, or any other exit | `error` | ❌ failed |
+
+An incomplete scan never gets a green check, whatever `fail-on` is set to. The engine's exit `1` takes precedence over `3`, so the Action also reads `analysis.complete` from the JSON: when a scan has findings and is also incomplete, the summary reports both. The incomplete-analysis report lists what could not be followed and why, as the CLI's warning does. To accept lower coverage, raise `max-unresolved` (`100` accepts any). To make the check non-blocking without making it green, leave it out of the branch's required status checks: it stays red and visible.
+
+### Inputs
+
+| Input | Default | |
+|---|---|---|
+| `api-key` | — (required) | Meta Model API key, from a secret |
+| `path` | `.` | Directory to scan, relative to the repository root |
+| `fail-on` | `high` | Lowest severity that fails the check: `critical`, `high`, `medium`, `low`, or `none` |
+| `max-unresolved` | engine default (`20`) | Percent of routes, tainted calls or files that may go unanalyzed before the scan is incomplete |
+| `inline-comments` / `summary-comment` | `true` | Turn either kind of comment off |
+| `max-comments` | `25` | Most new inline comments per run; the rest are listed in the summary |
+| `checkout` | `true` | Set to `false` if the workflow already checked out the code |
+| `base-url` / `model` | `https://api.meta.ai/v1` / `muse-spark-1.3` | Model endpoint |
+| `github-token` | `github.token` | Needs `pull-requests: write` |
+| `target` / `target-token` | — | Advanced: verification (below) |
+
+Outputs: `status` (`pass`, `findings`, `incomplete` or `error`), `findings`, `gated` (findings at or above `fail-on`), and `complete`.
+
+### Detection only by default; verification is opt-in
+
+A PR gate reviews a diff, not a running deployment, so the Action passes no `--target` by default. Findings are `suspected` and nothing is executed. To prove findings in CI, start the app on the runner earlier in the job, then pass its **local** URL:
+
+```yaml
+      - run: docker compose up -d && npx wait-on http://localhost:4000
+      - uses: Aminesikz/MuseFlowCheck@main
+        with:
+          api-key: ${{ secrets.META_API_KEY }}
+          target: http://localhost:4000
+          target-token: ${{ secrets.MUSEFLOWCHECK_TARGET_TOKEN }} # a seeded low-privilege account
+        env:
+          MUSEFLOWCHECK_IDENTITY: it belongs to shop 1 # any other setting, as MUSEFLOWCHECK_<NAME>
+```
+
+The engine also reads a `museflowcheck.config.json` committed in the scanned project (see [Configuration](#configuration)). A `target` set there turns verification on as well.
+
+### Notes
+
+- **Forks:** workflows triggered by a PR from a fork get no secrets, so the scan fails with a "no API key" error rather than passing. Keep the `pull_request` trigger; don't switch to `pull_request_target` to get around this.
+- **Cost:** each run makes one model call per judged sink or route, as the CLI does.
+- **Trying it locally:** `scripts/action-demo.ts` runs the Action's runner against a project, with a stand-in GitHub API that records the comments it would post. The stand-in rejects comments GitHub would reject. It prints the comments, the summary, the step outputs and the exit code:
+
+```bash
+npx tsx scripts/action-demo.ts test/project-scan --changed controllers/reports.js --offline   # canned model replies
+npx tsx scripts/action-demo.ts test/action-incomplete --offline                               # incomplete: fails, not green
+npx tsx scripts/action-demo.ts test/project-scan --changed controllers/reports.js            # real model, META_* from .env
+```
+
+`npx tsx --test test/action.test.ts` covers the verdict, the anchoring and the payloads offline.
 
 ## Verification (proving findings)
 
