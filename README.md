@@ -1,6 +1,6 @@
 # Flowcheck
 
-Flowcheck is an AI agent for shift-left secure-code review of JavaScript/TypeScript. It uses LLM-driven, cross-file taint analysis to trace untrusted input from sources to dangerous sinks across a codebase, then runs a self-verification pass on each finding to cut false positives before reporting. It will ship as a CLI and a GitHub Action, built on Meta's Model API (Muse Spark).
+Flowcheck is an AI agent for shift-left secure-code review of JavaScript/TypeScript. It uses LLM-driven, cross-file taint analysis to trace untrusted input from sources to dangerous sinks across a codebase, then runs a self-verification pass on each finding to cut false positives before reporting. It ships as a CLI and a [GitHub Action](#github-action), built on Meta's Model API (Muse Spark).
 
 Intentionally built for the Meta Global AI Developer Hackathon.
 
@@ -54,7 +54,15 @@ node dist/cli.js scan ../MetaVulnSite/server                     # full combined
 
 ### Output
 
-On a terminal, each finding is a card: a color-coded severity badge (`[CRITICAL]` red, `[HIGH]` yellow, `[MEDIUM]` blue, `[LOW]` dim), the type and CWE, and `✓ exploit confirmed` when verification proved it. Under it come the route and `source file:line → sink file:line`, the taint path hop by hop, **Why** it is exploitable, the **Proof** (what the exploit demonstrated, when confirmed), and the suggested **Fix** as a code block. A summary closes the report, with counts per class, per severity and per confidence.
+On a terminal, each finding is a card: a color-coded severity badge (`[CRITICAL]` red, `[HIGH]` yellow, `[MEDIUM]` blue, `[LOW]` dim), the type and CWE, and `✓ exploit confirmed` when verification proved it. Under it come the route and `source file:line → sink file:line`, the taint path hop by hop, the **Inputs** when several reach the same sink (see below), **Why** it is exploitable, the **Proof** (what the exploit demonstrated, when confirmed), and the suggested **Fix** as a code block. When other findings' fixes rewrite the same handler or function, a **⚠ Fix together** note above the fix names them: each patch fixes only its own finding, so they must be combined. A summary closes the report, with counts per class, per severity and per confidence.
+
+**Several inputs into one sink.** When Stage 1 traced more than one request input into the same sink — two query parameters concatenated into one SQL string, two values written unencoded into one HTML output, two request identifiers selecting rows of the same table with no owner check — the judge is shown each of them and asked which are exploitable. The finding stays one finding (one vulnerability, several vectors): its JSON carries `vectors` (each input with where it enters, its route and its own taint path; the input `taintPath` shows comes first), the explanation names every input, and the suggested patch must close all of them, not only the one in `taintPath`. Detection, severity and verification are unchanged: one confirmed exploit through any input confirms the finding. A sink one input reaches gets exactly the prompt and the finding it did before, with no `vectors` field. Identifiers into different tables are separate accesses and never become vectors of each other.
+
+To check that a scan's patches close every input, offline (no model call, nothing modified):
+
+```bash
+npx tsx scripts/check-patch-vectors.ts scan.json <scanned dir>   # applies each patch to a copy, re-runs Stage 1, lists inputs still open
+```
 
 Color is used only on a terminal. It is off when output is piped, with `--json`, when `NO_COLOR` is set, or with `--no-color` (`FORCE_COLOR=1` turns it on anyway); without color every status is still a label or symbol. `--json` is the machine interface: stdout carries only `{ "findings": Finding[], "analysis": {...} }`, unchanged by any of the above, while progress and the summary go to stderr. `analysis` reports coverage — `complete`, `entryPointsTotal`, `entryPointsResolved`, `callsFollowed`, `unresolved`, `files`, `filesParsed`, `parseErrors`, `reasons` and `problems` — so a consumer can tell an incomplete scan from a clean one instead of reading `findings: []` as safe.
 
@@ -141,6 +149,104 @@ Calls are resolved syntactically across CommonJS and ES modules:
 
 A tainted call that can't be followed is listed, never dropped. The trace output shows it either as **unresolved** (project code the tracer couldn't follow, such as a dynamic `require`, a missing export, or taint passed into a constructor and stored in a field) or as **leaving the project** (a package, a global, or a caller-supplied parameter).
 
+## GitHub Action
+
+The Action runs the combined scan on every pull request, posts each finding as a review comment on the diff, and fails the check on high/critical findings **or an incomplete analysis**. It wraps the CLI: `scan <path> --json`, whose `{ findings, analysis }` and exit code it maps onto GitHub. It does no detection of its own.
+
+### Setup
+
+1. Add the model key as a repository secret named `META_API_KEY` (Settings → Secrets and variables → Actions).
+2. Copy [`examples/museflowcheck.yml`](examples/museflowcheck.yml) to `.github/workflows/museflowcheck.yml`:
+
+```yaml
+name: MuseFlowCheck
+on:
+  pull_request:
+permissions:
+  contents: read
+  pull-requests: write # inline review comments and the summary comment
+jobs:
+  museflowcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Aminesikz/MuseFlowCheck@main
+        with:
+          api-key: ${{ secrets.META_API_KEY }}
+```
+
+3. To block merges on a failing scan, require the `museflowcheck` check in the branch's protection rule (Settings → Branches → require status checks to pass). The check takes its name from the job id, and it can be selected once it has run at least once.
+
+The Action checks out the PR's head commit, builds MuseFlowCheck, and scans the whole repository: cross-file taint needs the whole project, so a PR that only edits a helper still gets the flows through it.
+
+### What it posts
+
+- **Inline review comments**, one per finding that touches the PR's changed files. A comment goes on the sink line if the diff includes it, else the source line, else any taint-path hop in the diff (so a PR that edits a function in the middle of a flow gets the finding). If the file changed but none of those lines is in the diff, the comment goes on the file. Each comment has a severity badge, the type and CWE, the route with source → sink, the taint path, why the flow is exploitable, and the suggested fix.
+- **Findings elsewhere in the repository** are not commented inline: GitHub only accepts review comments on the diff, and existing findings would flood the PR. They are still counted, listed in the summary, and gate the check.
+- **One summary comment**, with the verdict, findings by class and severity, and analysis coverage. A later run updates it in place. The same report goes to the job summary.
+- **Findings whose fixes overlap are flagged.** When two or more findings' suggested fixes rewrite the same route handler or function (a SQL injection and an XSS in one handler, say), each patch fixes only its own finding. Applied alone it leaves the other bug in place, and applied one after another the patches conflict. Each such comment carries a "⚠ Fix together" warning naming the other findings, and the summary groups them. The patches are not merged automatically: combine them into one fix.
+- **Re-runs do not repost.** Each comment carries a hidden fingerprint: the finding's class and its taint path without line numbers. A finding already on the PR is skipped, even when a push only moved its code. A changed flow is a new finding and gets a new comment. A comment already posted is edited only when its "Fix together" warning changes, because a finding sharing its fix appeared or went away.
+
+Without a pull request (a `push` or a manual run), or when the token cannot write comments (a PR from a fork gets a read-only token), findings are reported as annotations on the commit instead.
+
+### Check status
+
+| Engine result | `status` output | Check |
+|---|---|---|
+| Analysis complete, nothing at or above `fail-on` (exit `0`) | `pass` | ✅ green |
+| A finding at or above `fail-on` (exit `1`) | `findings` | ❌ failed — merge blocked |
+| Analysis incomplete (exit `3`), no gating finding | `incomplete` | ❌ failed — **INCOMPLETE ANALYSIS — not a clean bill of health** |
+| Engine error (exit `2`), unreadable output, or any other exit | `error` | ❌ failed |
+
+An incomplete scan never gets a green check, whatever `fail-on` is set to. The engine's exit `1` takes precedence over `3`, so the Action also reads `analysis.complete` from the JSON: when a scan has findings and is also incomplete, the summary reports both. The incomplete-analysis report lists what could not be followed and why, as the CLI's warning does. To accept lower coverage, raise `max-unresolved` (`100` accepts any). To make the check non-blocking without making it green, leave it out of the branch's required status checks: it stays red and visible.
+
+### Inputs
+
+| Input | Default | |
+|---|---|---|
+| `api-key` | — (required) | Meta Model API key, from a secret |
+| `path` | `.` | Directory to scan, relative to the repository root |
+| `fail-on` | `high` | Lowest severity that fails the check: `critical`, `high`, `medium`, `low`, or `none` |
+| `max-unresolved` | engine default (`20`) | Percent of routes, tainted calls or files that may go unanalyzed before the scan is incomplete |
+| `inline-comments` / `summary-comment` | `true` | Turn either kind of comment off |
+| `max-comments` | `25` | Most new inline comments per run; the rest are listed in the summary |
+| `checkout` | `true` | Set to `false` if the workflow already checked out the code |
+| `base-url` / `model` | `https://api.meta.ai/v1` / `muse-spark-1.3` | Model endpoint |
+| `github-token` | `github.token` | Needs `pull-requests: write` |
+| `target` / `target-token` | — | Advanced: verification (below) |
+
+Outputs: `status` (`pass`, `findings`, `incomplete` or `error`), `findings`, `gated` (findings at or above `fail-on`), and `complete`.
+
+### Detection only by default; verification is opt-in
+
+A PR gate reviews a diff, not a running deployment, so the Action passes no `--target` by default. Findings are `suspected` and nothing is executed. To prove findings in CI, start the app on the runner earlier in the job, then pass its **local** URL:
+
+```yaml
+      - run: docker compose up -d && npx wait-on http://localhost:4000
+      - uses: Aminesikz/MuseFlowCheck@main
+        with:
+          api-key: ${{ secrets.META_API_KEY }}
+          target: http://localhost:4000
+          target-token: ${{ secrets.MUSEFLOWCHECK_TARGET_TOKEN }} # a seeded low-privilege account
+        env:
+          MUSEFLOWCHECK_IDENTITY: it belongs to shop 1 # any other setting, as MUSEFLOWCHECK_<NAME>
+```
+
+The engine also reads a `museflowcheck.config.json` committed in the scanned project (see [Configuration](#configuration)). A `target` set there turns verification on as well.
+
+### Notes
+
+- **Forks:** workflows triggered by a PR from a fork get no secrets, so the scan fails with a "no API key" error rather than passing. Keep the `pull_request` trigger; don't switch to `pull_request_target` to get around this.
+- **Cost:** each run makes one model call per judged sink or route, as the CLI does.
+- **Trying it locally:** `scripts/action-demo.ts` runs the Action's runner against a project, with a stand-in GitHub API that records the comments it would post. The stand-in rejects comments GitHub would reject. It prints the comments, the summary, the step outputs and the exit code:
+
+```bash
+npx tsx scripts/action-demo.ts test/project-scan --changed controllers/reports.js --offline   # canned model replies
+npx tsx scripts/action-demo.ts test/action-incomplete --offline                               # incomplete: fails, not green
+npx tsx scripts/action-demo.ts test/project-scan --changed controllers/reports.js            # real model, META_* from .env
+```
+
+`npx tsx --test test/action.test.ts` covers the verdict, the anchoring and the payloads offline.
+
 ## Verification (proving findings)
 
 Analysis reports findings as `"suspected"`. When you pass `--target`, Flowcheck tries to prove each finding by executing it against a running instance you control, and marks it `"confirmed"` or `"unverified"`.
@@ -187,6 +293,7 @@ Beyond the bundled fixture, Flowcheck was run (detection only, no `--target`) ag
 - **A library call can be misread as a route.** Route discovery counts `.get` / `.post` / … calls on any object that is not project code, so an HTTP client call like `needle.get(url, callback)` is listed as a `GET` route (one phantom entry point on NodeGoat; it reads no request input, so nothing is judged on it). Telling a client library apart from an Express app or router needs more than a one-line check, so it is left as a known issue.
 - **Deleted or created records are not restored.** A write proof restores what it changed, but a `DELETE` (or a `POST` that creates a record) cannot be undone automatically: the finding then says `RE-SEED RECOMMENDED`. The same applies to a stored-XSS proof whose original value could not be restored.
 - **Body-difference confirmation depends on the model naming the success phrase.** The PoC is generated blind (the model never sees the target's responses), so for a localized or non-English app it may not guess the exact phrase the server prints on success. A genuine exploit is then honestly reported `unverified`, never falsely confirmed (on sc_pro, a Korean-language app, the login bypass stayed `unverified` this way). Roadmap: derive the expected response indicators from the handler's response source, for language-agnostic confirmation.
+- **Node's built-in `node:sqlite` driver is not recognized yet.** SQL sinks are recognized by their package (`pg`, `mysql2`, `better-sqlite3`, `sqlite3`, …). `DatabaseSync` from Node's own `node:sqlite` (`db.prepare(sql).all()`, `db.exec(sql)`) is not in that list, so injection into a query run through it is missed. Roadmap.
 - **Taint through instance fields is not tracked.** A value stored on an object (`this.query = req.query.q`, or a tainted constructor argument kept in a field) and read later by another method is not followed; the constructor call is listed as unresolved, never dropped.
 
 ## License

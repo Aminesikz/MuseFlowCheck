@@ -1,0 +1,21 @@
+# Copy to .github/workflows/museflowcheck.yml in the repository to review, and add a repository secret META_API_KEY
+# (Settings → Secrets and variables → Actions). Every pull request is then scanned, findings are posted as review
+# comments on the diff, and the check fails on high/critical findings or an incomplete analysis.
+name: MuseFlowCheck
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write # inline review comments and the summary comment
+
+jobs:
+  museflowcheck: # the check's name; require it in branch protection to block merges
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Aminesikz/MuseFlowCheck@main
+        with:
+          api-key: ${{ secrets.META_API_KEY }}
+          # fail-on: high        # critical | high | medium | low | none
+          # path: server         # scan a subdirectory instead of the whole repository

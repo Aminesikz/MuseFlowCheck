@@ -1,0 +1,105 @@
+name: MuseFlowCheck
+description: Cross-file taint analysis for SQL injection, broken access control / IDOR and XSS in JS/TS, with findings as inline PR comments.
+author: Aminesikz
+branding:
+  icon: shield
+  color: red
+
+inputs:
+  api-key:
+    description: Meta Model API key. Pass it from a repository secret, e.g. secrets.META_API_KEY.
+    required: true
+  path:
+    description: Directory to scan, relative to the repository root. The whole project is scanned so cross-file flows can be traced.
+    default: "."
+  fail-on:
+    description: Lowest severity that fails the check — critical, high, medium, low, or none (report findings without failing on them). An incomplete analysis or a scan error fails the check whatever this is set to.
+    default: high
+  max-unresolved:
+    description: Share (percent) of routes, tainted calls or files that may go unanalyzed before the scan counts as incomplete. Empty uses the engine default (20).
+    default: ""
+  inline-comments:
+    description: Post a review comment on the PR's diff for each finding that touches a changed file.
+    default: "true"
+  summary-comment:
+    description: Post one summary comment on the PR, updated in place on later runs.
+    default: "true"
+  max-comments:
+    description: Most new inline comments to post in one run; the rest are listed in the summary.
+    default: "25"
+  github-token:
+    description: Token for posting comments. Needs pull-requests write permission.
+    default: ${{ github.token }}
+  checkout:
+    description: Check out the PR's head commit before scanning. Set to false if the workflow already checked out the code.
+    default: "true"
+  base-url:
+    description: Meta Model API base URL.
+    default: https://api.meta.ai/v1
+  model:
+    description: Model id.
+    default: muse-spark-1.3
+  target:
+    description: "Advanced: a LOCAL URL of the app, started earlier in the job (localhost, 127.0.0.1, *.localhost or *.test only). Findings are then proved by executing a PoC against it. Empty (the default) is detection only: findings stay suspected and nothing is executed."
+    default: ""
+  target-token:
+    description: "Advanced: bearer token the PoC requests use against target (a seeded low-privilege account). Pass it from a secret."
+    default: ""
+
+outputs:
+  status:
+    description: pass, findings, incomplete or error. Only pass is a green check.
+    value: ${{ steps.museflowcheck.outputs.status }}
+  findings:
+    description: Number of findings.
+    value: ${{ steps.museflowcheck.outputs.findings }}
+  gated:
+    description: Number of findings at or above fail-on.
+    value: ${{ steps.museflowcheck.outputs.gated }}
+  complete:
+    description: Whether the analysis was complete (false also when the scan errored).
+    value: ${{ steps.museflowcheck.outputs.complete }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check out the code under review
+      if: inputs.checkout == 'true'
+      uses: actions/checkout@v7
+      with:
+        # the PR's head commit, so finding line numbers match the lines the review comments are placed on
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+        persist-credentials: false
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version: 24
+        # no npm cache: setup-node only hashes lock files inside the workspace, and this one is in the action's folder;
+        # and no automatic cache keyed on the scanned repository's package manager either
+        package-manager-cache: false
+
+    - name: Build MuseFlowCheck
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        npm ci --no-audit --no-fund
+        npm run build
+
+    - name: Scan and report
+      id: museflowcheck
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/dist/action/run.js"
+      env:
+        META_API_KEY: ${{ inputs.api-key }}
+        META_BASE_URL: ${{ inputs.base-url }}
+        META_MODEL: ${{ inputs.model }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_MAX_UNRESOLVED: ${{ inputs.max-unresolved }}
+        INPUT_INLINE_COMMENTS: ${{ inputs.inline-comments }}
+        INPUT_SUMMARY_COMMENT: ${{ inputs.summary-comment }}
+        INPUT_MAX_COMMENTS: ${{ inputs.max-comments }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_TARGET: ${{ inputs.target }}
+        INPUT_TARGET_TOKEN: ${{ inputs.target-token }}

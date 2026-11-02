@@ -1,0 +1,11 @@
+CREATE TABLE teams (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL
+);
+
+CREATE TABLE notes (
+  id SERIAL PRIMARY KEY,
+  team_id INTEGER NOT NULL REFERENCES teams(id),
+  title TEXT NOT NULL,
+  status TEXT NOT NULL
+);

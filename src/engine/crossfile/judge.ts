@@ -6,6 +6,7 @@ import { complete } from "../../llm/meta-client.js";
 import type { Finding } from "../../types/index.js";
 import { extractJsonArray, FindingParseError, validateJudgment } from "../parse.js";
 import { BINDING_GUIDE, bindingStyle, EXPLANATION_STYLE, SAFE_PATTERNS, SEVERITY_GUIDE } from "../prompt.js";
+import { inputOfOrigin, inputsOf, parseVectors, vectorsBlock, vectorsField, type VectorPath, type VectorWording } from "../vectors.js";
 import type { CandidatePath, FunctionRef, Hop } from "./trace.js";
 
 /**
@@ -95,7 +96,19 @@ function libraryNote(group: SinkGroup): string {
   return `DATABASE LIBRARY: not identified from the code — infer it from the code shown.\n${BINDING_GUIDE}`;
 }
 
+/** The group's paths as vectors: one input per tracer origin (two paths from the same input are one vector). */
+export function sqliVectorPaths(group: SinkGroup): VectorPath[] {
+  return group.paths.map((p) => ({ key: p.origin, input: inputOfOrigin(p.origin), hops: p.hops, taintPath: p.hops.map(formatHop), ...(p.route ? { route: p.route } : {}) }));
+}
+
+const SQLI_VECTORS: VectorWording = {
+  sink: "SQL execution call",
+  fix: "bind the value as a query parameter (or neutralize it as listed above)",
+  open: "concatenated into the SQL text",
+};
+
 export function buildJudgePrompt(group: SinkGroup, root?: string): string {
+  const inputs = inputsOf(sqliVectorPaths(group));
   const paths = group.paths
     .map((p, i) => `Path ${i + 1}:\n${p.hops.map((h, n) => `  ${n + 1}. [${h.kind}] ${formatHop(h)}`).join("\n")}`)
     .join("\n\n");
@@ -111,7 +124,7 @@ Also not exploitable: a condition on the path that makes the dangerous concatena
 A path IS exploitable if attacker-controlled data reaches the SQL text without neutralization — including as an unquoted numeric value, an identifier, or a keyword.
 
 CANDIDATE PATHS (all end at the same SQL execution call: ${formatHop(group.sink)})
-${paths}${group.omitted > 0 ? `\n\n(${group.omitted} more path(s) into this call are not shown.)` : ""}
+${paths}${group.omitted > 0 ? `\n\n(${group.omitted} more path(s) into this call are not shown.)` : ""}${vectorsBlock(inputs, SQLI_VECTORS)}
 
 CODE — every function on the paths, with real file line numbers prefixed as "N | "
 ${functionsOn(group).map(codeSlice).join("\n\n")}
@@ -130,7 +143,7 @@ Return ONLY a JSON array — no prose, no markdown fences.
 {
   "type": "SQL Injection",
   "cwe": "CWE-89",
-  "severity": "critical" | "high" | "medium" | "low",
+  "severity": "critical" | "high" | "medium" | "low",${vectorsField(inputs)}
   "path": number,            // the "Path N" number above that most clearly demonstrates the injection
   "explanation": string,     // plain language: why it is exploitable across these files, what an attacker could do; mention any other exploitable flows into the same call by where their input enters
   "suggestedPatch": string   // corrected code for the function containing the SQL execution, using the DATABASE LIBRARY's parameter binding above and only identifiers in PATCH SCOPE, multi-line and formatted like the original
@@ -146,9 +159,12 @@ export function parseJudgment(raw: string, group: SinkGroup): Finding | null {
     const judgment = validateJudgment(items[0], 0);
     // "path" is 1-based, matching the "Path N" headings in the prompt and the trace output.
     const n = Number((items[0] as Record<string, unknown>).path);
-    const path = (Number.isInteger(n) && group.paths[n - 1]) || group.paths[0];
+    const index = Number.isInteger(n) && group.paths[n - 1] ? n - 1 : 0;
+    const path = group.paths[index];
     const source = path.hops[0];
     const sink = path.hops.at(-1)!;
+    const vectorPaths = sqliVectorPaths(group);
+    const vectors = parseVectors(items[0] as Record<string, unknown>, vectorPaths, inputsOf(vectorPaths), vectorPaths[index]);
     return {
       ...judgment,
       file: source.file,
@@ -157,6 +173,7 @@ export function parseJudgment(raw: string, group: SinkGroup): Finding | null {
       sinkLine: sink.line,
       taintPath: path.hops.map(formatHop),
       ...(path.route ? { httpRoute: path.route } : {}),
+      ...(vectors ? { vectors } : {}),
       confidence: "suspected",
     };
   } catch (err) {

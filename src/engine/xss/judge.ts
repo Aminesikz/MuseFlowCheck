@@ -7,6 +7,7 @@ import { codeSlice, formatHop, MAX_PATHS_PER_SINK } from "../crossfile/judge.js"
 import { EXPLANATION_STYLE } from "../prompt.js";
 import type { FunctionRef, Hop } from "../crossfile/trace.js";
 import { extractJsonArray, FindingParseError, validateJudgment } from "../parse.js";
+import { inputOfOrigin, inputsOf, parseVectors, vectorsBlock, vectorsField, type VectorPath, type VectorWording } from "../vectors.js";
 import type { Severity } from "../../types/index.js";
 import type { Reach, XssPath } from "./trace.js";
 
@@ -144,7 +145,29 @@ function storedNote(group: XssSinkGroup): string {
   return `\n\nThis is a STORED flow across two requests: request input is written to the database column ${group.stored}${writer ? ` by ${writer}` : ""}, and a later request reads that column back and renders it. In each path, the hops up to [store] are the write; [entry] and [load] mark where the rendering side begins and reads the stored value back; the rest is how it reaches the output. Anyone who can make the write controls what every later viewer receives. Check the write side for validation or encoding before storage as well as the render side.`;
 }
 
+/**
+ * The group's paths as vectors: a reflected input per tracer origin; a stored value per column and write (the request
+ * that wrote it, and where its input entered), since every stored path's origin is the column itself.
+ */
+export function xssVectorPaths(group: XssSinkGroup): VectorPath[] {
+  return group.paths.map((p) => ({
+    key: p.stored ? `${p.stored}|${p.writtenBy ?? ""}|${p.hops[0].file}:${p.hops[0].line}` : p.origin,
+    input: p.stored ?? inputOfOrigin(p.origin),
+    hops: p.hops,
+    taintPath: p.hops.map(formatHop),
+    ...(p.route ? { route: p.route } : {}),
+    ...(p.writtenBy ? { writeRoute: p.writtenBy } : {}),
+  }));
+}
+
+const XSS_VECTORS: VectorWording = {
+  sink: "output",
+  fix: "HTML-encode the value where it enters the markup",
+  open: "inserted unencoded",
+};
+
 export function buildXssPrompt(group: XssSinkGroup): string {
+  const inputs = inputsOf(xssVectorPaths(group));
   const paths = group.paths.map(numbered).join("\n\n");
   const contrast =
     group.contrast.length > 0
@@ -169,7 +192,7 @@ Encoding applied to a DIFFERENT output of the same value does not protect this o
 A path IS exploitable if attacker-controlled text reaches this output without such neutralization. Consider the context it lands in: element content, a quoted or unquoted attribute value, a URL-valued attribute (javascript: URLs), or inside a <script> or <style> element.
 
 CANDIDATE PATHS (all end at the same output: ${formatHop(group.sink)})${routesOf(group)}
-${paths}${group.omitted > 0 ? `\n\n(${group.omitted} more path(s) into this output are not shown.)` : ""}${contrast}
+${paths}${group.omitted > 0 ? `\n\n(${group.omitted} more path(s) into this output are not shown.)` : ""}${contrast}${vectorsBlock(inputs, XSS_VECTORS)}
 
 IMPORTS OF ${group.sink.file}
 ${imports.length > 0 ? imports.map((i) => `  ${i}`).join("\n") : "  (none)"}
@@ -190,7 +213,7 @@ Return ONLY a JSON array — no prose, no markdown fences.
 {
   "type": "${xssType(group)}",
   "cwe": "${XSS_CWE}",
-  "severity": "critical" | "high" | "medium" | "low",
+  "severity": "critical" | "high" | "medium" | "low",${vectorsField(inputs)}
   "path": number,            // the "Path N" number above that most clearly demonstrates the flaw
   "explanation": string,     // plain language: why it is exploitable across these files and what an attacker could do (include an example payload; any example URL uses the full HTTP route above), AND confirm, step by step along the flow, that no encoding or sanitization is applied on the way to this output${group.stored ? `; say that the input is stored (persisted)` : ""}; say who can be affected (the viewer reach) in your own words
   "suggestedPatch": string   // corrected code for the function containing the output, HTML-encoding the value where it enters the markup — use ONLY identifiers the output's file already imports or defines (reuse an encoding helper listed under IMPORTS above; do not call a module the file does not import), multi-line and formatted like the original
@@ -209,9 +232,12 @@ export function parseXssJudgment(raw: string, group: XssSinkGroup): Finding | nu
   try {
     const judgment = validateJudgment(items[0], 0);
     const n = Number((items[0] as Record<string, unknown>).path);
-    const path = (Number.isInteger(n) && group.paths[n - 1]) || group.paths[0];
+    const index = Number.isInteger(n) && group.paths[n - 1] ? n - 1 : 0;
+    const path = group.paths[index];
     const source = path.hops[0];
     const sink = path.hops.at(-1)!;
+    const vectorPaths = xssVectorPaths(group);
+    const vectors = parseVectors(items[0] as Record<string, unknown>, vectorPaths, inputsOf(vectorPaths), vectorPaths[index]);
     const severity = judgment.severity === "critical" || judgment.severity === "high" ? xssSeverity(group) : judgment.severity;
     const writeRoute = path.writtenBy ?? group.paths.find((p) => p.writtenBy)?.writtenBy;
     return {
@@ -226,6 +252,7 @@ export function parseXssJudgment(raw: string, group: XssSinkGroup): Finding | nu
       taintPath: path.hops.map(formatHop),
       ...(path.route ? { httpRoute: path.route } : {}),
       ...(writeRoute ? { writeRoute } : {}),
+      ...(vectors ? { vectors } : {}),
       confidence: "suspected",
     };
   } catch (err) {
