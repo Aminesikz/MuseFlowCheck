@@ -4,6 +4,7 @@
 import { complete } from "../../llm/meta-client.js";
 import type { Finding, Severity } from "../../types/index.js";
 import { codeSlice, formatHop, importLinesOf, patchScopeBlock } from "../crossfile/judge.js";
+import { EXPLANATION_STYLE } from "../prompt.js";
 import type { FunctionRef } from "../crossfile/trace.js";
 import { extractJsonArray, FindingParseError, validateJudgment } from "../parse.js";
 import { ownerColumns, scopeTables, type Access, type AccessContext, type AccessKind, type AccessRoute } from "./context.js";
@@ -200,6 +201,8 @@ ${patchScopeBlock(route.handler.file, importLinesOf(ctx.root, route.handler.file
 
 ${severityRule(ctx, route)}
 
+${EXPLANATION_STYLE}
+
 OUTPUT
 Return ONLY a JSON array — no prose, no markdown fences.
 - [] if A, B or C does not hold.
@@ -209,7 +212,7 @@ Return ONLY a JSON array — no prose, no markdown fences.
   "cwe": "${cwe}",
   "severity": "critical" | "high" | "medium" | "low",
   "path": number,            // the "Path N" number above that most clearly shows the unchecked access
-  "explanation": string,     // must cite (A) which identity field was available and not used, (B) how the record is scoped in the data model, (C) which sibling route enforces the check (or that none does) — then what an attacker could do
+  "explanation": string,     // must cite which identity field was available and not used, how the record is scoped in the data model, and which sibling route enforces the check (or that none does) — then what an attacker could do
   "suggestedPatch": string   // corrected code for the handler adding the scope check, using ONLY identifiers in PATCH SCOPE above (reuse a function the handler already imports — e.g. the one that loads the record, which returns it with its owner field — and do not call a module the handler does not import), in the same style
 }
 This route ${kind === "write" ? "modifies" : "reads"} the record, so type is "${type}" and cwe is "${cwe}".

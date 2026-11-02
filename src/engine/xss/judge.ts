@@ -4,6 +4,7 @@
 import { complete } from "../../llm/meta-client.js";
 import type { Finding } from "../../types/index.js";
 import { codeSlice, formatHop, MAX_PATHS_PER_SINK } from "../crossfile/judge.js";
+import { EXPLANATION_STYLE } from "../prompt.js";
 import type { FunctionRef, Hop } from "../crossfile/trace.js";
 import { extractJsonArray, FindingParseError, validateJudgment } from "../parse.js";
 import type { Severity } from "../../types/index.js";
@@ -180,6 +181,8 @@ ${severityRule(group)}
 
 ${grounding(group)}
 
+${EXPLANATION_STYLE}
+
 OUTPUT
 Return ONLY a JSON array — no prose, no markdown fences.
 - [] if no path is exploitable.
@@ -189,7 +192,7 @@ Return ONLY a JSON array — no prose, no markdown fences.
   "cwe": "${XSS_CWE}",
   "severity": "critical" | "high" | "medium" | "low",
   "path": number,            // the "Path N" number above that most clearly demonstrates the flaw
-  "explanation": string,     // plain language: why it is exploitable across these files and what an attacker could do (include an example payload; any example URL uses the full HTTP route above), AND confirm, hop by hop, that no encoding or sanitization is applied on the way to this output${group.stored ? `; say that the input is stored (persisted)` : ""}; state the viewer reach
+  "explanation": string,     // plain language: why it is exploitable across these files and what an attacker could do (include an example payload; any example URL uses the full HTTP route above), AND confirm, step by step along the flow, that no encoding or sanitization is applied on the way to this output${group.stored ? `; say that the input is stored (persisted)` : ""}; say who can be affected (the viewer reach) in your own words
   "suggestedPatch": string   // corrected code for the function containing the output, HTML-encoding the value where it enters the markup — use ONLY identifiers the output's file already imports or defines (reuse an encoding helper listed under IMPORTS above; do not call a module the file does not import), multi-line and formatted like the original
 }
 Do not include file, line, or taintPath fields — the tool fills those in from the traced path.`;
