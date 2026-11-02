@@ -3,6 +3,9 @@
 // the real engine, with stand-ins for the model endpoint and the GitHub API (which rejects comments GitHub would).
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import {
@@ -12,10 +15,12 @@ import {
   fingerprint,
   postedFingerprints,
   repoPath,
+  staleFixNote,
   summaryComment,
   verdict,
   type ScanResult,
 } from "../src/action/report.js";
+import { fixGroups } from "../src/report.js";
 import type { Analysis } from "../src/engine/coverage.js";
 import type { Finding } from "../src/types/index.js";
 
@@ -161,6 +166,30 @@ test("summaryComment: counts by class and severity; an incomplete scan is called
   assert.doesNotMatch(ib, /✅|passed/);
 });
 
+test("findingComment and summaryComment: findings whose fixes rewrite one handler warn to fix together, and are grouped", () => {
+  const sqli = finding({ file: "routes/search.js", sinkFile: undefined, sinkLine: 9, severity: "critical", suggestedPatch: 'router.get("/search", async (req, res) => {\n});' });
+  const xss = finding({ type: "Cross-Site Scripting (Reflected)", cwe: "CWE-79", file: "routes/search.js", sinkFile: undefined, sinkLine: 11, taintPath: ["routes/search.js:11  res.send(q)"], suggestedPatch: 'router.get("/search", async (req, res) => {\n});' });
+  const [group] = fixGroups([sqli, xss]);
+  const body = findingComment(sqli, "server", undefined, group);
+  assert.match(body, /\n> \[!WARNING\]\n> \*\*⚠ Fix together\.\*\* The GET \/search handler in server\/routes\/search\.js has 2 findings \(also: Cross-Site Scripting \(Reflected\) \(CWE-79\) at server\/routes\/search\.js:11\)\. The suggested fixes each rewrite the handler independently — apply them together, not in isolation, or combine them into one fix\.\n/);
+  assert.ok(body.indexOf("Fix together") < body.indexOf("**Suggested fix**"));
+  assert.doesNotMatch(findingComment(sqli, "server"), /Fix together/);
+
+  // An earlier run's comment is edited only when its warning is missing, outdated, or no longer true.
+  assert.equal(staleFixNote(body, sqli, "server", group), false);
+  assert.equal(staleFixNote(findingComment(sqli, "server"), sqli, "server", group), true, "warning missing");
+  assert.equal(staleFixNote(body.replace(":11)", ":12)"), sqli, "server", group), true, "warning outdated");
+  assert.equal(staleFixNote(body, sqli, "server", undefined), true, "warning no longer true");
+  assert.equal(staleFixNote(findingComment(sqli, "server"), sqli, "server", undefined), false);
+
+  const r = result([sqli, xss, finding({ httpRoute: "GET /other" })]);
+  const summary = summaryComment({ verdict: verdict(1, r, "high"), result: r, failOn: "high", scanDir: "server", inline: new Set() });
+  assert.match(summary, /> \[!WARNING\]\n> \*\*Findings that share a fix — combine their fixes\.\*\*/);
+  assert.match(summary, /^> - GET \/search handler in `server\/routes\/search\.js`: 🔴 \*\*CRITICAL\*\* SQL Injection \(CWE-89\) at `server\/routes\/search\.js:9` · 🟠 \*\*HIGH\*\* Cross-Site Scripting \(Reflected\) \(CWE-79\) at `server\/routes\/search\.js:11`$/m);
+  assert.equal(summary.match(/^> - /gm)?.length, 1, "the finding on another route is in no group");
+  assert.doesNotMatch(summaryComment({ verdict: verdict(1, result([sqli]), "high"), result: result([sqli]), failOn: "high", scanDir: ".", inline: new Set() }), /share a fix/);
+});
+
 // ---- end to end ----------------------------------------------------------------------------------------
 
 const demo = fileURLToPath(new URL("../scripts/action-demo.ts", import.meta.url));
@@ -169,7 +198,7 @@ const fixture = (name: string) => fileURLToPath(new URL(`./${name}`, import.meta
 
 interface DemoRun {
   runs: { code: number; outputs: Record<string, string>; log: string; stepSummary: string }[];
-  reviewComments: { path: string; line?: number; subject_type?: string; body: string }[];
+  reviewComments: { path: string; line?: number; subject_type?: string; body: string; edited?: boolean }[];
   issueComments: { body: string }[];
   rejected: { route: string; reason: string }[];
 }
@@ -220,6 +249,42 @@ test("action: a high finding on the PR's diff is commented inline on its line, t
   assert.match(r.issueComments[0].body, /runs\/1001\)/, "holding the second run's result");
   assert.match(r.issueComments[0].body, /1 finding\(s\) commented inline on this PR's diff; 0 elsewhere/);
   assert.equal(first.stepSummary.trim(), r.issueComments[0].body.replace("runs/1001", "runs/1000").trim(), "the job summary carries the same report");
+});
+
+const sharedArgs = [fixture("action-shared-handler"), "--changed", "routes/search.js,server.js:2-2"];
+const shared = runAction([...sharedArgs, "--runs", "2"]);
+
+test("action: PR 1's SQLi and XSS share one handler — both comments warn to fix together, and the summary groups them", async () => {
+  const r = await shared;
+  assert.deepEqual(r.rejected, []);
+  assert.deepEqual(r.runs.map((run) => run.code), [1, 1]);
+  assert.equal(r.reviewComments.length, 2, "posted once across two runs");
+  const byLine = new Map(r.reviewComments.map((c) => [c.line, c.body]));
+  assert.match(byLine.get(9)!, /\*\*SQL Injection\*\* · CWE-89[\s\S]*> \*\*⚠ Fix together\.\*\* The GET \/search handler in routes\/search\.js has 2 findings \(also: Cross-Site Scripting \(Reflected\) \(CWE-79\) at routes\/search\.js:11\)/);
+  assert.match(byLine.get(11)!, /\*\*Cross-Site Scripting \(Reflected\)\*\* · CWE-79[\s\S]*> \*\*⚠ Fix together\.\*\* The GET \/search handler in routes\/search\.js has 2 findings \(also: SQL Injection \(CWE-89\) at routes\/search\.js:9\)/);
+  assert.match(r.runs[1].log, /Inline comments: 0 posted, 2 already on the PR\./, "an up-to-date warning is not re-edited");
+  assert.match(r.issueComments[0].body, /^> - GET \/search handler in `routes\/search\.js`: .*SQL Injection \(CWE-89\) at `routes\/search\.js:9` · .*Cross-Site Scripting \(Reflected\) \(CWE-79\) at `routes\/search\.js:11`$/m);
+});
+
+test("action: a comment posted before the warning existed is edited to carry it, not posted again", async () => {
+  // The SQLi comment as the first live run posted it: no warning (the XSS comment is not on the PR yet).
+  const posted = (await shared).reviewComments.find((c) => c.line === 9)!;
+  const old = posted.body.replace(/\n> \[!WARNING\]\n> \*\*⚠ Fix together\.\*\*[^\n]*\n/, "\n");
+  assert.doesNotMatch(old, /Fix together/);
+  const dir = mkdtempSync(path.join(tmpdir(), "action-seed-"));
+  try {
+    const seed = path.join(dir, "seed.json");
+    writeFileSync(seed, JSON.stringify([{ path: posted.path, line: 9, body: old }]));
+    const r = await runAction([...sharedArgs, "--seed", seed]);
+    assert.deepEqual(r.rejected, []);
+    assert.equal(r.reviewComments.length, 2, "the seeded SQLi comment plus a new XSS comment");
+    const edited = r.reviewComments.find((c) => c.line === 9)!;
+    assert.equal(edited.edited, true);
+    assert.match(edited.body, /⚠ Fix together\.\*\* The GET \/search handler in routes\/search\.js has 2 findings/);
+    assert.match(r.runs[0].log, /Inline comments: 1 posted, 1 already on the PR \(1 updated: same-handler warning changed\)\./);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("action: a finding outside the PR's changed files is not commented inline, but still counted, listed and gating", async () => {

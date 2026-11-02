@@ -125,8 +125,8 @@ const label = (c: Colors, text: string) => c.bold(text);
  */
 export function patchFile(f: Finding): string | undefined {
   const code = f.suggestedPatch.trimStart();
-  if (/^(?:router|app)\.(?:get|post|put|patch|delete|all|use)\s*\(/.test(code)) return f.file;
-  const name = /^(?:export\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(/.exec(code)?.[1] ?? /^(?:export\s+)?(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=/.exec(code)?.[1];
+  if (ROUTE_PATCH.test(code)) return f.file;
+  const name = patchedFunction(code);
   if (!name) return undefined;
   const declares = new RegExp(`^(\\S+?):\\d+\\s+.*\\b(?:function\\s+${name.replace(/\$/g, "\\$")}\\s*\\(|${name.replace(/\$/g, "\\$")}\\s*=)`);
   for (const hop of f.taintPath) {
@@ -136,12 +136,85 @@ export function patchFile(f: Finding): string | undefined {
   return undefined;
 }
 
+/** A patch that is a route registration: `router.get("/x", …)`, with its method and path. */
+const ROUTE_PATCH = /^(?:router|app)\.(get|post|put|patch|delete|all|use)\s*\(\s*(?:(["'`])([^"'`]*)\2)?/;
+
+/** The function a patch redefines (`function name(` or `const name =`), if it is one. */
+function patchedFunction(code: string): string | undefined {
+  return /^(?:export\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(/.exec(code)?.[1] ?? /^(?:export\s+)?(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=/.exec(code)?.[1];
+}
+
+/** What a finding's suggested patch rewrites as a whole: a route's handler, or a named function, in one file. */
+export interface FixTarget {
+  kind: "handler" | "function";
+  /** "GET /search" for a handler, the function's name for a function. */
+  name: string;
+  file: string;
+}
+
+/**
+ * The handler or function a finding's suggested fix rewrites. A patched route registration rewrites the handler of
+ * the finding's route; a patched function, that function in the file declaring it. A patch that is neither (or names
+ * a function the path never declares) is placed on the route the input enters through, when there is one.
+ */
+export function fixTarget(f: Finding): FixTarget | undefined {
+  const code = f.suggestedPatch.trimStart();
+  const route = ROUTE_PATCH.exec(code);
+  const fn = route ? undefined : patchedFunction(code);
+  const fnFile = fn ? patchFile(f) : undefined;
+  if (fn && fnFile) return { kind: "function", name: fn, file: fnFile };
+  const name = f.httpRoute ?? (route?.[3] !== undefined ? `${route[1].toUpperCase()} ${route[3]}` : undefined);
+  return name ? { kind: "handler", name, file: f.file } : undefined;
+}
+
+/** Findings whose suggested fixes rewrite the same handler or function: two or more, so the fixes overlap. */
+export interface FixGroup {
+  target: FixTarget;
+  findings: Finding[];
+}
+
+/**
+ * Groups findings by the handler or function their fixes rewrite. Each suggested patch rewrites its target on its
+ * own, so in a group, applying one patch drops the others' fixes and applying them in turn conflicts. Only groups of
+ * two or more are returned; the patches are not merged — the reader is told to combine them.
+ */
+export function fixGroups(findings: Finding[]): FixGroup[] {
+  const by = new Map<string, FixGroup>();
+  for (const f of findings) {
+    const target = fixTarget(f);
+    if (!target) continue;
+    const key = `${target.kind}\0${target.file}\0${target.name}`;
+    const group = by.get(key) ?? by.set(key, { target, findings: [] }).get(key)!;
+    group.findings.push(f);
+  }
+  return [...by.values()].filter((g) => g.findings.length > 1);
+}
+
+export function groupOf(f: Finding, groups: FixGroup[]): FixGroup | undefined {
+  return groups.find((g) => g.findings.includes(f));
+}
+
+/** "GET /search handler in routes/search.js" / "function find in db/a.js" — `where` maps a file to how it is shown. */
+export function describeTarget(t: FixTarget, where: (file: string) => string = (file) => file): string {
+  return t.kind === "handler" ? `${t.name} handler in ${where(t.file)}` : `function ${t.name} in ${where(t.file)}`;
+}
+
+/** The warning for a finding in a group: which other findings share its target, and that the fixes must be combined. */
+export function sharedFixNote(f: Finding, group: FixGroup, where: (file: string) => string = (file) => file): string {
+  const others = group.findings.filter((o) => o !== f).map((o) => `${o.type} (${o.cwe}) at ${where(o.sinkFile ?? o.file)}:${o.sinkLine}`);
+  return (
+    `The ${describeTarget(group.target, where)} has ${group.findings.length} findings (also: ${others.join("; ")}). ` +
+    `The suggested fixes each rewrite the ${group.target.kind} independently — apply them together, not in isolation, or combine them into one fix.`
+  );
+}
+
 /**
  * One finding as a card: a header with the severity badge, type and CWE, and the verification badge on the right;
  * the route and location; then the taint path, why it is exploitable, the proof (when verification ran), and the
- * suggested fix set off as a code block.
+ * suggested fix set off as a code block. When the fix shares its target with other findings' fixes (`group`), a
+ * warning above the fix says to combine them.
  */
-export function findingCard(c: Colors, f: Finding, n: number, total: number, width: number): string {
+export function findingCard(c: Colors, f: Finding, n: number, total: number, width: number, group?: FixGroup): string {
   const sev = `[${f.severity.toUpperCase()}]`;
   const num = `${n}/${total}`;
   const title = `${f.type} · ${f.cwe}`;
@@ -169,6 +242,10 @@ export function findingCard(c: Colors, f: Finding, n: number, total: number, wid
     if (v.patchProof) lines.push(`    ${c.dim("patch check")}  ${v.patchProof.outcome} — ${v.patchProof.summary}`);
   }
 
+  if (group) {
+    const note = wrap(sharedFixNote(f, group), width, "    ");
+    lines.push("", `  ${c.bold(c.yellow("⚠ Fix together"))}`, ...note.map((l) => c.yellow(l)));
+  }
   const target = patchFile(f);
   lines.push("", `  ${c.bold(c.green("Fix"))} ${c.dim(`— suggested patch${target ? ` for ${target}` : ""}`)}`);
   for (const code of f.suggestedPatch.replace(/\s+$/, "").split("\n")) lines.push(`    ${c.green("│")} ${code}`);

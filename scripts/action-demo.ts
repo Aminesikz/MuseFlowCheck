@@ -3,10 +3,11 @@
 // the step outputs and the exit code. Nothing reaches GitHub. The project is copied to a temporary "checkout" first.
 //
 //   npx tsx scripts/action-demo.ts <project-dir> [--changed <file>[:<from>-<to>],...] [--fail-on <severity>]
-//                                  [--runs <n>] [--offline [finding|garbage]] [--json]
+//                                  [--runs <n>] [--seed <comments.json>] [--offline [finding|garbage]] [--json]
 //
 // --changed   the files the simulated PR changes (repo-relative), optionally only a line range; default: every file
 // --runs      run the Action n times against the same PR, to show re-runs do not repost comments (default 1)
+// --seed      review comments already on the PR before the first run (a JSON array of { path, line?, body })
 // --offline   answer model calls from a local stand-in instead of the Meta Model API: "finding" (default) returns one
 //             canned high finding per judged sink, "garbage" an unparsable reply (an engine error). Without
 //             --offline the real API is called, with META_* from .env.
@@ -25,7 +26,7 @@ const PR = 7;
 const REPO = "demo/app";
 
 const argv = process.argv.slice(2);
-const VALUE_FLAGS = new Set(["--changed", "--fail-on", "--runs"]);
+const VALUE_FLAGS = new Set(["--changed", "--fail-on", "--runs", "--seed"]);
 const MODEL_MODES = ["finding", "garbage"];
 const opt = (name: string) => {
   const i = argv.indexOf(`--${name}`);
@@ -33,7 +34,7 @@ const opt = (name: string) => {
 };
 const [projectArg] = argv.filter((a, i) => !a.startsWith("--") && !VALUE_FLAGS.has(argv[i - 1]) && !(argv[i - 1] === "--offline" && MODEL_MODES.includes(a)));
 if (!projectArg) {
-  console.error("usage: npx tsx scripts/action-demo.ts <project-dir> [--changed <file>[:<from>-<to>],...] [--fail-on <sev>] [--runs <n>] [--offline [finding|garbage]] [--json]");
+  console.error("usage: npx tsx scripts/action-demo.ts <project-dir> [--changed <file>[:<from>-<to>],...] [--fail-on <sev>] [--runs <n>] [--seed <comments.json>] [--offline [finding|garbage]] [--json]");
   process.exit(2);
 }
 const project = path.resolve(projectArg);
@@ -62,7 +63,7 @@ function pullFiles(): { filename: string; status: string; patch: string }[] {
 }
 
 interface Recorded {
-  reviewComments: { id: number; path: string; line?: number; subject_type?: string; body: string }[];
+  reviewComments: { id: number; path: string; line?: number; subject_type?: string; body: string; edited?: boolean }[];
   issueComments: { id: number; body: string }[];
   rejected: { route: string; reason: string }[];
 }
@@ -109,6 +110,13 @@ function fakeGitHub(files: ReturnType<typeof pullFiles>, rec: Recorded): http.Se
         rec.issueComments.push(c);
         return send(201, c);
       }
+      const review = /^PATCH \/pulls\/comments\/(\d+)$/.exec(route);
+      if (review) {
+        const c = rec.reviewComments.find((x) => x.id === Number(review[1]));
+        if (!c) return send(404, { message: "Not Found" });
+        Object.assign(c, { body: body.body, edited: true });
+        return send(200, c);
+      }
       const edit = /^PATCH \/issues\/comments\/(\d+)$/.exec(route);
       if (edit) {
         const c = rec.issueComments.find((x) => x.id === Number(edit[1]));
@@ -150,7 +158,8 @@ const listen = (s: http.Server) => new Promise<string>((r) => s.listen(0, "127.0
 async function main(): Promise<number> {
   if (!offline) process.loadEnvFile?.(".env");
   const files = pullFiles();
-  const rec: Recorded = { reviewComments: [], issueComments: [], rejected: [] };
+  const seeded = opt("seed") ? (JSON.parse(readFileSync(opt("seed")!, "utf8")) as { path: string; line?: number; body: string }[]) : [];
+  const rec: Recorded = { reviewComments: seeded.map((c, i) => ({ id: 900 + i, ...c })), issueComments: [], rejected: [] };
   const github = fakeGitHub(files, rec);
   const model = offline ? fakeModel(offline) : undefined;
   const apiUrl = await listen(github);
@@ -207,7 +216,7 @@ async function main(): Promise<number> {
     console.log(JSON.stringify({ runs, ...rec }, null, 2));
   } else {
     log(`\n══ ${rec.reviewComments.length} inline review comment(s) recorded ══`);
-    for (const c of rec.reviewComments) log(`\n── ${c.path}${c.line ? `:${c.line}` : " (file-level)"} ──\n${c.body}`);
+    for (const c of rec.reviewComments) log(`\n── ${c.path}${c.line ? `:${c.line}` : " (file-level)"}${c.edited ? " (edited)" : ""} ──\n${c.body}`);
     log(`\n══ summary comment (${rec.issueComments.length}) ══`);
     for (const c of rec.issueComments) log(c.body);
     for (const r of rec.rejected) log(`✗ rejected ${r.route}: ${r.reason}`);

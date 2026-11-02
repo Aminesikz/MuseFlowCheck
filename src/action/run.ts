@@ -8,7 +8,8 @@ import { spawn } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { GitHub, GitHubError } from "./github.js";
+import { fixGroups, groupOf } from "../report.js";
+import { GitHub, GitHubError, type Comment } from "./github.js";
 import {
   anchorFor,
   commentableLines,
@@ -18,6 +19,7 @@ import {
   isGated,
   postedFingerprints,
   repoPath,
+  staleFixNote,
   summaryComment,
   SUMMARY_MARKER,
   verdict,
@@ -100,21 +102,43 @@ function pullRequest(): PullRequest | undefined {
 
 /**
  * Posts an inline comment for each finding that touches the PR's diff and has not been posted before (matched by
- * fingerprint), up to `max`. Returns the fingerprints that have an inline comment, and a note when posting stopped.
+ * fingerprint), up to `max`. A comment from an earlier run is edited only when its same-handler warning is stale (a
+ * finding sharing its fix appeared or went away). Returns the fingerprints that have an inline comment, and a note
+ * when posting stopped.
  */
 async function commentInline(gh: GitHub, pr: PullRequest, result: ScanResult, scanDir: string, max: number): Promise<{ inline: Set<string>; note?: string; readOnly?: boolean }> {
   const diff: DiffIndex = new Map();
   for (const f of await gh.pullFiles(pr.number)) if (f.status !== "removed") diff.set(f.filename, commentableLines(f.patch));
-  const posted = postedFingerprints((await gh.reviewComments(pr.number)).map((c) => c.body));
+  const posted = new Map<string, Comment>();
+  for (const c of await gh.reviewComments(pr.number)) for (const fp of postedFingerprints([c.body])) posted.set(fp, c);
+  const groups = fixGroups(result.findings);
   const inline = new Set<string>();
   let fresh = 0;
+  let edited = 0;
   let skipped = 0;
+  const denied = (err: unknown) => {
+    if (!(err instanceof GitHubError && (err.status === 403 || err.status === 401))) return false;
+    command("warning", { title: "MuseFlowCheck: cannot comment" }, `${err.message}\nFalling back to annotations. Grant the workflow "pull-requests: write"; a pull request from a fork only gets a read-only token.`);
+    return true;
+  };
+  const readOnly = { inline, note: "the token cannot write PR comments, so findings are annotations instead", readOnly: true };
   for (const f of result.findings) {
     const anchor = anchorFor(f, scanDir, diff);
     if (!anchor) continue;
     const fp = fingerprint(f);
-    if (posted.has(fp) || inline.has(fp)) {
+    const group = groupOf(f, groups);
+    const prior = posted.get(fp);
+    if (prior || inline.has(fp)) {
       inline.add(fp); // already on the PR from an earlier run
+      if (prior && staleFixNote(prior.body, f, scanDir, group)) {
+        try {
+          await gh.updateReviewComment(prior.id, findingComment(f, scanDir, anchor, group));
+          edited++;
+        } catch (err) {
+          if (denied(err)) return readOnly;
+          command("warning", { title: "MuseFlowCheck: inline comment not updated" }, (err as Error).message);
+        }
+      }
       continue;
     }
     if (fresh >= max) {
@@ -122,18 +146,16 @@ async function commentInline(gh: GitHub, pr: PullRequest, result: ScanResult, sc
       continue;
     }
     try {
-      await gh.postReviewComment(pr.number, pr.headSha, { path: anchor.path, line: anchor.line, body: findingComment(f, scanDir, anchor) });
+      await gh.postReviewComment(pr.number, pr.headSha, { path: anchor.path, line: anchor.line, body: findingComment(f, scanDir, anchor, group) });
       inline.add(fp);
       fresh++;
     } catch (err) {
-      if (err instanceof GitHubError && (err.status === 403 || err.status === 401)) {
-        command("warning", { title: "MuseFlowCheck: cannot comment" }, `${err.message}\nFalling back to annotations. Grant the workflow "pull-requests: write"; a pull request from a fork only gets a read-only token.`);
-        return { inline, note: "the token cannot write PR comments, so findings are annotations instead", readOnly: true };
-      }
+      if (denied(err)) return readOnly;
       command("warning", { title: "MuseFlowCheck: inline comment not posted" }, (err as Error).message);
     }
   }
-  console.log(`Inline comments: ${fresh} posted, ${inline.size - fresh} already on the PR${skipped > 0 ? `, ${skipped} over the max-comments limit` : ""}.`);
+  const updates = edited > 0 ? ` (${edited} updated: same-handler warning changed)` : "";
+  console.log(`Inline comments: ${fresh} posted, ${inline.size - fresh} already on the PR${updates}${skipped > 0 ? `, ${skipped} over the max-comments limit` : ""}.`);
   return { inline, note: skipped > 0 ? `${skipped} more not posted: over the max-comments limit` : undefined };
 }
 

@@ -4,7 +4,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type { Analysis } from "../engine/coverage.js";
-import { patchFile } from "../report.js";
+import { describeTarget, fixGroups, patchFile, sharedFixNote, type FixGroup } from "../report.js";
 import { SEVERITIES, type Finding, type Severity } from "../types/index.js";
 
 /** The engine's `--json` output. */
@@ -160,8 +160,27 @@ const CONFIDENCE: Record<Finding["confidence"], string> = {
   unverified: "not confirmed by verification",
 };
 
-/** One finding as a review comment: badge, type and CWE, location, taint path, why, proof (if any), and the fix. */
-export function findingComment(f: Finding, scanDir: string, anchor?: Anchor): string {
+const FIX_TOGETHER = "**⚠ Fix together.**";
+
+/** The same-handler warning line of a finding's comment, or undefined when its fix shares its target with no other. */
+export function fixTogetherLine(f: Finding, scanDir: string, group: FixGroup | undefined): string | undefined {
+  return group ? `> ${FIX_TOGETHER} ${sharedFixNote(f, group, (file) => repoPath(scanDir, file))}` : undefined;
+}
+
+/**
+ * Whether a comment posted on an earlier run carries a stale same-handler warning — missing, outdated, or no longer
+ * true — so the runner edits it. Nothing else triggers an edit: the model's wording varies between runs.
+ */
+export function staleFixNote(body: string, f: Finding, scanDir: string, group: FixGroup | undefined): boolean {
+  const line = fixTogetherLine(f, scanDir, group);
+  return line ? !body.includes(line) : body.includes(FIX_TOGETHER);
+}
+
+/**
+ * One finding as a review comment: badge, type and CWE, location, taint path, why, proof (if any), and the fix —
+ * preceded by a warning when other findings' fixes rewrite the same handler or function (`group`).
+ */
+export function findingComment(f: Finding, scanDir: string, anchor?: Anchor, group?: FixGroup): string {
   const source = `${repoPath(scanDir, f.file)}:${f.sourceLine}`;
   const sink = `${repoPath(scanDir, f.sinkFile ?? f.file)}:${f.sinkLine}`;
   const lines = [
@@ -178,6 +197,8 @@ export function findingComment(f: Finding, scanDir: string, anchor?: Anchor): st
     lines.push("", v.outcome === "confirmed" ? "**Proof**" : `**Verification** (${v.outcome})`, v.summary.trim());
     if (v.patchProof) lines.push("", `Patch check: **${v.patchProof.outcome}** — ${v.patchProof.summary}`);
   }
+  const together = fixTogetherLine(f, scanDir, group);
+  if (together) lines.push("", "> [!WARNING]", together);
   const target = patchFile(f);
   const ext = path.extname(target ?? f.sinkFile ?? f.file).slice(1);
   lines.push("", `**Suggested fix**${target ? ` for \`${repoPath(scanDir, target)}\`` : ""}`, fence(f.suggestedPatch, ext === "ts" || ext === "tsx" ? "ts" : "js"));
@@ -236,6 +257,21 @@ export function summaryComment(s: SummaryInput): string {
       out.push(`| ${t} | ${SEVERITIES.map((sev) => of.filter((f) => f.severity === sev).length || "·").join(" | ")} | ${of.length} |`);
     }
     out.push(`| **All** | ${SEVERITIES.map((sev) => findings.filter((f) => f.severity === sev).length || "·").join(" | ")} | **${findings.length}** |`, "");
+
+    const groups = fixGroups(findings);
+    if (groups.length > 0) {
+      const where = (file: string) => repoPath(s.scanDir, file);
+      out.push(
+        "> [!WARNING]",
+        "> **Findings that share a fix — combine their fixes.** Each suggested fix rewrites the whole handler or function on its own: applying one alone leaves the others' bugs in place, and applying them one after another conflicts.",
+        ">",
+      );
+      for (const g of groups) {
+        const members = g.findings.map((f) => `${BADGE[f.severity]} ${f.type} (${f.cwe}) at \`${where(f.sinkFile ?? f.file)}:${f.sinkLine}\``);
+        out.push(`> - ${describeTarget(g.target, (file) => `\`${where(file)}\``)}: ${members.join(" · ")}`);
+      }
+      out.push("");
+    }
 
     const outside = findings.filter((f) => !s.inline.has(fingerprint(f)));
     const commented = findings.length - outside.length;

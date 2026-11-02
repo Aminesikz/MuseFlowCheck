@@ -82,6 +82,10 @@ export class GitHub {
     return this.request("POST", `/pulls/${pr}/comments`, { body: c.body, commit_id: commitId, path: c.path, ...where });
   }
 
+  updateReviewComment(id: number, body: string): Promise<Comment> {
+    return this.request("PATCH", `/pulls/comments/${id}`, { body });
+  }
+
   postIssueComment(pr: number, body: string): Promise<Comment> {
     return this.request("POST", `/issues/${pr}/comments`, { body });
   }

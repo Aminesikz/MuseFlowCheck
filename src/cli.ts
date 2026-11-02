@@ -51,7 +51,7 @@ import { assessCoverage, DEFAULT_MAX_UNRESOLVED, wholeFileAnalysis, type Analysi
 import { CONFIG_FILE, ConfigError, envVar, layeredValues, loadConfig, sourcedSettings } from "./config.js";
 import { complete } from "./llm/meta-client.js";
 import { describeApiError, loadDotEnv } from "./llm/errors.js";
-import { colorEnabled, coverageRow, findingCard, incompleteWarning, makeColors, paintSeverity, reportWidth, rule, severityCounts, type Colors } from "./report.js";
+import { colorEnabled, coverageRow, describeTarget, findingCard, fixGroups, groupOf, incompleteWarning, makeColors, paintSeverity, reportWidth, rule, severityCounts, type Colors } from "./report.js";
 import { CONFIDENCES, SEVERITIES, type Confidence, type Finding, type Verification } from "./types/index.js";
 
 const VERSION = "0.0.0";
@@ -297,7 +297,13 @@ function emitFindings(findings: Finding[], json: boolean, analysis: Analysis): n
   if (json) console.log(JSON.stringify({ findings, analysis }, null, 2));
   else if (findings.length > 0) {
     say(`\n${rule(c, width, `Findings (${findings.length})`)}\n`);
-    findings.forEach((f, i) => say(findingCard(c, f, i + 1, findings.length, width) + "\n"));
+    const groups = fixGroups(findings);
+    findings.forEach((f, i) => say(findingCard(c, f, i + 1, findings.length, width, groupOf(f, groups)) + "\n"));
+    // Fixes that rewrite the same handler or function overlap: say which findings must be fixed together.
+    for (const g of groups) {
+      const refs = g.findings.map((f) => `#${findings.indexOf(f) + 1} ${f.type} (${f.cwe})`).join(", ");
+      say(c.yellow(`⚠ ${g.findings.length} findings share the ${describeTarget(g.target)} — combine their fixes: ${refs}\n`));
+    }
   }
   return gatedCount(findings) > 0 ? EXIT_GATE : 0;
 }
