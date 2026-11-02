@@ -126,6 +126,9 @@ test("the CLI card lists every input and where it joins the sink, and says the f
   const card = findingCard(makeColors(false), f, 1, 1, 100);
   assert.match(card, /Inputs \(2\) — one vulnerability, several inputs into the same sink; the fix must close every one\n {4}• teamId {2}routes\/notes\.js:7 → db\/notes\.js:5 {2}\(taint path above\)\n {4}• status {2}routes\/notes\.js:7 → db\/notes\.js:7\n/);
   assert.match(card, /Fix — suggested patch for db\/notes\.js; it must close all 2 inputs/);
+  // Two inputs read in one statement have identical hop text; only the first is the one the taint path shows.
+  const xss = findingCard(makeColors(false), parseXssJudgment(reply({ path: 2, vectors: [1, 2] }), twoOutputs)!, 1, 1, 100);
+  assert.match(xss, /• req\.query\.last {3}routes\/pages\.js:7 {2}\(taint path above\)\n {4}• req\.query\.first {2}routes\/pages\.js:7\n/);
   const single = findingCard(makeColors(false), parseJudgment(sqliReply({ path: 1 }), oneParam)!, 1, 1, 100);
   assert.doesNotMatch(single, /Inputs|must close all/);
 });

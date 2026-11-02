@@ -143,7 +143,7 @@ export interface VectorRow {
   /** `file:line` of the last hop before the sink that no other vector's path shares — where this input joins the sink. */
   joins?: string;
   route?: string;
-  /** True for the vector whose path is the finding's taintPath. */
+  /** True for the vector whose path is the finding's taintPath: the first (two inputs read on one line share hop text). */
   shown: boolean;
 }
 
@@ -163,7 +163,7 @@ export function vectorRows(f: Finding): VectorRow[] {
       enters,
       ...(joins && joins !== enters ? { joins } : {}),
       ...(v.httpRoute ? { route: v.httpRoute } : {}),
-      shown: v.taintPath.join("\n") === f.taintPath.join("\n"),
+      shown: i === 0,
     };
   });
 }
