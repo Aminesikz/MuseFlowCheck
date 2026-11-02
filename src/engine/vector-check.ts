@@ -10,7 +10,7 @@ import { Project, type Node, type SourceFile } from "ts-morph";
 import { patchFile } from "../report.js";
 import type { Finding, Vector } from "../types/index.js";
 import { assembleAccessContext, routeLabel, type Access, type Guard } from "./access/index.js";
-import { traceProject } from "./crossfile/index.js";
+import { traceProject, type Hop } from "./crossfile/index.js";
 import { applyNamedFunctions, patchedFunctionNames } from "./verify/patch.js";
 import { inputOfOrigin } from "./vectors.js";
 import { traceXssProject } from "./xss/index.js";
@@ -70,16 +70,38 @@ function matches(v: ReturnType<typeof inputsOf>[number], sourceFile: string, inp
   return sourceFile === v.file && (v.input === undefined || input === v.input) && (!v.httpRoute || !route || route === v.httpRoute) && sinkFile === findingSink;
 }
 
+/** The variable a hop leaves the value in: a parameter (`[param x]`), a declaration, or an assignment target. */
+function heldIn(hop: Hop): string | undefined {
+  const code = hop.code.trim();
+  return /\[param ([A-Za-z_$][\w$]*)/.exec(code)?.[1] ?? declared(code) ?? /^([A-Za-z_$][\w$]*)\s*(?:\+=|=(?!=))/.exec(code)?.[1];
+}
+
+/**
+ * Whether a traced path passes the value on only as its `.length` at some hop — e.g. a placeholder number built from a
+ * bound-values array (`' AND status = $' + params.length`). A length is a number, not the input's text, so such a path
+ * no longer carries the input into the SQL or HTML. Stage 1 over-approximates there; detection keeps that, and only
+ * this check reads it. A hop whose variable cannot be told is never treated as cut.
+ */
+export function onlyLengthAt(hops: Hop[]): boolean {
+  for (let i = 1; i < hops.length; i++) {
+    const name = heldIn(hops[i - 1]);
+    if (!name) continue;
+    const uses = [...hops[i].code.matchAll(new RegExp(`(?<![\\w$.])${name.replace(/\$/g, "\\$")}(?![\\w$])(\\??\\.length\\b)?`, "g"))];
+    if (uses.length > 0 && uses.every((m) => m[1] !== undefined)) return true;
+  }
+  return false;
+}
+
 function statusAfterPatch(copy: string, f: Finding): VectorStatus[] {
   const sinkFile = f.sinkFile ?? f.file;
   const inputs = inputsOf(f);
   const label = (v: ReturnType<typeof inputsOf>[number]) => v.input ?? `${v.file} input`;
   if (f.cwe === "CWE-89" || /sql/i.test(f.type)) {
-    const open = traceProject(copy).paths.filter((p) => p.sqlText);
+    const open = traceProject(copy).paths.filter((p) => p.sqlText && !onlyLengthAt(p.hops));
     return inputs.map((v) => ({ input: label(v), open: open.some((p) => matches(v, p.hops[0].file, inputOfOrigin(p.origin), p.route, p.hops.at(-1)!.file, sinkFile)) }));
   }
   if (f.cwe === "CWE-79" || /cross-site/i.test(f.type)) {
-    const open = traceXssProject(copy).xss.filter((p) => !p.encoded);
+    const open = traceXssProject(copy).xss.filter((p) => !p.encoded && !onlyLengthAt(p.hops));
     return inputs.map((v) => ({ input: label(v), open: open.some((p) => matches(v, p.hops[0].file, p.stored ?? inputOfOrigin(p.origin), p.route, p.hops.at(-1)!.file, sinkFile)) }));
   }
   // Access control: Stage 1 counts one owner check in a handler as covering all of its reads, so here an identifier is

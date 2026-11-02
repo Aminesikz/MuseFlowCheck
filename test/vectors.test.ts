@@ -9,7 +9,8 @@ import { accessSeverity, assembleAccessContext, buildAccessPrompt, candidates, t
 import { parseAccessJudgment } from "../src/engine/access/judge.js";
 import { buildJudgePrompt, groupBySink, traceProject } from "../src/engine/crossfile/index.js";
 import { parseJudgment } from "../src/engine/crossfile/judge.js";
-import { checkPatchVectors } from "../src/engine/vector-check.js";
+import { checkPatchVectors, onlyLengthAt } from "../src/engine/vector-check.js";
+import type { Hop } from "../src/engine/crossfile/index.js";
 import { buildXssPrompt, groupXssBySink, parseXssJudgment, traceXssProject } from "../src/engine/xss/index.js";
 import { findingCard, makeColors } from "../src/report.js";
 import type { Finding } from "../src/types/index.js";
@@ -174,6 +175,57 @@ test("SQLi: a patch binding both parameters closes both; binding one leaves the 
   // The fixture itself is untouched.
   assert.deepEqual(afterPatch(f, "async function list(teamId, status) { return []; }"), ["teamId closed", "status closed"]);
   assert.equal(groupBySink(traceProject(root).paths).find((g) => g.sink.line === 9)?.paths.length, 2);
+});
+
+test("SQLi: a placeholder numbered from the bound values' .length closes the input; text still concatenated stays open", () => {
+  const f = parseJudgment(sqliReply({ path: 1, vectors: [1, 2] }), twoParams)!;
+  // The live fix for GET /api/appointments numbered its placeholder this way; Stage 1 still sees params (holding
+  // teamId) flow into the SQL text through .length, which is a number, not the input.
+  const both = `async function list(teamId, status) {
+  let sql = 'SELECT id, team_id, title, status FROM notes WHERE team_id = $1';
+  const params = [teamId];
+  if (status) {
+    params.push(status);
+    sql += ' AND status = $' + params.length;
+  }
+  const { rows } = await db.query(sql, params);
+  return rows;
+}`;
+  const statusOpen = `async function list(teamId, status) {
+  const params = [teamId];
+  let sql = 'SELECT id, team_id, title, status FROM notes WHERE team_id = $' + params.length;
+  if (status) {
+    sql += " AND status = '" + status + "'";
+  }
+  const { rows } = await db.query(sql, params);
+  return rows;
+}`;
+  const teamIdOpen = `async function list(teamId, status) {
+  let sql = 'SELECT id, team_id, title, status FROM notes WHERE team_id = ' + teamId + ' AND length(title) > ' + teamId.length;
+  const params = [];
+  if (status) {
+    params.push(status);
+    sql += ' AND status = $1';
+  }
+  const { rows } = await db.query(sql, params);
+  return rows;
+}`;
+  assert.deepEqual(afterPatch(f, both), ["teamId closed", "status closed"]);
+  assert.deepEqual(afterPatch(f, statusOpen), ["teamId closed", "status open"]);
+  assert.deepEqual(afterPatch(f, teamIdOpen), ["teamId open", "status closed"], "used as text too, not only as .length");
+});
+
+test("onlyLengthAt: a hop that uses the previous hop's variable only as .length cuts the path; any other use does not", () => {
+  const fn = { file: "db/a.js", name: "f", startLine: 1, endLine: 9, code: "" };
+  const hop = (line: number, code: string, kind: Hop["kind"] = "propagate"): Hop => ({ file: "db/a.js", line, code, kind, fn });
+  const into = (code: string) => [hop(1, "async function f(id, status)  [param id]", "param"), hop(2, "const params = [id];"), hop(3, code, "build"), hop(4, "db.query(sql, params)", "sink")];
+  assert.equal(onlyLengthAt(into("sql += ' AND status = $' + params.length")), true);
+  assert.equal(onlyLengthAt(into("sql += ' AND status = $' + params?.length")), true);
+  assert.equal(onlyLengthAt(into("sql += ' AND x = ' + params + ' -- ' + params.length")), false);
+  assert.equal(onlyLengthAt(into("sql += ' AND x IN (' + params.join(',') + ')'")), false);
+  assert.equal(onlyLengthAt(into("sql += ' AND x = ' + other.params.length")), false, "a property of another object is not the variable");
+  // A source hop that destructures several names gives no single variable: never treated as cut.
+  assert.equal(onlyLengthAt([hop(1, "const { a, b } = req.query;", "source"), hop(2, "sql += a.length", "build")]), false);
 });
 
 test("XSS: a patch encoding both inputs closes both; encoding one leaves the other open", () => {
