@@ -56,6 +56,18 @@ export const SEVERITY_GUIDE = `SEVERITY — check these rules IN ORDER and assig
 3. "medium" or "low" — only for a specific, clearly stated reason (e.g. a strong precondition, or no sensitive data reachable).
 For SQL injection: unless the code shows otherwise, an injectable query can rewrite its own filter (e.g. drop a WHERE condition, add UNION SELECT), so it normally reaches data beyond the attacker's scope.`;
 
+/**
+ * How the explanation is worded (shared by every judge): it is shown to developers verbatim, so it must not leak the
+ * prompt's own scaffolding — path labels, the reviewer's voice, reach labels copied as fragments. Wording only: it
+ * sits after the rules and changes none of them.
+ */
+export const EXPLANATION_STYLE = `EXPLANATION STYLE — the explanation is shown to developers as finished prose:
+- Do not refer to the labels or sections of these instructions: no "Path 1", "candidate path", "hop 3", rule numbers, or headings such as VIEWER REACH, ACTOR REACH or PATCH SCOPE. Describe the flow itself in plain terms (e.g. "the name query parameter reaches the SQL text unparameterized"), citing the code and its file:line locations from above.
+- Write in the third person and state findings directly. No first person ("I", "we", "I assume", "I think"). Where the code leaves something open, say so as a fact about the code (e.g. "the handler reads no authenticated user, so the route may be reachable without logging in").
+- When the explanation states the reach or an assumption, put it in your own words as a full sentence (e.g. "only a victim who opens an attacker-crafted link is affected"), never as a label copied from these instructions.
+- Complete sentences only: no fragments, dangling dashes, placeholders, or text quoted from these instructions.
+This governs only how the explanation is worded. Whether to report, the severity, the path number and the patch follow the rules above, unchanged.`;
+
 /** Prefixes each line with its 1-based number so the model can cite exact lines. */
 export function numberLines(source: string): string {
   const lines = source.split(/\r?\n/);
@@ -97,6 +109,8 @@ Report only flows where both the source and the executing sink are visible in th
 ${SEVERITY_GUIDE}
 
 ${BINDING_GUIDE}
+
+${EXPLANATION_STYLE}
 
 OUTPUT
 Return ONLY a JSON array of objects matching this TypeScript schema — no prose, no markdown fences. Return [] if there are no findings.

@@ -113,7 +113,7 @@ test("stored groups: type, two-request framing, output kind, and escaped renders
   assert.match(prompt, /This is a STORED flow across two requests: request input is written to the database column posts\.body by POST \/forum\/posts/);
   assert.match(prompt, /here: inserted into the page as HTML in the browser \(React dangerouslySetInnerHTML/);
   assert.match(prompt, /"type": "Cross-Site Scripting \(Stored\)"/);
-  assert.match(prompt, /say that the input is stored \(persisted\); state the viewer reach/);
+  assert.match(prompt, /say that the input is stored \(persisted\); say who can be affected \(the viewer reach\) in your own words/);
   assert.match(prompt, /OTHER OUTPUTS OF THE SAME INPUT[^\n]*\n {2}- web\/src\/Excerpt\.jsx:4/);
   assert.match(prompt, /For this output the rule gives "critical"\./);
   assert.match(prompt, /\nHTTP ROUTE \(full path, including the prefix the router is mounted under\): GET \/forum\/posts\/:id\n/);

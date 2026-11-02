@@ -5,7 +5,7 @@ import path from "node:path";
 import { complete } from "../../llm/meta-client.js";
 import type { Finding } from "../../types/index.js";
 import { extractJsonArray, FindingParseError, validateJudgment } from "../parse.js";
-import { BINDING_GUIDE, bindingStyle, SAFE_PATTERNS, SEVERITY_GUIDE } from "../prompt.js";
+import { BINDING_GUIDE, bindingStyle, EXPLANATION_STYLE, SAFE_PATTERNS, SEVERITY_GUIDE } from "../prompt.js";
 import type { CandidatePath, FunctionRef, Hop } from "./trace.js";
 
 /**
@@ -121,6 +121,8 @@ Middleware and route registration are not shown. If the handler reads an authent
 
 ${libraryNote(group)}
 ${scope}
+${EXPLANATION_STYLE}
+
 OUTPUT
 Return ONLY a JSON array — no prose, no markdown fences.
 - [] if no path is exploitable.
@@ -130,7 +132,7 @@ Return ONLY a JSON array — no prose, no markdown fences.
   "cwe": "CWE-89",
   "severity": "critical" | "high" | "medium" | "low",
   "path": number,            // the "Path N" number above that most clearly demonstrates the injection
-  "explanation": string,     // plain language: why it is exploitable across these files, what an attacker could do; mention any other exploitable paths into the same call
+  "explanation": string,     // plain language: why it is exploitable across these files, what an attacker could do; mention any other exploitable flows into the same call by where their input enters
   "suggestedPatch": string   // corrected code for the function containing the SQL execution, using the DATABASE LIBRARY's parameter binding above and only identifiers in PATCH SCOPE, multi-line and formatted like the original
 }
 Do not include file, line, or taintPath fields — the tool fills those in from the traced path.`;
