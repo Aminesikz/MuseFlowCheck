@@ -54,7 +54,7 @@ node dist/cli.js scan ../MetaVulnSite/server                     # full combined
 
 ### Output
 
-On a terminal, each finding is a card: a color-coded severity badge (`[CRITICAL]` red, `[HIGH]` yellow, `[MEDIUM]` blue, `[LOW]` dim), the type and CWE, and `✓ exploit confirmed` when verification proved it. Under it come the route and `source file:line → sink file:line`, the taint path hop by hop, **Why** it is exploitable, the **Proof** (what the exploit demonstrated, when confirmed), and the suggested **Fix** as a code block. A summary closes the report, with counts per class, per severity and per confidence.
+On a terminal, each finding is a card: a color-coded severity badge (`[CRITICAL]` red, `[HIGH]` yellow, `[MEDIUM]` blue, `[LOW]` dim), the type and CWE, and `✓ exploit confirmed` when verification proved it. Under it come the route and `source file:line → sink file:line`, the taint path hop by hop, **Why** it is exploitable, the **Proof** (what the exploit demonstrated, when confirmed), and the suggested **Fix** as a code block. When other findings' fixes rewrite the same handler or function, a **⚠ Fix together** note above the fix names them: each patch fixes only its own finding, so they must be combined. A summary closes the report, with counts per class, per severity and per confidence.
 
 Color is used only on a terminal. It is off when output is piped, with `--json`, when `NO_COLOR` is set, or with `--no-color` (`FORCE_COLOR=1` turns it on anyway); without color every status is still a label or symbol. `--json` is the machine interface: stdout carries only `{ "findings": Finding[], "analysis": {...} }`, unchanged by any of the above, while progress and the summary go to stderr. `analysis` reports coverage — `complete`, `entryPointsTotal`, `entryPointsResolved`, `callsFollowed`, `unresolved`, `files`, `filesParsed`, `parseErrors`, `reasons` and `problems` — so a consumer can tell an incomplete scan from a clean one instead of reading `findings: []` as safe.
 
@@ -158,13 +158,15 @@ permissions:
   contents: read
   pull-requests: write # inline review comments and the summary comment
 jobs:
-  scan:
+  museflowcheck:
     runs-on: ubuntu-latest
     steps:
       - uses: Aminesikz/MuseFlowCheck@main
         with:
           api-key: ${{ secrets.META_API_KEY }}
 ```
+
+3. To block merges on a failing scan, require the `museflowcheck` check in the branch's protection rule (Settings → Branches → require status checks to pass). The check takes its name from the job id, and it can be selected once it has run at least once.
 
 The Action checks out the PR's head commit, builds MuseFlowCheck, and scans the whole repository: cross-file taint needs the whole project, so a PR that only edits a helper still gets the flows through it.
 
@@ -173,7 +175,8 @@ The Action checks out the PR's head commit, builds MuseFlowCheck, and scans the 
 - **Inline review comments**, one per finding that touches the PR's changed files. A comment goes on the sink line if the diff includes it, else the source line, else any taint-path hop in the diff (so a PR that edits a function in the middle of a flow gets the finding). If the file changed but none of those lines is in the diff, the comment goes on the file. Each comment has a severity badge, the type and CWE, the route with source → sink, the taint path, why the flow is exploitable, and the suggested fix.
 - **Findings elsewhere in the repository** are not commented inline: GitHub only accepts review comments on the diff, and existing findings would flood the PR. They are still counted, listed in the summary, and gate the check.
 - **One summary comment**, with the verdict, findings by class and severity, and analysis coverage. A later run updates it in place. The same report goes to the job summary.
-- **Re-runs do not repost.** Each comment carries a hidden fingerprint: the finding's class and its taint path without line numbers. A finding already on the PR is skipped, even when a push only moved its code. A changed flow is a new finding and gets a new comment.
+- **Findings whose fixes overlap are flagged.** When two or more findings' suggested fixes rewrite the same route handler or function (a SQL injection and an XSS in one handler, say), each patch fixes only its own finding. Applied alone it leaves the other bug in place, and applied one after another the patches conflict. Each such comment carries a "⚠ Fix together" warning naming the other findings, and the summary groups them. The patches are not merged automatically: combine them into one fix.
+- **Re-runs do not repost.** Each comment carries a hidden fingerprint: the finding's class and its taint path without line numbers. A finding already on the PR is skipped, even when a push only moved its code. A changed flow is a new finding and gets a new comment. A comment already posted is edited only when its "Fix together" warning changes, because a finding sharing its fix appeared or went away.
 
 Without a pull request (a `push` or a manual run), or when the token cannot write comments (a PR from a fork gets a read-only token), findings are reported as annotations on the commit instead.
 
@@ -282,6 +285,7 @@ Beyond the bundled fixture, Flowcheck was run (detection only, no `--target`) ag
 - **A library call can be misread as a route.** Route discovery counts `.get` / `.post` / … calls on any object that is not project code, so an HTTP client call like `needle.get(url, callback)` is listed as a `GET` route (one phantom entry point on NodeGoat; it reads no request input, so nothing is judged on it). Telling a client library apart from an Express app or router needs more than a one-line check, so it is left as a known issue.
 - **Deleted or created records are not restored.** A write proof restores what it changed, but a `DELETE` (or a `POST` that creates a record) cannot be undone automatically: the finding then says `RE-SEED RECOMMENDED`. The same applies to a stored-XSS proof whose original value could not be restored.
 - **Body-difference confirmation depends on the model naming the success phrase.** The PoC is generated blind (the model never sees the target's responses), so for a localized or non-English app it may not guess the exact phrase the server prints on success. A genuine exploit is then honestly reported `unverified`, never falsely confirmed (on sc_pro, a Korean-language app, the login bypass stayed `unverified` this way). Roadmap: derive the expected response indicators from the handler's response source, for language-agnostic confirmation.
+- **Node's built-in `node:sqlite` driver is not recognized yet.** SQL sinks are recognized by their package (`pg`, `mysql2`, `better-sqlite3`, `sqlite3`, …). `DatabaseSync` from Node's own `node:sqlite` (`db.prepare(sql).all()`, `db.exec(sql)`) is not in that list, so injection into a query run through it is missed. Roadmap.
 - **Taint through instance fields is not tracked.** A value stored on an object (`this.query = req.query.q`, or a tainted constructor argument kept in a field) and read later by another method is not followed; the constructor call is listed as unresolved, never dropped.
 
 ## License
