@@ -33,7 +33,7 @@ export interface PatchProverOptions {
 }
 
 /** Top-level function names a patch snippet defines: `function f`, `const f = () =>`, `exports.f = function`. */
-function patchedFunctionNames(patch: string): string[] {
+export function patchedFunctionNames(patch: string): string[] {
   const project = new Project({ useInMemoryFileSystem: true, compilerOptions: { allowJs: true } });
   let sf: SourceFile;
   try {
@@ -56,7 +56,7 @@ function patchedFunctionNames(patch: string): string[] {
 }
 
 /** Replaces, in `file`, each top-level function the patch redefines by name. Returns the names replaced. */
-function applyNamedFunctions(file: SourceFile, patch: string, names: string[]): string[] {
+export function applyNamedFunctions(file: SourceFile, patch: string, names: string[]): string[] {
   const applied: string[] = [];
   const patchProject = new Project({ useInMemoryFileSystem: true, compilerOptions: { allowJs: true } });
   const patchSf = patchProject.createSourceFile("patch.ts", patch);

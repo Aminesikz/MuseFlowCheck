@@ -208,6 +208,38 @@ export function sharedFixNote(f: Finding, group: FixGroup, where: (file: string)
   );
 }
 
+/** One input into a multi-vector finding, for display: where it enters, and where its own path last differs from the others'. */
+export interface VectorRow {
+  input: string;
+  enters: string;
+  /** `file:line` of the last hop before the sink that no other vector's path shares — where this input joins the sink. */
+  joins?: string;
+  route?: string;
+  /** True for the vector whose path is the finding's taintPath: the first (two inputs read on one line share hop text). */
+  shown: boolean;
+}
+
+const hopAt = (hop: string) => /^(\S+?:\d+)\s/.exec(hop)?.[1];
+
+/** The finding's vectors as display rows; [] for a single-input finding. */
+export function vectorRows(f: Finding): VectorRow[] {
+  const vectors = f.vectors ?? [];
+  if (vectors.length < 2) return [];
+  const atsOf = (path: string[]) => path.slice(0, -1).map(hopAt);
+  return vectors.map((v, i) => {
+    const others = new Set(vectors.filter((_, j) => j !== i).flatMap((o) => atsOf(o.taintPath)));
+    const joins = atsOf(v.taintPath).filter((at) => at && !others.has(at)).at(-1);
+    const enters = `${v.file}:${v.line}`;
+    return {
+      input: v.input,
+      enters,
+      ...(joins && joins !== enters ? { joins } : {}),
+      ...(v.httpRoute ? { route: v.httpRoute } : {}),
+      shown: i === 0,
+    };
+  });
+}
+
 /**
  * One finding as a card: a header with the severity badge, type and CWE, and the verification badge on the right;
  * the route and location; then the taint path, why it is exploitable, the proof (when verification ran), and the
@@ -232,6 +264,17 @@ export function findingCard(c: Colors, f: Finding, n: number, total: number, wid
   lines.push(`  ${label(c, "Taint path")}`);
   const w = String(f.taintPath.length).length;
   f.taintPath.forEach((hop, i) => lines.push(`    ${c.dim(String(i + 1).padStart(w))}  ${hop}`));
+  const vectors = vectorRows(f);
+  if (vectors.length > 0) {
+    lines.push("", `  ${label(c, `Inputs (${vectors.length})`)} ${c.dim("— one vulnerability, several inputs into the same sink; the fix must close every one")}`);
+    const iw = Math.max(...vectors.map((v) => v.input.length));
+    const routes = new Set(vectors.map((v) => v.route)).size > 1;
+    for (const v of vectors) {
+      const at = `${v.enters}${v.joins ? ` ${c.dim("→")} ${v.joins}` : ""}`;
+      const notes = [routes && v.route ? v.route : "", v.shown ? "taint path above" : ""].filter(Boolean).join(", ");
+      lines.push(`    ${c.dim("•")} ${v.input.padEnd(iw)}  ${at}${notes ? c.dim(`  (${notes})`) : ""}`);
+    }
+  }
   lines.push("", `  ${label(c, "Why")}`, ...wrap(f.explanation, width, "    "));
 
   const v = f.verification;
@@ -247,7 +290,8 @@ export function findingCard(c: Colors, f: Finding, n: number, total: number, wid
     lines.push("", `  ${c.bold(c.yellow("⚠ Fix together"))}`, ...note.map((l) => c.yellow(l)));
   }
   const target = patchFile(f);
-  lines.push("", `  ${c.bold(c.green("Fix"))} ${c.dim(`— suggested patch${target ? ` for ${target}` : ""}`)}`);
+  const covers = vectors.length > 0 ? `; it must close all ${vectors.length} inputs` : "";
+  lines.push("", `  ${c.bold(c.green("Fix"))} ${c.dim(`— suggested patch${target ? ` for ${target}` : ""}${covers}`)}`);
   for (const code of f.suggestedPatch.replace(/\s+$/, "").split("\n")) lines.push(`    ${c.green("│")} ${code}`);
   return lines.join("\n");
 }
