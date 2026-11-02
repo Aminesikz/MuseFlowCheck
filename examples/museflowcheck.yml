@@ -11,7 +11,7 @@ permissions:
   pull-requests: write # inline review comments and the summary comment
 
 jobs:
-  scan:
+  museflowcheck: # the check's name; require it in branch protection to block merges
     runs-on: ubuntu-latest
     steps:
       - uses: Aminesikz/MuseFlowCheck@main

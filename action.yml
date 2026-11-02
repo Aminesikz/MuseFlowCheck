@@ -49,33 +49,35 @@ inputs:
 outputs:
   status:
     description: pass, findings, incomplete or error. Only pass is a green check.
-    value: ${{ steps.scan.outputs.status }}
+    value: ${{ steps.museflowcheck.outputs.status }}
   findings:
     description: Number of findings.
-    value: ${{ steps.scan.outputs.findings }}
+    value: ${{ steps.museflowcheck.outputs.findings }}
   gated:
     description: Number of findings at or above fail-on.
-    value: ${{ steps.scan.outputs.gated }}
+    value: ${{ steps.museflowcheck.outputs.gated }}
   complete:
     description: Whether the analysis was complete (false also when the scan errored).
-    value: ${{ steps.scan.outputs.complete }}
+    value: ${{ steps.museflowcheck.outputs.complete }}
 
 runs:
   using: composite
   steps:
     - name: Check out the code under review
       if: inputs.checkout == 'true'
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         # the PR's head commit, so finding line numbers match the lines the review comments are placed on
         ref: ${{ github.event.pull_request.head.sha || github.sha }}
         persist-credentials: false
 
     - name: Set up Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v7
       with:
-        # no npm cache: setup-node only hashes lock files inside the workspace, and this one is in the action's folder
-        node-version: 22
+        node-version: 24
+        # no npm cache: setup-node only hashes lock files inside the workspace, and this one is in the action's folder;
+        # and no automatic cache keyed on the scanned repository's package manager either
+        package-manager-cache: false
 
     - name: Build MuseFlowCheck
       shell: bash
@@ -85,7 +87,7 @@ runs:
         npm run build
 
     - name: Scan and report
-      id: scan
+      id: museflowcheck
       shell: bash
       run: node "$GITHUB_ACTION_PATH/dist/action/run.js"
       env:
