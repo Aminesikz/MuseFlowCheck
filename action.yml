@@ -74,9 +74,8 @@ runs:
     - name: Set up Node.js
       uses: actions/setup-node@v4
       with:
+        # no npm cache: setup-node only hashes lock files inside the workspace, and this one is in the action's folder
         node-version: 22
-        cache: npm
-        cache-dependency-path: ${{ github.action_path }}/package-lock.json
 
     - name: Build MuseFlowCheck
       shell: bash
