@@ -54,7 +54,15 @@ node dist/cli.js scan ../MetaVulnSite/server                     # full combined
 
 ### Output
 
-On a terminal, each finding is a card: a color-coded severity badge (`[CRITICAL]` red, `[HIGH]` yellow, `[MEDIUM]` blue, `[LOW]` dim), the type and CWE, and `✓ exploit confirmed` when verification proved it. Under it come the route and `source file:line → sink file:line`, the taint path hop by hop, **Why** it is exploitable, the **Proof** (what the exploit demonstrated, when confirmed), and the suggested **Fix** as a code block. A summary closes the report, with counts per class, per severity and per confidence.
+On a terminal, each finding is a card: a color-coded severity badge (`[CRITICAL]` red, `[HIGH]` yellow, `[MEDIUM]` blue, `[LOW]` dim), the type and CWE, and `✓ exploit confirmed` when verification proved it. Under it come the route and `source file:line → sink file:line`, the taint path hop by hop, the **Inputs** when several reach the same sink (see below), **Why** it is exploitable, the **Proof** (what the exploit demonstrated, when confirmed), and the suggested **Fix** as a code block. A summary closes the report, with counts per class, per severity and per confidence.
+
+**Several inputs into one sink.** When Stage 1 traced more than one request input into the same sink — two query parameters concatenated into one SQL string, two values written unencoded into one HTML output, two request identifiers selecting rows of the same table with no owner check — the judge is shown each of them and asked which are exploitable. The finding stays one finding (one vulnerability, several vectors): its JSON carries `vectors` (each input with where it enters, its route and its own taint path; the input `taintPath` shows comes first), the explanation names every input, and the suggested patch must close all of them, not only the one in `taintPath`. Detection, severity and verification are unchanged: one confirmed exploit through any input confirms the finding. A sink one input reaches gets exactly the prompt and the finding it did before, with no `vectors` field. Identifiers into different tables are separate accesses and never become vectors of each other.
+
+To check that a scan's patches close every input, offline (no model call, nothing modified):
+
+```bash
+npx tsx scripts/check-patch-vectors.ts scan.json <scanned dir>   # applies each patch to a copy, re-runs Stage 1, lists inputs still open
+```
 
 Color is used only on a terminal. It is off when output is piped, with `--json`, when `NO_COLOR` is set, or with `--no-color` (`FORCE_COLOR=1` turns it on anyway); without color every status is still a label or symbol. `--json` is the machine interface: stdout carries only `{ "findings": Finding[], "analysis": {...} }`, unchanged by any of the above, while progress and the summary go to stderr. `analysis` reports coverage — `complete`, `entryPointsTotal`, `entryPointsResolved`, `callsFollowed`, `unresolved`, `files`, `filesParsed`, `parseErrors`, `reasons` and `problems` — so a consumer can tell an incomplete scan from a clean one instead of reading `findings: []` as safe.
 
